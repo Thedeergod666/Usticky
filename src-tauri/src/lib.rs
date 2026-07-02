@@ -41,6 +41,7 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::Builder::new()
             .args(vec!["--autostart"])
             .build())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // 1. 加载或初始化 todo store
