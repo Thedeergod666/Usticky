@@ -1,0 +1,39 @@
+{
+  "name": "usticky",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.15.4",
+  "description": "Always-on-top floating sticky note for desktop — single-task, glass aesthetic, no bloat",
+  "scripts": {
+    "sync-version": "node scripts/sync-version.cjs",
+    "predev": "pnpm sync-version",
+    "prebuild": "pnpm sync-version",
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-autostart": "^2.0.0",
+    "@tauri-apps/plugin-global-shortcut": "^2.0.0",
+    "@tauri-apps/plugin-notification": "^2.0.0",
+    "sortablejs": "^1.15.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/node": "^20.0.0",
+    "@types/sortablejs": "^1.15.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ],
+    "enablePrePostScripts": true
+  }
+}

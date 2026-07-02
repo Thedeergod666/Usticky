@@ -1,0 +1,57 @@
+[package]
+name = "usticky"
+version = "0.1.0"
+description = "Always-on-top floating sticky note for desktop"
+authors = ["Thedeergod666"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "usticky_lib"
+# Windows 上只用 staticlib 就够（main.rs 静态链接 usticky_lib）。
+# 删 cdylib 是为了绕过 MinGW ld 16-bit ordinal 表上限 —— Tauri 2 + GNU 工具链的已知坑
+# （cargo 给 cdylib 自动生成的 .def 含 14 万+ 符号，ld 不让过）。
+crate-type = ["staticlib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+chrono = "0.4"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+dirs = "5"
+uuid = { version = "1", features = ["v4", "serde"] }
+rust-i18n = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSWindow"] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+# 不开 strip = true —— 跟 rust-i18n 3.x 的 Lazy<HashMap> 存储冲突
+# （Windows MSVC 链接器会把 HashMap 字面量 backing 段当 unreferenced 丢掉）

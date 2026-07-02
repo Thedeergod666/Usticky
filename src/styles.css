@@ -1,0 +1,360 @@
+/* Usticky 浮窗 —— iOS 26 / macOS 26 widget 风格
+ *
+ * 设计哲学（v1，源自 Musage v0.2 经验）：
+ *   - 整窗 #app 完全透明，每个 .todo-card 是独立玻璃胶囊瓦片
+ *   - 默认（idle）：瓦片半透 + 所有数据文字统一白色（仿 macOS 26 天气 widget）
+ *   - 鼠标进入窗口（body[data-hover] #app）：瓦片背景升至 ~82% alpha + 强 blur +
+ *     阴影 + 内描边，同时数字从白色平滑变为 iOS 语义色
+ *   - 所有色彩切换走 CSS variable swap，单一 body[data-hover] #app 触发整组变化
+ *   - ~280ms iOS spring 过渡
+ *
+ * 为什么用 body[data-hover] 而不是 :hover？
+ * macOS 上 NSWindow 默认不向非 key window 派发 mouseMoved 事件，WKWebView 的
+ * CSS :hover 在浮窗未聚焦时不会激活。Usticky v0.1 暂不实现 Rust hover emitter
+ * （见 AGENTS.md v0.2 候选），先用 JS mouseenter/leave 兜底。Win/Linux 上
+ * WebView 正常分发事件，CSS :hover 本来就能用 —— 但为了跨平台一致，统一走
+ * JS toggle body.dataset.hover。
+ */
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+               "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* ── 整窗容器 ── */
+#app {
+  width: 100%;
+  height: 100%;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+  cursor: grab;
+
+  /* 玻璃材质 */
+  --tile-bg: rgba(22, 24, 30, 0.30);
+  --tile-blur: 10px;
+  --tile-saturate: 140%;
+  --tile-border: rgba(255, 255, 255, 0);
+  --tile-shadow: 0 0 0 rgba(0, 0, 0, 0);
+
+  /* 文字层级（idle：偏白，靠 alpha 拉开主次） */
+  --text-bright: rgba(255, 255, 255, 0.96);
+  --text-mute:   rgba(255, 255, 255, 0.68);
+  --text-faint:  rgba(255, 255, 255, 0.44);
+  --text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+
+  /* 语义色（idle：全部统一为白） */
+  --c-data-ok:    rgba(255, 255, 255, 0.96);
+  --c-data-cyan:  rgba(255, 255, 255, 0.96);
+  --c-data-warn:  rgba(255, 255, 255, 0.96);
+  --c-data-alert: rgba(255, 255, 255, 0.96);
+  --c-data-info:  rgba(255, 255, 255, 0.96);
+
+  --c-bg-ok:    rgba(255, 255, 255, 0.10);
+  --c-bg-alert: rgba(255, 255, 255, 0.10);
+}
+#app:active { cursor: grabbing; }
+
+/* ── 鼠标进入窗口 → 唤醒玻璃材质 + iOS 语义色 ── */
+body[data-hover] #app {
+  --tile-bg: rgba(28, 30, 38, 0.82);
+  --tile-blur: 28px;
+  --tile-saturate: 180%;
+  --tile-border: rgba(255, 255, 255, 0.10);
+  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.45),
+                 0 0 0 0.5px rgba(255, 255, 255, 0.04) inset;
+  --text-bright: #f4f5f7;
+  --text-mute:   rgba(255, 255, 255, 0.72);
+  --text-faint:  rgba(255, 255, 255, 0.52);
+  --text-shadow: 0 1px 2px rgba(0, 0, 0, 0);
+
+  --c-data-ok:    #30d158;
+  --c-data-cyan:  #5ac8fa;
+  --c-data-warn:  #ff9f0a;
+  --c-data-alert: #ff453a;
+  --c-data-info:  #0a84ff;
+  --c-bg-ok:    rgba(48, 209, 88, 0.16);
+  --c-bg-alert: rgba(255, 69, 58, 0.16);
+}
+
+/* ── Todo 卡片 ── */
+.todo-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 13px 10px;
+  background: var(--tile-bg);
+  backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
+  -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
+  border: 1px solid var(--tile-border);
+  border-radius: 14px;
+  box-shadow: var(--tile-shadow);
+  transition:
+    background-color 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    backdrop-filter 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    -webkit-backdrop-filter 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+  cursor: grab;
+}
+.todo-card:active { cursor: grabbing; }
+.todo-card.dragging { opacity: 0.5; transform: scale(0.98); }
+
+/* 已完成的 todo：fade out + 删除线 */
+.todo-card.done .todo-title {
+  text-decoration: line-through;
+  color: var(--text-faint);
+}
+.todo-card.vanishing {
+  transform: translateX(-30%);
+  opacity: 0;
+  max-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  margin: 0;
+  border-width: 0;
+  overflow: hidden;
+  transition: all 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* 完成 checkbox */
+.todo-check {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border: 1.5px solid var(--text-mute);
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+.todo-check:hover { border-color: var(--c-data-ok); }
+.todo-card.done .todo-check {
+  background: var(--c-data-ok);
+  border-color: var(--c-data-ok);
+}
+.todo-card.done .todo-check::after {
+  content: '✓';
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+/* 标题 */
+.todo-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-bright);
+  letter-spacing: -0.1px;
+  text-shadow: var(--text-shadow);
+  transition: color 0.28s, text-shadow 0.28s;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* due 时间标签 */
+.todo-due {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 5px;
+  color: var(--text-faint);
+  background: rgba(255, 255, 255, 0.06);
+  letter-spacing: 0.2px;
+  font-variant-numeric: tabular-nums;
+  transition: color 0.28s, background-color 0.28s;
+}
+body[data-hover] #app .todo-due.today    { color: var(--c-data-warn);  background: rgba(255, 159, 10, 0.18); }
+body[data-hover] #app .todo-due.tomorrow { color: var(--c-data-info);  background: rgba(10, 132, 255, 0.18); }
+body[data-hover] #app .todo-due.overdue  { color: var(--c-data-alert); background: rgba(255, 69, 58, 0.18); }
+body[data-hover] #app .todo-due.days     { color: var(--c-data-cyan);  background: rgba(90, 200, 250, 0.18); }
+
+/* delete 按钮（hover 才显示） */
+.todo-delete {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.18s, background-color 0.18s, color 0.18s;
+}
+.todo-card:hover .todo-delete { opacity: 1; }
+.todo-delete:hover {
+  color: var(--c-data-alert);
+  background: rgba(255, 69, 58, 0.16);
+}
+
+/* ── 输入区 ── */
+.todo-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 13px;
+  background: var(--tile-bg);
+  backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
+  -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
+  border: 1px solid var(--tile-border);
+  border-radius: 14px;
+  box-shadow: var(--tile-shadow);
+  transition:
+    background-color 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    backdrop-filter 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    -webkit-backdrop-filter 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.todo-input:focus-within {
+  border-color: rgba(10, 132, 255, 0.45);
+}
+.todo-input input {
+  flex: 1 1 auto;
+  background: transparent;
+  border: none;
+  outline: none;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-bright);
+  text-shadow: var(--text-shadow);
+  caret-color: var(--c-data-info);
+}
+.todo-input input::placeholder {
+  color: var(--text-faint);
+  font-weight: 400;
+}
+.todo-input-hint {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-faint);
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  letter-spacing: 0.2px;
+}
+
+/* ── Section header (Pending / Done) ── */
+.section-header {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-faint);
+  padding: 4px 4px 0;
+  text-shadow: var(--text-shadow);
+  transition: color 0.28s;
+}
+
+/* ── 空态 ── */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 24px 16px;
+  text-align: center;
+  min-width: 240px;
+  max-width: 320px;
+}
+.empty-state-title {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-bright);
+  text-shadow: var(--text-shadow);
+  letter-spacing: 0.02em;
+}
+.empty-state-subtitle {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-mute);
+  text-shadow: var(--text-shadow);
+}
+.empty-state-cta {
+  margin-top: 4px;
+  padding: 8px 22px;
+  border: none;
+  border-radius: 999px;
+  background: #007aff;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0, 122, 255, 0.3);
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+}
+.empty-state-cta:hover  { background: #2294ff; }
+.empty-state-cta:active { transform: scale(0.96); }
+
+/* ── mini flash（撤销/删除反馈） ── */
+.mini-flash {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%) translateY(8px);
+  padding: 8px 16px;
+  background: rgba(28, 28, 30, 0.92);
+  color: #fff;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s, transform 0.2s;
+  z-index: 9999;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.mini-flash.visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* ── 省电模式（body[data-low-power]） ── */
+body[data-low-power] #app {
+  --tile-bg: rgba(22, 24, 30, 0.78);
+  --tile-blur: 0;
+  --tile-saturate: 100%;
+}
+body[data-low-power][data-hover] #app {
+  --tile-bg: rgba(28, 30, 38, 0.92);
+  --tile-blur: 0;
+  --tile-saturate: 100%;
+}
+body[data-low-power] *,
+body[data-low-power] *::before,
+body[data-low-power] *::after {
+  transition: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  animation: none !important;
+}

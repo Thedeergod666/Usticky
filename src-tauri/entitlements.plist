@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Usticky — macOS Hardened Runtime entitlements
+      ==============================================
+      从 Musage 继承：Usticky 不联网（todos 存本地 JSON），但保留以下 entitlement
+      以满足 Tauri 2 + macos-private-api + WKWebView JIT 的最小集合。
+
+      注意：
+      - App **不上沙盒**（PinBottom 模式需要 setLevel，沙盒不允许）
+      - 没 Apple Developer ID 也能用此文件 + codesign --sign -（ad-hoc），
+        只是 spctl --assess 会报 "rejected"，用户能跑就行
+    -->
+
+    <!-- Hardened Runtime 必需: 允许 JIT (WKWebView 内部用) -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+
+    <!-- Hardened Runtime 必需: 允许未签名可执行内存 (WKWebView 内部) -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- Hardened Runtime 必需: 关掉库签名校验，objc2 + 私有 API 才能 load 系统 framework -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Tauri 自动更新需要从 GitHub release 下载 new bundle (HTTPS) -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+</dict>
+</plist>

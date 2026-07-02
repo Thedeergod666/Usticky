@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<!--
+  lang attr 在 src/i18n/index.ts initLocale() 启动时被改成当前 locale
+  （默认 "zh-CN" 在 initLocale 跑之前短暂存在，跟 Musage 旧行为 byte-for-byte 一致）
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Usticky</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

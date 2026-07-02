@@ -1,0 +1,7 @@
+{
+  "error": {
+    "empty_title": "Title cannot be empty",
+    "too_long": "Title too long (max {max} characters)",
+    "not_found": "Todo not found"
+  }
+}
