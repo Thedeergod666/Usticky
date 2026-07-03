@@ -200,15 +200,40 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
         .name("usticky-hover-emitter".into())
         .spawn(move || {
             let mut last_inside = false;
+            let mut last_emitted = false;
+            // 边缘抖动防抖（macos.rs 同款）。50ms × 3 = 150ms 确认延迟，
+            // 人手移动窗口跨越边缘的典型时间已经足够，不会感知到延迟。
+            const DEBOUNCE_TICKS: u8 = 3;
+            let mut pending_inside: Option<bool> = None;
+            let mut pending_count: u8 = 0;
             loop {
                 thread::sleep(Duration::from_millis(50));
 
-                let Some(inside) = is_cursor_inside_floating(&app) else {
+                let Some(raw_inside) = is_cursor_inside_floating(&app) else {
                     continue;
                 };
 
+                let inside = match pending_inside {
+                    Some(p) if p == raw_inside => {
+                        pending_count += 1;
+                        if pending_count >= DEBOUNCE_TICKS {
+                            pending_inside = None;
+                            pending_count = 0;
+                            raw_inside
+                        } else {
+                            last_inside
+                        }
+                    }
+                    _ => {
+                        pending_inside = Some(raw_inside);
+                        pending_count = 1;
+                        last_inside
+                    }
+                };
+
                 // (1) 永远 emit hover 事件（驱动 CSS 玻璃效果）
-                if inside != last_inside {
+                if inside != last_emitted {
+                    last_emitted = inside;
                     let _ = app.emit("usticky://floating-hover", inside);
                 }
 

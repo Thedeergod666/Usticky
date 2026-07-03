@@ -71,7 +71,16 @@ html, body {
 }
 #app:active { cursor: grabbing; }
 
-/* ── 鼠标进入窗口 → 唤醒玻璃材质 + iOS 语义色 ── */
+/* ── 鼠标进入窗口 → 唤醒玻璃材质 + iOS 语义色 ──
+ *
+ * ⚠️ 这里**故意不写 transition**。
+ * `backdrop-filter: blur(28px)` 是非常昂贵的合成操作，每次 hover 状态
+ * 翻转都会触发一次整窗重合成。如果给 backdrop-filter / CSS variable
+ * 加 0.28s spring 过渡，Rust hover emitter 50ms tick 在浮窗边缘抖动时
+ * 会反复 emit hover → CSS variable 反复重计算 → 重合成 → 视觉上
+ * "光标闪烁"。代价：hover 进入没有 280ms 的 iOS 弹簧过渡，是离散切。
+ * 视觉换性能 + 不闪烁 —— 透明浮窗场景下值得。
+ */
 body[data-hover] #app {
   --tile-bg: rgba(28, 30, 38, 0.82);
   --tile-blur: 28px;
@@ -105,12 +114,13 @@ body[data-hover] #app {
   border: 1px solid var(--tile-border);
   border-radius: 14px;
   box-shadow: var(--tile-shadow);
+  /* ⚠️ 不 transition backdrop-filter / box-shadow —— 它们都是合成层重操作，
+     在 Rust hover emitter 50ms tick 抖动时会反复插值 → 光标闪烁。
+     视觉上从 idle 到 hover 是离散切，保留 background-color / border-color
+     的 0.18s 过渡已足够"软着陆"。 */
   transition:
-    background-color 0.28s cubic-bezier(0.22, 1, 0.36, 1),
-    backdrop-filter 0.28s cubic-bezier(0.22, 1, 0.36, 1),
-    -webkit-backdrop-filter 0.28s cubic-bezier(0.22, 1, 0.36, 1),
-    border-color 0.28s cubic-bezier(0.22, 1, 0.36, 1),
-    box-shadow 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
     transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
   cursor: grab;
 }
@@ -227,12 +237,10 @@ body[data-hover] #app .todo-due.days     { color: var(--c-data-cyan);  backgroun
   border: 1px solid var(--tile-border);
   border-radius: 14px;
   box-shadow: var(--tile-shadow);
+  /* 不 transition backdrop-filter —— 同 .todo-card，防 hover emitter 抖动闪烁 */
   transition:
-    background-color 0.28s cubic-bezier(0.22, 1, 0.36, 1),
-    backdrop-filter 0.28s cubic-bezier(0.22, 1, 0.36, 1),
-    -webkit-backdrop-filter 0.28s cubic-bezier(0.22, 1, 0.36, 1),
-    border-color 0.28s cubic-bezier(0.22, 1, 0.36, 1),
-    box-shadow 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+    background-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .todo-input:focus-within {
   border-color: rgba(10, 132, 255, 0.45);

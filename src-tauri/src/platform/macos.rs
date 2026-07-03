@@ -101,6 +101,18 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
         .spawn(move || {
             tracing::debug!("hover emitter 启动");
             let mut last_inside = false;
+            let mut last_emitted = false;
+            // 边缘抖动防抖计数器：
+            // - 鼠标在浮窗边缘抖动时，windowNumberAtPoint 会在 inside/outside
+            //   之间反复切，每次切都会 emit hover 事件 → 前端 backdrop-filter
+            //   28px 反复重合成 → 视觉上"光标闪烁"。
+            // - 修复：要求连续 ≥ DEBOUNCE_TICKS 次同方向 hit-test 才确认翻转。
+            // - 50ms tick × 3 = 150ms 延迟，人手移动窗口跨越边缘的典型时间
+            //   （>100ms）已经足够，所以感知不到延迟。
+            const DEBOUNCE_TICKS: u8 = 3;
+            let mut pending_inside: Option<bool> = None;
+            let mut pending_count: u8 = 0;
+
             loop {
                 thread::sleep(Duration::from_millis(50));
 
@@ -108,10 +120,31 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 
                 // 关键：用 NSWindow.windowNumberAtPoint 做命中测试 ——
                 // 不光检查"鼠标在不在浮窗 frame 内"，还要确认浮窗在该点是**最上层**。
-                let inside = is_floating_topmost_at(&app, mouse);
+                let raw_inside = is_floating_topmost_at(&app, mouse);
 
-                if inside != last_inside {
-                    last_inside = inside;
+                // 边缘防抖：连续 DEBOUNCE_TICKS 次同方向才确认状态翻转
+                let inside = match pending_inside {
+                    Some(p) if p == raw_inside => {
+                        pending_count += 1;
+                        if pending_count >= DEBOUNCE_TICKS {
+                            // 状态翻转确认
+                            pending_inside = None;
+                            pending_count = 0;
+                            raw_inside
+                        } else {
+                            last_inside // 还没确认，保持上次 emit 状态
+                        }
+                    }
+                    _ => {
+                        // raw_inside 跟 pending 不一致 → 重置 pending
+                        pending_inside = Some(raw_inside);
+                        pending_count = 1;
+                        last_inside
+                    }
+                };
+
+                if inside != last_emitted {
+                    last_emitted = inside;
 
                     // (1) 永远 emit —— 驱动前端 body[data-hover]，让 CSS hover 生效
                     if let Err(e) = app.emit("usticky://floating-hover", inside) {
@@ -128,6 +161,8 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                         set_window_level(&app, level, false);
                     }
                 }
+
+                last_inside = inside;
             }
         });
     if let Err(e) = builder {

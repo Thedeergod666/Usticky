@@ -478,13 +478,31 @@ async function init() {
     .catch((e) => console.error("[usticky] listen locale-changed failed", e));
 
   // ── Hover attribute toggle ──
+  //
+  // 三个来源会触发 body[data-hover]：
+  //   1. JS mouseenter/mouseleave（在 body 上）
+  //   2. Rust hover emitter（50ms tick）emit usticky://floating-hover
+  //   3. CSS :hover（被 body[data-hover] 自身覆盖）
+  //
+  // 鼠标在浮窗边缘抖动时，1 + 2 会反复翻转 → backdrop-filter 28px 反复
+  // 重合成 → 视觉上"光标闪烁"。这里用 rAF 合并 + debounce，把多源
+  // 抖动收敛成最多 1 次 / 帧的 DOM 写。
+  let pendingHover: boolean | null = null;
+  let hoverRafId: number | null = null;
   const setHoverAttr = (on: boolean) => {
-    if (on) document.body.dataset.hover = "1";
-    else delete document.body.dataset.hover;
+    if (pendingHover === on) return; // 同帧重复写，跳过
+    pendingHover = on;
+    if (hoverRafId !== null) return;
+    hoverRafId = requestAnimationFrame(() => {
+      hoverRafId = null;
+      const target = pendingHover!;
+      pendingHover = null;
+      if (target) document.body.dataset.hover = "1";
+      else if (document.body.dataset.hover) delete document.body.dataset.hover;
+    });
   };
-  // macOS / Win 上非 key window CSS :hover 不生效，后端 hover emitter emit
-  // usticky://floating-hover 兜底驱动 body[data-hover]。JS mouseenter/leave
-  // 仍挂作非 macOS/Win 平台的二级兜底。
+  // macOS / Win 上非 key window CSS :hover 不生效 —— Rust hover emitter 是
+  // 权威源；JS mouseenter/leave 留作 Linux 兜底（不依赖 Rust 实现）。
   document.body.addEventListener("mouseenter", () => setHoverAttr(true));
   document.body.addEventListener("mouseleave", () => setHoverAttr(false));
 
