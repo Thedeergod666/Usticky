@@ -27,6 +27,37 @@ pub enum TodoStatus {
     Done,
 }
 
+/// 浮窗层级模式 —— 跟 Musage 同款三档：
+/// - PinTop: 始终置顶（kCGFloatingWindowLevel / HWND_TOPMOST）
+/// - PinBottom: 默认置底（kCGNormalWindowLevel - 1 / HWND_BOTTOM），
+///              鼠标 hover 时临时置顶
+/// - Normal: 不强制层级，跟普通窗口一样
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PinMode {
+    PinTop,
+    PinBottom,
+    Normal,
+}
+
+impl Default for PinMode {
+    fn default() -> Self {
+        Self::PinTop  // v0.1 默认置顶（alwaysOnTop: true 同源）
+    }
+}
+
+impl PinMode {
+    /// 解析前端传过来的字符串。失败返 None。
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "pin_top" => Some(Self::PinTop),
+            "pin_bottom" => Some(Self::PinBottom),
+            "normal" => Some(Self::Normal),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TodoPriority {
     P0,
@@ -60,10 +91,12 @@ pub struct WindowGeom {
 ///
 /// `todos` 是平铺数组 —— Usticky 不分层不分项目，简单就是好。
 /// `window_geom` 单独存（避免 todos 的 update 触发不必要的窗口几何 persist）。
+/// `pin_mode` 跨重启保留 —— PinBottom 用户一般不会反复切，存盘一次保终身。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StoreData {
     pub todos: Vec<Todo>,
     pub window_geom: WindowGeom,
+    pub pin_mode: Option<PinMode>,
 }
 
 /// Store —— 内存态 + 文件路径。
@@ -174,6 +207,14 @@ impl Store {
     pub fn update_window_size(&mut self, w: Option<u32>, h: Option<u32>) {
         if let Some(w) = w { self.data.window_geom.width = Some(w); }
         if let Some(h) = h { self.data.window_geom.height = Some(h); }
+    }
+
+    pub fn pin_mode(&self) -> PinMode {
+        self.data.pin_mode.unwrap_or_default()
+    }
+
+    pub fn set_pin_mode(&mut self, mode: PinMode) {
+        self.data.pin_mode = Some(mode);
     }
 }
 

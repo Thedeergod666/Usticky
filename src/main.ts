@@ -46,6 +46,11 @@ let lastRenderedSnap: TodoSnapshot | null = null;
 let lastFitFingerprint: string | null = null;
 let sortableInstances: Sortable[] = [];  // 保存实例，cleanup 用
 
+// 浮窗层级模式（pin_top / pin_bottom / normal）
+// 启动时从后端 get_pin_mode 拉，跟 usticky://pin-mode-changed 事件同步
+type PinMode = "pin_top" | "pin_bottom" | "normal";
+let currentPinMode: PinMode = "pin_top";  // 默认跟后端 PinMode::default() 对齐
+
 // ── mini flash（复用 Musage 模式） ──
 let miniFlashTimer: ReturnType<typeof setTimeout> | null = null;
 function showMiniFlash(msg: string): void {
@@ -250,19 +255,35 @@ function updateFoot(snap: TodoSnapshot) {
   let foot = app.querySelector<HTMLElement>(".foot");
   const count = snap.todos.filter((x) => x.status === "pending").length;
   const text = t("app.count.other", { count });
+
+  // pin mode 三档切换：紧凑的 segmented control，跟 .foot 共一行
+  const pinCtrl = `
+    <div class="pin-ctrl" data-pin="${currentPinMode}">
+      <span class="pin-ctrl-label">${escapeHtml(t("app.pin.label"))}</span>
+      <button class="pin-btn ${currentPinMode === "pin_top" ? "active" : ""}" data-pin-value="pin_top">${escapeHtml(t("app.pin.top"))}</button>
+      <button class="pin-btn ${currentPinMode === "pin_bottom" ? "active" : ""}" data-pin-value="pin_bottom">${escapeHtml(t("app.pin.bottom"))}</button>
+      <button class="pin-btn ${currentPinMode === "normal" ? "active" : ""}" data-pin-value="normal">${escapeHtml(t("app.pin.normal"))}</button>
+    </div>
+  `;
+
   if (foot) {
-    foot.textContent = text;
+    foot.innerHTML = `<span class="foot-text">${escapeHtml(text)}</span>${pinCtrl}`;
   } else {
     foot = document.createElement("div");
     foot.className = "foot";
-    foot.textContent = text;
-    foot.style.fontSize = "10px";
-    foot.style.color = "var(--text-faint)";
-    foot.style.padding = "4px 6px 2px";
-    foot.style.textAlign = "center";
-    foot.style.textShadow = "var(--text-shadow)";
+    foot.innerHTML = `<span class="foot-text">${escapeHtml(text)}</span>${pinCtrl}`;
     app.appendChild(foot);
   }
+}
+
+/// 只刷新 pin-ctrl 的 active 状态（避免整个 foot 重建）
+function refreshPinCtrl() {
+  const ctrl = app.querySelector<HTMLElement>(".pin-ctrl");
+  if (!ctrl) return;
+  ctrl.dataset.pin = currentPinMode;
+  ctrl.querySelectorAll<HTMLElement>(".pin-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.pinValue === currentPinMode);
+  });
 }
 
 // ── 自适应高度 ──
@@ -390,6 +411,7 @@ async function init() {
 
   onLocaleChange(() => {
     document.title = t("app.title");
+    refreshPinCtrl();  // pin-ctrl 文案要随 locale 变（"Top"/"Bottom"/"Normal" ↔ "置顶"/"置底"/"默认"）
     if (lastRenderedSnap) render(lastRenderedSnap);
   });
 
@@ -428,6 +450,25 @@ async function init() {
     renderEmptyState();
   }
 
+  // ── 启动时拉一次 pin mode + 监听 pin-mode-changed 事件 ──
+  let unlistenPinMode: UnlistenFn | null = null;
+  try {
+    currentPinMode = await invoke<PinMode>("get_pin_mode");
+    refreshPinCtrl();
+    setupPinModeHoverRaise(currentPinMode);
+  } catch (e) {
+    console.error("[usticky] get_pin_mode failed", e);
+  }
+  listen<PinMode>("usticky://pin-mode-changed", (e) => {
+    if (e.payload !== currentPinMode) {
+      currentPinMode = e.payload;
+      refreshPinCtrl();
+      setupPinModeHoverRaise(currentPinMode);
+    }
+  })
+    .then((fn) => (unlistenPinMode = fn))
+    .catch((e) => console.error("[usticky] listen pin-mode-changed failed", e));
+
   // ── 浮窗拖动：左键 mousedown 但 target 是 .todo-card 或 input/button 时跳过 ──
   const w = getCurrentWindow();
   app.addEventListener("mousedown", (e) => {
@@ -458,12 +499,23 @@ async function init() {
     }
   });
 
-  // ── 事件代理：empty state CTA / due label click ──
-  app.addEventListener("click", (e) => {
+  // ── 事件代理：empty state CTA / due label click / pin mode 切换 ──
+  app.addEventListener("click", async (e) => {
     const target = e.target as HTMLElement;
     if (target.closest(".focus-input")) {
       const input = app.querySelector<HTMLInputElement>(".todo-input input");
       if (input) input.focus();
+    } else if (target.closest(".pin-btn")) {
+      const btn = target.closest<HTMLElement>(".pin-btn");
+      const newMode = btn?.dataset.pinValue as PinMode | undefined;
+      if (newMode && newMode !== currentPinMode) {
+        try {
+          await invoke("set_pin_mode", { mode: newMode });
+          // 后端会 emit usticky://pin-mode-changed，handler 在上面已经接好
+        } catch (err) {
+          console.error("[usticky] set_pin_mode failed", err);
+        }
+      }
     }
   });
 
@@ -471,8 +523,39 @@ async function init() {
   window.addEventListener("beforeunload", () => {
     unlistenTodos?.();
     unlistenQuickAdd?.();
+    unlistenPinMode?.();
     cleanupSortables();
+    // 摘掉 hover-raise listener
+    document.body.removeEventListener("mouseenter", onBodyHoverEnter);
+    document.body.removeEventListener("mouseleave", onBodyHoverLeave);
   });
+}
+
+/// PinBottom 模式挂 body mouseenter/mouseleave → 调 set_floating_hover_raise。
+/// macOS / Win 上 tracker 已自行处理（commands 那边识别 PinBottom 后转发到 native），
+/// 这里只是"前端兜底信号"，让后端知道前端看到 hover 了，跨平台一致。
+///
+/// 其它模式不挂监听，避免无意义 IPC。
+function setupPinModeHoverRaise(mode: PinMode) {
+  // 幂等：先摘再装
+  document.body.removeEventListener("mouseenter", onBodyHoverEnter);
+  document.body.removeEventListener("mouseleave", onBodyHoverLeave);
+  if (mode !== "pin_bottom") return;
+  // 跟 setHoverAttr 共享一个 target —— body 撑满整个浮窗（CSS margin:0 + bg:transparent），
+  // 鼠标移出浮窗时 mouseleave 100% 触发。
+  document.body.addEventListener("mouseenter", onBodyHoverEnter);
+  document.body.addEventListener("mouseleave", onBodyHoverLeave);
+}
+
+function onBodyHoverEnter() {
+  invoke("set_floating_hover_raise", { hovering: true }).catch((e) =>
+    console.error(e),
+  );
+}
+function onBodyHoverLeave() {
+  invoke("set_floating_hover_raise", { hovering: false }).catch((e) =>
+    console.error(e),
+  );
 }
 
 function ensureInputBar() {

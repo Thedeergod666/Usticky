@@ -2,16 +2,19 @@
 //
 // 关键设计（沿用 Musage v0.2 经验，详见 ~/Project/Usticky/AGENTS.md）：
 //   - crate-type = ["staticlib", "rlib"] 绕过 MinGW ld 16-bit ordinal 溢出
-//   - storage trait + JSON impl —— 后续换 sqlite 只需新加一个 impl
 //   - tokio::sync::RwLock<Store> 持有内存态，IPC 走 &State<...>
 //   - WindowEvent::Moved/Resized → spawn 异步任务持久化（不阻塞 UI 线程）
 //   - 单文件 JSON 原子写：tmp → rename + Unix 0600 + parse 失败 backup .bak.<ts>
+//   - 跨平台 pin mode 三档：pin_top / pin_bottom / normal
+//     （macOS: NSWindow.setLevel; Win: HWND_TOPMOST/BOTTOM; Linux: no-op）
+//   - hover emitter 50ms tick 永远运行（驱动 CSS glass 效果），
+//     PinBottom 模式额外切 NSWindow level / Win z-order
 //
 // 不沿用 Musage 的：
 //   - 11 provider / QuotaSource trait
 //   - poller / backoff
 //   - tray 动态进度条（Usticky tray 是"任务总数 badge"，v0.1 stub）
-//   - platform/macos.rs 的 PinBottom hover emitter（v0.1 不做）
+//   - PinBottom hover emitter 在 Musage 是 v0.2 才加的，Usticky v0.1 直接搬
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -22,7 +25,7 @@ mod platform;
 mod todo;
 mod tray;
 
-use todo::Store;
+use todo::{PinMode, Store};
 
 pub type SharedStore = Arc<tokio::sync::RwLock<Store>>;
 
@@ -86,6 +89,20 @@ pub fn run() {
             // 4. 系统托盘（v0.1 stub：显示/隐藏/退出）
             tray::build_tray(app.handle())?;
 
+            // 5. 启动 hover emitter + 应用上次持久化的 pin mode
+            //    （Musage 经验：tracker 始终跑，不分 pin mode；
+            //      LEVEL_SWITCHING_ACTIVE 在 PinBottom 模式才翻 true）
+            let initial_pin_mode = store.blocking_read().pin_mode();
+            match initial_pin_mode {
+                PinMode::PinTop => platform::set_window_pin_top(app.handle()),
+                PinMode::PinBottom => platform::set_window_pin_bottom(app.handle()),
+                PinMode::Normal => platform::set_window_normal(app.handle()),
+            }
+            // PinTop / Normal 模式时 start_hover_emitter 不会被内部调，
+            // 但 hover 事件 emit 仍要工作（驱动 CSS glass 效果），
+            // 所以无条件下调一次启动 tracker。
+            platform::start_hover_emitter(app.handle().clone());
+
             // 5. 注册浮窗位置/尺寸持久化（Musage 经验：spawn 异步写，不阻塞 UI 线程）
             if let Some(window) = app.get_webview_window("floating") {
                 let store_for_geom = store.clone();
@@ -141,6 +158,9 @@ pub fn run() {
             commands::show_floating_window,
             commands::get_app_locale,
             commands::set_app_locale,
+            commands::get_pin_mode,
+            commands::set_pin_mode,
+            commands::set_floating_hover_raise,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Usticky");

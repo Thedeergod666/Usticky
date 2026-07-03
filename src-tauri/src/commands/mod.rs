@@ -7,8 +7,17 @@
 // 也走 camelCase 转换（Musage PR 1b 实测坑）。
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::todo::{Todo, TodoStatus, TodoSnapshot};
+use crate::todo::{PinMode, Todo, TodoStatus, TodoSnapshot};
 use crate::SharedStore;
+
+/// 把 pin mode 应用到窗口（跨平台，platform/mod.rs 统一导出）。
+pub fn apply_pin_mode_to_window(app: &AppHandle, mode: PinMode) {
+    match mode {
+        PinMode::PinTop => crate::platform::set_window_pin_top(app),
+        PinMode::PinBottom => crate::platform::set_window_pin_bottom(app),
+        PinMode::Normal => crate::platform::set_window_normal(app),
+    }
+}
 
 fn emit_todos_changed(app: &AppHandle, snap: &TodoSnapshot) {
     let _ = app.emit("usticky://todos-changed", snap);
@@ -167,5 +176,57 @@ pub fn get_app_locale() -> String {
 pub fn set_app_locale(app: AppHandle, locale: String) -> Result<(), String> {
     rust_i18n::set_locale(&locale);
     let _ = app.emit("usticky://locale-changed", locale);
+    Ok(())
+}
+
+// ── Pin mode ──
+
+#[tauri::command]
+pub async fn get_pin_mode(store: State<'_, SharedStore>) -> Result<String, String> {
+    let s = store.read().await;
+    Ok(match s.pin_mode() {
+        PinMode::PinTop => "pin_top".into(),
+        PinMode::PinBottom => "pin_bottom".into(),
+        PinMode::Normal => "normal".into(),
+    })
+}
+
+#[tauri::command]
+pub async fn set_pin_mode(
+    app: AppHandle,
+    store: State<'_, SharedStore>,
+    mode: String,
+) -> Result<(), String> {
+    let parsed = PinMode::from_str_opt(&mode)
+        .ok_or_else(|| format!("invalid pin mode: {}", mode))?;
+    apply_pin_mode_to_window(&app, parsed);
+    {
+        let mut s = store.write().await;
+        s.set_pin_mode(parsed);
+    }
+    // 持久化
+    let snap = {
+        let s = store.read().await;
+        s.snapshot()
+    };
+    if let Err(e) = store.read().await.persist(&app) {
+        tracing::error!("persist failed: {}", e);
+    }
+    let _ = app.emit("usticky://pin-mode-changed", &mode);
+    let _ = snap;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_floating_hover_raise(
+    app: AppHandle,
+    store: State<'_, SharedStore>,
+    hovering: bool,
+) -> Result<(), String> {
+    let mode = store.read().await.pin_mode();
+    if mode != PinMode::PinBottom {
+        return Ok(());
+    }
+    crate::platform::set_window_hover_raise(&app, hovering);
     Ok(())
 }
