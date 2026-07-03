@@ -477,34 +477,61 @@ async function init() {
     .then((fn) => (unlistenLocale = fn))
     .catch((e) => console.error("[usticky] listen locale-changed failed", e));
 
-  // ── Hover attribute toggle ──
+  // ── Hover 状态同步：驱动 body[data-hover] 让 iOS 26 玻璃效果生效 ──
   //
-  // 三个来源会触发 body[data-hover]：
-  //   1. JS mouseenter/mouseleave（在 body 上）
-  //   2. Rust hover emitter（50ms tick）emit usticky://floating-hover
-  //   3. CSS :hover（被 body[data-hover] 自身覆盖）
+  // 双路径并存（先到先生效，幂等）：
+  //   1. Rust `usticky://floating-hover`（macOS 必需 —— WKWebView 非 key window
+  //      不分发 mouseMoved，CSS `:hover` 在浮窗未聚焦时失效，Rust 用
+  //      NSEvent.mouseLocation 全局轮询绕过）
+  //   2. JS mouseenter/mouseleave（Win/Linux 主路径；macOS 聚焦态下兜底）
   //
-  // 鼠标在浮窗边缘抖动时，1 + 2 会反复翻转 → backdrop-filter 28px 反复
-  // 重合成 → 视觉上"光标闪烁"。这里用 rAF 合并 + debounce，把多源
-  // 抖动收敛成最多 1 次 / 帧的 DOM 写。
-  let pendingHover: boolean | null = null;
-  let hoverRafId: number | null = null;
+  // 沿用 Musage 2026-07-03 fix 的三层保险（v0.2.x 闪烁修复）：
+  //   (a) 失焦 / 页面隐藏时把 body mouseenter 视为 spurious 忽略；
+  //       顺手挡住 deactivate→reactivate 切换瞬间 WKWebView 的 spurious
+  //       mouseenter 路径。
+  //   (b) hover 显形 40ms debounce —— enter→leave 抖动被吞；正常 hover
+  //       仅延后 40ms 不可察觉。leave 方向不 debounce（撤销要快）。
+  //   (c) Rust emit 同值去重 —— hover emitter 内部已有 dwell-time
+  //       hysteresis（enter 2 ticks / exit 1 tick），这里再做一层保险
+  //       避免 CSS spring 动画进行中反复重置起始点。
   const setHoverAttr = (on: boolean) => {
-    if (pendingHover === on) return; // 同帧重复写，跳过
-    pendingHover = on;
-    if (hoverRafId !== null) return;
-    hoverRafId = requestAnimationFrame(() => {
-      hoverRafId = null;
-      const target = pendingHover!;
-      pendingHover = null;
-      if (target) document.body.dataset.hover = "1";
-      else if (document.body.dataset.hover) delete document.body.dataset.hover;
-    });
+    if (on) document.body.dataset.hover = "1";
+    else delete document.body.dataset.hover;
   };
-  // macOS / Win 上非 key window CSS :hover 不生效 —— Rust hover emitter 是
-  // 权威源；JS mouseenter/leave 留作 Linux 兜底（不依赖 Rust 实现）。
-  document.body.addEventListener("mouseenter", () => setHoverAttr(true));
-  document.body.addEventListener("mouseleave", () => setHoverAttr(false));
+  // (a) 失焦 / 页面隐藏时把 body mouseenter 视为 spurious 忽略
+  let focused = true;
+  let pageVisible = true;
+  getCurrentWindow()
+    .onFocusChanged(({ payload: f }) => {
+      focused = f;
+      if (!f) setHoverAttr(false);
+    })
+    .catch(() => {});
+  document.addEventListener("visibilitychange", () => {
+    pageVisible = document.visibilityState === "visible";
+    if (!pageVisible) setHoverAttr(false);
+  });
+  // (b) 显形 debounce：enter→leave < 40ms 视为抖动，不切 data-hover。
+  //     显形方向 debounce（enter 后等 40ms 才设 hover），撤销方向照常立即。
+  let hoverEnterTimer: ReturnType<typeof setTimeout> | null = null;
+  const HOVER_DEBOUNCE_MS = 40;
+  const onBodyMouseEnter = () => {
+    if (!focused || !pageVisible) return; // 失焦 / 隐藏态 → spurious 忽略
+    if (hoverEnterTimer !== null) clearTimeout(hoverEnterTimer);
+    hoverEnterTimer = setTimeout(() => {
+      hoverEnterTimer = null;
+      setHoverAttr(true);
+    }, HOVER_DEBOUNCE_MS);
+  };
+  const onBodyMouseLeave = () => {
+    if (hoverEnterTimer !== null) {
+      clearTimeout(hoverEnterTimer);
+      hoverEnterTimer = null;
+    }
+    setHoverAttr(false);
+  };
+  document.body.addEventListener("mouseenter", onBodyMouseEnter);
+  document.body.addEventListener("mouseleave", onBodyMouseLeave);
 
   // ── IPC: 监听 todos-changed 事件 ──
   let unlistenTodos: UnlistenFn | null = null;
@@ -515,8 +542,23 @@ async function init() {
     .catch((e) => console.error("[usticky] listen todos-changed failed", e));
 
   // 后端 hover emitter 兜底（macOS / Win），与 JS mouseenter/leave 等效
+  // (c) Rust emit 同值去重：避免 CSS spring 动画进行中反复重置起始点。
+  //     Rust 端已有 dwell-time hysteresis，这里再做一层保险。
+  //     失焦 / 隐藏态下 Rust 仍可能 emit true（50ms tick 周期），挡掉。
   let unlistenHover: UnlistenFn | null = null;
-  listen<boolean>("usticky://floating-hover", (e) => setHoverAttr(e.payload))
+  let lastHoverPayload: boolean | null = null;
+  listen<boolean>("usticky://floating-hover", (e) => {
+    if (e.payload && (!focused || !pageVisible)) return;
+    if (lastHoverPayload === e.payload) return;
+    lastHoverPayload = e.payload;
+    // Rust 路径直接同步切（已经过 50ms tick 去抖）；cancel pending enter
+    // timer（如果用户从 enter 进入但 40ms 内 Rust 也 emit true，按 Rust 为准）
+    if (hoverEnterTimer !== null) {
+      clearTimeout(hoverEnterTimer);
+      hoverEnterTimer = null;
+    }
+    setHoverAttr(e.payload);
+  })
     .then((fn) => (unlistenHover = fn))
     .catch((e) => console.error("[usticky] listen floating-hover failed", e));
 
@@ -611,9 +653,12 @@ async function init() {
     unlistenLocale?.();
     unlistenHover?.();
     cleanupSortables();
+    // 摘掉 hover listener（setHoverAttr 路径，命名引用）
+    document.body.removeEventListener("mouseenter", onBodyMouseEnter);
+    document.body.removeEventListener("mouseleave", onBodyMouseLeave);
     // 摘掉 hover-raise listener（仅在 PinBottom 模式注册过，需要命名引用）
-    document.body.removeEventListener("mouseenter", onBodyHoverEnter);
-    document.body.removeEventListener("mouseleave", onBodyHoverLeave);
+    document.body.removeEventListener("mouseenter", onPinBottomHoverEnter);
+    document.body.removeEventListener("mouseleave", onPinBottomHoverLeave);
   });
 }
 
@@ -624,21 +669,21 @@ async function init() {
 /// 其它模式不挂监听，避免无意义 IPC。
 function setupPinModeHoverRaise(mode: PinMode) {
   // 幂等：先摘再装
-  document.body.removeEventListener("mouseenter", onBodyHoverEnter);
-  document.body.removeEventListener("mouseleave", onBodyHoverLeave);
+  document.body.removeEventListener("mouseenter", onPinBottomHoverEnter);
+  document.body.removeEventListener("mouseleave", onPinBottomHoverLeave);
   if (mode !== "pin_bottom") return;
   // 跟 setHoverAttr 共享一个 target —— body 撑满整个浮窗（CSS margin:0 + bg:transparent），
   // 鼠标移出浮窗时 mouseleave 100% 触发。
-  document.body.addEventListener("mouseenter", onBodyHoverEnter);
-  document.body.addEventListener("mouseleave", onBodyHoverLeave);
+  document.body.addEventListener("mouseenter", onPinBottomHoverEnter);
+  document.body.addEventListener("mouseleave", onPinBottomHoverLeave);
 }
 
-function onBodyHoverEnter() {
+function onPinBottomHoverEnter() {
   invoke("set_floating_hover_raise", { hovering: true }).catch((e) =>
     console.error(e),
   );
 }
-function onBodyHoverLeave() {
+function onPinBottomHoverLeave() {
   invoke("set_floating_hover_raise", { hovering: false }).catch((e) =>
     console.error(e),
   );

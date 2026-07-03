@@ -117,10 +117,12 @@ body[data-hover] #app {
   /* ⚠️ 不 transition backdrop-filter / box-shadow —— 它们都是合成层重操作，
      在 Rust hover emitter 50ms tick 抖动时会反复插值 → 光标闪烁。
      视觉上从 idle 到 hover 是离散切，保留 background-color / border-color
-     的 0.18s 过渡已足够"软着陆"。 */
+     的过渡已足够"软着陆"。
+     timing function 用 cubic-bezier(0.22, 1, 0.36, 1)（ease-out-quint）：
+     开头快、结尾稳 —— 视觉上"马上出现然后平滑过渡到位"，跟用户期望一致。 */
   transition:
-    background-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
-    border-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
     transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
   cursor: grab;
 }
@@ -180,7 +182,9 @@ body[data-hover] #app {
   color: var(--text-bright);
   letter-spacing: -0.1px;
   text-shadow: var(--text-shadow);
-  transition: color 0.28s, text-shadow 0.28s;
+  /* ease-out-quint：开头快结尾稳 —— hover 进入时颜色"马上出现然后平滑过渡" */
+  transition: color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+              text-shadow 0.22s cubic-bezier(0.22, 1, 0.36, 1);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -197,7 +201,8 @@ body[data-hover] #app {
   background: rgba(255, 255, 255, 0.06);
   letter-spacing: 0.2px;
   font-variant-numeric: tabular-nums;
-  transition: color 0.28s, background-color 0.28s;
+  transition: color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+              background-color 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 body[data-hover] #app .todo-due.today    { color: var(--c-data-warn);  background: rgba(255, 159, 10, 0.18); }
 body[data-hover] #app .todo-due.tomorrow { color: var(--c-data-info);  background: rgba(10, 132, 255, 0.18); }
@@ -281,7 +286,7 @@ body[data-hover] #app .todo-due.days     { color: var(--c-data-cyan);  backgroun
   color: var(--text-faint);
   padding: 4px 4px 0;
   text-shadow: var(--text-shadow);
-  transition: color 0.28s;
+  transition: color 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 /* ── 空态 ── */
@@ -385,7 +390,8 @@ body[data-low-power] *::after {
   color: var(--text-faint);
   text-shadow: var(--text-shadow);
   flex: 0 0 auto;
-  transition: color 0.28s, text-shadow 0.28s;
+  transition: color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+              text-shadow 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .pin-ctrl-label {
   margin-right: 2px;

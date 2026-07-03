@@ -31,7 +31,6 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
-use objc2::MainThreadMarker;
 use objc2_app_kit::{NSEvent, NSWindow};
 use objc2_core_graphics::{kCGFloatingWindowLevel, kCGNormalWindowLevel, CGWindowLevel};
 use objc2_foundation::NSPoint;
@@ -93,7 +92,18 @@ pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) 
 }
 
 /// 启动 hover emitter 线程。idempotent —— 第二次调用立即返回。
-/// 由 lib.rs setup() 调一次即可。启动后整个 app 生命周期不停。
+/// 由 lib.rs setup() 调一次即可。启动后整个 app 生命周期不停。20Hz 轮询。
+///
+/// **dwell-time hysteresis**（沿用 Musage 2026-07-03 fix）：
+/// 多个 transparent + always-on-top 窗口共存时光标静止在浮窗边缘，
+/// `windowNumberAtPoint` 返回值在两个 window number 之间抖；20Hz tick
+/// 里 inside 持续翻转 → 每次翻转 emit 一次 → 前端每次都 toggle
+/// body[data-hover] → CSS spring 反复起头又被瞬间打断 → 肉眼看到闪。
+///
+/// 修复：enter 阈值 2 ticks（100ms）/ exit 阈值 1 tick（50ms）。
+/// 离开比进入快 —— 用户离开时希望玻璃及时撤销；进入时多 1 tick 防抖。
+/// Usticky 比 Musage（enter 3 / exit 2）略激进：因为玻璃材质已常驻强开，
+/// hover 只切 color / text-shadow，抖动视觉影响小，可以更快响应。
 pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
     if TRACKER_RUNNING.swap(true, Ordering::SeqCst) {
         return; // 已在跑
@@ -102,17 +112,19 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
         .name("usticky-hover-emitter".into())
         .spawn(move || {
             tracing::debug!("hover emitter 启动");
-            let mut last_emitted = false;
-            // v2（2026-07-03）：去掉了 150ms 防抖（DEBOUNCE_TICKS=3）。
-            // 旧防抖是为了避免边缘抖动时 backdrop-filter 28px 反复重合成闪烁，
-            // 但 v2 把玻璃材质常驻强开后，hover 只切 color / text-shadow
-            // （CSS variable swap），这些属性的前端 transition（.todo-title
-            // 0.28s color 等）已经能吸收抖动 —— color 过渡中反复方向只是
-            // "颜色微微抖动"，不像 backdrop-filter 反复重合成那样刺眼。
-            // 前端 main.ts 的 setHoverAttr 还用 rAF 合并同帧多次 emit，
-            // 进一步降低 DOM 写入频率。
-            // 净效果：50ms tick 检测到就立即 emit，进入/离开都无感知延迟。
-
+            let mut last_inside = false;
+            // dwell-time hysteresis（沿用 Musage 2026-07-03 fix）：
+            // - **enter**：inside=true 必须连续 ≥2 个 tick（100ms）才采纳，
+            //   抖动短脉冲被吞。
+            // - **exit**：inside=false 必须连续 ≥1 个 tick（50ms）就采纳，
+            //   离开要快（用户离开时希望玻璃及时撤销）。
+            // - **enter→exit 切换瞬间 reset 计数器**：避免在过渡中误累计。
+            //
+            // Usticky 比 Musage 略激进（Musage enter 3 / exit 2）：因为 v2
+            // 把玻璃材质常驻强开后，hover 只切 color / text-shadow，抖动
+            // 视觉影响小，可以更快响应。
+            let mut pending_ticks: u8 = 0;
+            let mut pending_value = false;
             loop {
                 thread::sleep(Duration::from_millis(50));
 
@@ -122,23 +134,44 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                 // 不光检查"鼠标在不在浮窗 frame 内"，还要确认浮窗在该点是**最上层**。
                 let inside = is_floating_topmost_at(&app, mouse);
 
-                if inside != last_emitted {
-                    last_emitted = inside;
+                if inside == last_inside {
+                    pending_ticks = 0;
+                    continue;
+                }
 
-                    // (1) 永远 emit —— 驱动前端 body[data-hover]，让 CSS hover 生效
-                    if let Err(e) = app.emit("usticky://floating-hover", inside) {
-                        tracing::trace!(error = %e, "emit hover 失败");
-                    }
+                // inside 与 last_inside 不同 —— 是真切换还是抖动？
+                if pending_value != inside {
+                    pending_value = inside;
+                    pending_ticks = 1;
+                } else {
+                    pending_ticks = pending_ticks.saturating_add(1);
+                }
 
-                    // (2) PinBottom 模式：同步切 NSWindow level
-                    if LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst) {
-                        let level = if inside {
-                            LEVEL_FLOATING
-                        } else {
-                            LEVEL_BELOW_NORMAL
-                        };
-                        set_window_level(&app, level, false);
-                    }
+                const ENTER_THRESHOLD: u8 = 2; // 100ms
+                const EXIT_THRESHOLD: u8 = 1;  // 50ms
+                let threshold = if pending_value { ENTER_THRESHOLD } else { EXIT_THRESHOLD };
+
+                if pending_ticks < threshold {
+                    continue;
+                }
+
+                // 阈值达成 —— 采纳新状态，emit + 切 level
+                last_inside = inside;
+                pending_ticks = 0;
+
+                // (1) 永远 emit —— 驱动前端 body[data-hover]，让 CSS hover 生效
+                if let Err(e) = app.emit("usticky://floating-hover", inside) {
+                    tracing::trace!(error = %e, "emit hover 失败");
+                }
+
+                // (2) PinBottom 模式：同步切 NSWindow level
+                if LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst) {
+                    let level = if inside {
+                        LEVEL_FLOATING
+                    } else {
+                        LEVEL_BELOW_NORMAL
+                    };
+                    set_window_level(&app, level, false);
                 }
             }
         });
@@ -176,11 +209,24 @@ pub fn set_window_level<R: Runtime>(
     });
 }
 
-/// 命中测试：鼠标在 `point` 处时，浮窗是否是**最上层**窗口。
+/// 命中测试：鼠标在 `point` 处时，浮窗是否被 hover。
 ///
-/// 用 `+[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:]` 传 0
-/// （穿透所有 app 检查整个屏幕），返回该点 topmost window 的 ID。
-/// 与浮窗自己的 `windowNumber` 比对，相等则 hover 在浮窗**可见**部分。
+/// **v2 实现（2026-07-03 fix）**：改用 `frame + visible` 检测，**不再用**
+/// `windowNumberAtPoint`。
+///
+/// 旧实现的 bug：浮窗 `transparent: true` → `NSWindow.opaque = false`，
+/// `windowNumberAtPoint` 在 webview 内容像素 alpha 低于阈值时**跳过该窗口**。
+/// Usticky 的 `#app` 完全透明，只有 `.todo-card` 有 82% alpha，所以鼠标
+/// 停在 #app padding / 卡片间隙时命中测试返回浮窗下方的窗口 →
+/// `is_floating_topmost_at` 返 false → emit hover=false → 玻璃消失。
+/// 体验上表现为"hover 时过一回会消失" + "离开时先出现然后消失"。
+///
+/// 新实现用 `frame.contains(point)` + `is_visible()`：
+/// - PinTop / Normal 模式：浮窗始终在最顶层（或跟普通窗口一样），frame 检测足够
+/// - PinBottom 模式：浮窗被遮挡时，frame 检测会触发 hover=true → 浮窗提升到
+///   floating level。这是 PinBottom 模式的预期行为（"hover 临时置顶"），
+///   用户选了 PinBottom 就接受了这个。原来 windowNumberAtPoint 想"避免被
+///   遮挡时误触发"，但代价是 transparent 区域命中测试失效，得不偿失。
 ///
 /// 全局复用 `std::sync::Mutex<Option<bool>>` + `Condvar` 单槽位
 /// （外层包 `OnceLock<Arc<...>>` 复用），避免 20Hz × 24h 的 allocator churn。
@@ -206,25 +252,27 @@ fn is_floating_topmost_at<R: Runtime>(app: &AppHandle<R>, point: NSPoint) -> boo
     let dispatch_result = app.run_on_main_thread(move || {
         let result = (|| -> Option<bool> {
             let win = app2.get_webview_window("floating")?;
+            // 浮窗必须可见（hide 状态下不触发 hover）
+            if !win.is_visible().ok()? {
+                return Some(false);
+            }
             let ptr = win.ns_window().ok()?;
             if ptr.is_null() {
                 return None;
             }
             // SAFETY: ptr 来自 webview_window 的 NSWindow，整个 app 生命周期有效。
             let window: &NSWindow = unsafe { &*ptr.cast::<NSWindow>() };
-            let our_id = window.windowNumber();
-            if our_id == 0 {
-                return Some(false);
-            }
-            let Some(mtm) = MainThreadMarker::new() else {
-                tracing::trace!("is_floating_topmost_at: MainThreadMarker 不可用，跳过本 tick");
-                return Some(false);
-            };
-            let topmost = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(point, 0, mtm);
-            Some(topmost == our_id)
+            // 用 NSWindow.frame() 拿屏幕坐标系（原点左下，跟 NSEvent.mouseLocation 一致）
+            // 做 point-in-rect 检测。不再用 windowNumberAtPoint —— transparent 窗口
+            // 的命中测试会跳过 alpha 低的像素，导致 #app padding / 卡片间隙误判。
+            let frame = window.frame();
+            let in_frame = point.x >= frame.origin.x
+                && point.x <= frame.origin.x + frame.size.width
+                && point.y >= frame.origin.y
+                && point.y <= frame.origin.y + frame.size.height;
+            Some(in_frame)
         })();
         // 写结果前先清空旧值 —— 避免读到上一次的 stale 值
-        // （call loop 的 while guard.is_none() 直接跳过、返回旧结果）。
         {
             let mut g = slot2.slot.lock().unwrap_or_else(|e| e.into_inner());
             *g = Some(result.unwrap_or(false));
