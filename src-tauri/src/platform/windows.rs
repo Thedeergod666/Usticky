@@ -66,8 +66,8 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::{HWND as WIN_HWND, POINT, RECT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetCursorPos, GetWindowLongW, GetWindowRect, SetWindowLongW, SetWindowPos,
-    WindowFromPoint, GA_ROOT, GWL_EXSTYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST,
+    GetAncestor, GetCursorPos, GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, SetWindowPos,
+    WindowFromPoint, GA_ROOT, GWLP_EXSTYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
 };
 
@@ -109,19 +109,21 @@ unsafe fn apply_z_order(hwnd: *mut core::ffi::c_void, z: ZOrder) {
     };
 
     // 路 B：直接改 style bit
+    // 64-bit 进程必须用 GetWindowLongPtrW / SetWindowLongPtrW（返回 LONG_PTR = i64），
+    // 避免 LONG (i32) 截断。windows-sys 0.59 把两者放在同一 feature gate。
     match z {
         ZOrder::TopMost => {
-            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-            let new_style: i32 = ex_style | (WS_EX_TOPMOST as i32);
-            SetWindowLongW(hwnd, GWL_EXSTYLE, new_style);
+            let ex_style = GetWindowLongPtrW(hwnd, GWLP_EXSTYLE);
+            let new_style: isize = ex_style | (WS_EX_TOPMOST as isize);
+            SetWindowLongPtrW(hwnd, GWLP_EXSTYLE, new_style);
         }
         ZOrder::Bottom | ZOrder::NotTopMost => {
             // Bottom + NotTopMost 都显式 AND-out WS_EX_TOPMOST。
             // WebView2 会在自己的 message handler 里 re-assert WS_EX_TOPMOST，
             // 不显式清的话 Normal 模式在 Win10/11 上不可靠。
-            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-            let new_style: i32 = ex_style & !(WS_EX_TOPMOST as i32);
-            SetWindowLongW(hwnd, GWL_EXSTYLE, new_style);
+            let ex_style = GetWindowLongPtrW(hwnd, GWLP_EXSTYLE);
+            let new_style: isize = ex_style & !((WS_EX_TOPMOST as isize));
+            SetWindowLongPtrW(hwnd, GWLP_EXSTYLE, new_style);
         }
     }
 

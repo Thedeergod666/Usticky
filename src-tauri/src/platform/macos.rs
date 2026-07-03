@@ -33,13 +33,20 @@ use std::time::Duration;
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSEvent, NSWindow};
-use objc2_core_graphics::{kCGFloatingWindowLevel, kCGNormalWindowLevel, CGWindowLevel};
+use objc2_core_graphics::{
+    kCGDesktopWindowLevel, kCGFloatingWindowLevel, kCGNormalWindowLevel, CGWindowLevel,
+};
 use objc2_foundation::NSPoint;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-/// 始终在底部：在 kCGNormalWindowLevel 之下 1 格。
-/// 比桌面背景高，比所有普通 app 窗口低 → macOS 调度会一直把我们压在最底。
-pub const LEVEL_BELOW_NORMAL: CGWindowLevel = kCGNormalWindowLevel - 1;
+/// 始终在底部：使用 `kCGDesktopWindowLevel - 1`。
+///
+/// 为什么不直接用 kCGNormalWindowLevel - 1 (= -1)：
+/// macOS Sonoma+ 的 Dock / Mission Control 在 kCGNormalWindowLevel 之上的某些
+/// 场景会盖住 -1。桌面图标层 `kCGDesktopWindowLevel` 比 -1 更低且稳定。
+/// 这里取桌面图标之下 1 格：失焦时浮窗处于"桌面图标"之下，仍可见但不被
+/// 普通 app 遮挡 —— 跟 macOS `LEVEL_BELOW_NORMAL` 语义对齐。
+pub const LEVEL_BELOW_NORMAL: CGWindowLevel = kCGDesktopWindowLevel - 1;
 
 /// 始终在顶部：等于 kCGFloatingWindowLevel。
 pub const LEVEL_FLOATING: CGWindowLevel = kCGFloatingWindowLevel;
@@ -59,7 +66,7 @@ static LEVEL_SWITCHING_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// PinBottom 模式启动时调：把 level 切到 below-normal，并开启 hover 切 level。
 /// tracker 已由 [`start_hover_emitter`] 在 app 启动时拉起，这里只翻开关。
 pub fn set_window_pin_bottom<R: Runtime>(app: &AppHandle<R>) {
-    set_window_level(app, LEVEL_BELOW_NORMAL, true); // true = is_pin_bottom
+    set_window_level(app, LEVEL_BELOW_NORMAL, false); // 不失焦隐藏，hover 临时置顶
     LEVEL_SWITCHING_ACTIVE.store(true, Ordering::SeqCst);
     start_hover_emitter(app.clone());
 }
@@ -68,13 +75,13 @@ pub fn set_window_pin_bottom<R: Runtime>(app: &AppHandle<R>) {
 /// hover 事件 emit 不变，前端的玻璃效果继续受惠。
 pub fn set_window_pin_top<R: Runtime>(app: &AppHandle<R>) {
     LEVEL_SWITCHING_ACTIVE.store(false, Ordering::SeqCst);
-    set_window_level(app, LEVEL_FLOATING, false); // false = 非 PinBottom
+    set_window_level(app, LEVEL_FLOATING, false); // 不失焦隐藏，"始终置顶"承诺
 }
 
 /// Normal 模式：level 切回 0，关闭 hover 切 level。
 pub fn set_window_normal<R: Runtime>(app: &AppHandle<R>) {
     LEVEL_SWITCHING_ACTIVE.store(false, Ordering::SeqCst);
-    set_window_level(app, kCGNormalWindowLevel, false); // false = 非 PinBottom
+    set_window_level(app, kCGNormalWindowLevel, true); // 失焦隐藏，跟普通窗口一致
 }
 
 /// hover 切 level 的"前端兜底信号"：macOS 上 tracker 已自行处理，此处 no-op。
@@ -118,7 +125,7 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                         } else {
                             LEVEL_BELOW_NORMAL
                         };
-                        set_window_level(&app, level, true);
+                        set_window_level(&app, level, false);
                     }
                 }
             }
@@ -132,10 +139,16 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 // ── 内部 ──
 
 /// 把浮窗的 NSWindow level 切到 `level`。dispatch 到 main thread（AppKit 强制要求）。
-/// `is_pin_bottom` 控制 setHidesOnDeactivate —— PinBottom 设 false
-/// （否则鼠标一离开焦点窗口就消失），PinTop / Normal 走默认值(true)，
-/// Normal 模式失焦时窗口应被隐藏。
-pub fn set_window_level<R: Runtime>(app: &AppHandle<R>, level: CGWindowLevel, is_pin_bottom: bool) {
+///
+/// `hides_on_deactivate` 控制 setHidesOnDeactivate —— 失焦时是否隐藏。
+/// - Normal 模式：传 true（跟普通窗口行为一致）
+/// - PinTop 模式：传 false（"始终置顶"的承诺 = 失焦也得在）
+/// - PinBottom 模式：传 false（鼠标 hover 临时置顶，要求浮窗随时可达）
+pub fn set_window_level<R: Runtime>(
+    app: &AppHandle<R>,
+    level: CGWindowLevel,
+    hides_on_deactivate: bool,
+) {
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(win) = app2.get_webview_window("floating") {
@@ -144,7 +157,7 @@ pub fn set_window_level<R: Runtime>(app: &AppHandle<R>, level: CGWindowLevel, is
                     // SAFETY: `ptr` 来自 webview_window 的 NSWindow，整个 app 生命周期有效。
                     let window: &NSWindow = unsafe { &*ptr.cast::<NSWindow>() };
                     window.setLevel(level as _);
-                    window.setHidesOnDeactivate(!is_pin_bottom);
+                    window.setHidesOnDeactivate(hides_on_deactivate);
                 }
             }
         }
@@ -198,7 +211,8 @@ fn is_floating_topmost_at<R: Runtime>(app: &AppHandle<R>, point: NSPoint) -> boo
             let topmost = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(point, 0, mtm);
             Some(topmost == our_id)
         })();
-        // mutex poison 恢复（不 .expect()）
+        // 写结果前先清空旧值 —— 避免读到上一次的 stale 值
+        // （call loop 的 while guard.is_none() 直接跳过、返回旧结果）。
         {
             let mut g = slot2.slot.lock().unwrap_or_else(|e| e.into_inner());
             *g = Some(result.unwrap_or(false));

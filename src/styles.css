@@ -131,6 +131,8 @@ body[data-hover] #app {
   margin: 0;
   border-width: 0;
   overflow: hidden;
+  /* 动画期间禁止点击 —— 否则重复点 ✓/× 触发多次 IPC */
+  pointer-events: none;
   transition: all 0.3s cubic-bezier(0.22, 1, 0.36, 1);
 }
 

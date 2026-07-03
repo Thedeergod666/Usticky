@@ -23,6 +23,11 @@ fn emit_todos_changed(app: &AppHandle, snap: &TodoSnapshot) {
     let _ = app.emit("usticky://todos-changed", snap);
 }
 
+/// 落盘 + emit todos-changed。
+///
+/// persist 失败时（磁盘满 / 权限被剥 / 临时目录异常）不再静默吞掉，而是
+/// emit `usticky://persist-failed` 让前端 mini-flash 提示用户 —— 否则前端
+/// invoke 拿到 Ok 后以为写成功了，下次启动数据全没。
 async fn persist_and_emit(app: &AppHandle, store: &SharedStore) -> TodoSnapshot {
     let snap = {
         let s = store.read().await;
@@ -30,9 +35,19 @@ async fn persist_and_emit(app: &AppHandle, store: &SharedStore) -> TodoSnapshot 
     };
     if let Err(e) = store.read().await.persist(app) {
         tracing::error!("persist failed: {}", e);
+        let _ = app.emit("usticky://persist-failed", e.to_string());
     }
     emit_todos_changed(app, &snap);
     snap
+}
+
+/// 状态字符串 → enum。非法值直接报错，让前端知道走错了路径。
+fn parse_status(s: &str) -> Result<TodoStatus, String> {
+    match s {
+        "pending" => Ok(TodoStatus::Pending),
+        "done" => Ok(TodoStatus::Done),
+        other => Err(format!("invalid status: {}", other)),
+    }
 }
 
 // ── CRUD ──
@@ -50,10 +65,10 @@ pub async fn add_todo(
 ) -> Result<Todo, String> {
     let trimmed = title.trim().to_string();
     if trimmed.is_empty() {
-        return Err("empty title".into());
+        return Err(rust_i18n::t!("commands.error.empty_title").into());
     }
     if trimmed.chars().count() > 280 {
-        return Err("title too long".into());
+        return Err(rust_i18n::t!("commands.error.too_long").into());
     }
     let todo = {
         let mut s = store.write().await;
@@ -71,14 +86,14 @@ pub async fn update_todo(
     title: Option<String>,
     status: Option<String>,
 ) -> Result<Todo, String> {
-    let status_enum = status.map(|s| match s.as_str() {
-        "done" => TodoStatus::Done,
-        _ => TodoStatus::Pending,
-    });
+    let status_enum = match status {
+        Some(s) => Some(parse_status(&s)?),
+        None => None,
+    };
     let updated = {
         let mut s = store.write().await;
         s.update(&id, title, status_enum)
-            .ok_or_else(|| "not found".to_string())?
+            .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?
     };
     persist_and_emit(&app, &store).await;
     Ok(updated)
@@ -92,7 +107,8 @@ pub async fn delete_todo(
 ) -> Result<Todo, String> {
     let deleted = {
         let mut s = store.write().await;
-        s.delete(&id).ok_or_else(|| "not found".to_string())?
+        s.delete(&id)
+            .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?
     };
     persist_and_emit(&app, &store).await;
     Ok(deleted)
@@ -137,7 +153,7 @@ pub async fn reset_floating_window(
     store: State<'_, SharedStore>,
 ) -> Result<(), String> {
     let monitor = app.primary_monitor().map_err(|e| e.to_string())?
-        .ok_or_else(|| "no primary monitor".to_string())?;
+        .ok_or_else(|| rust_i18n::t!("commands.error.no_primary_monitor").to_string())?;
     let mon_size = monitor.size();
     let mon_pos = monitor.position();
     if let Some(w) = app.get_webview_window("floating") {
@@ -150,7 +166,12 @@ pub async fn reset_floating_window(
             let mut s = store.write().await;
             s.update_window_pos(Some(x), Some(y));
         }
-        persist_and_emit(&app, &store).await;
+        // 落盘（窗口几何 + todos 一起）但不 emit todos-changed —— 复位位置
+        // 跟 todo 列表无关，前端不要白白 render 一遍。
+        if let Err(e) = store.read().await.persist(&app) {
+            tracing::error!("persist failed: {}", e);
+            let _ = app.emit("usticky://persist-failed", e.to_string());
+        }
     }
     Ok(())
 }
@@ -204,16 +225,13 @@ pub async fn set_pin_mode(
         let mut s = store.write().await;
         s.set_pin_mode(parsed);
     }
-    // 持久化
-    let snap = {
-        let s = store.read().await;
-        s.snapshot()
-    };
+    // 复用 persist_and_emit —— 但它会 emit todos-changed，pin mode 改了跟 todo 列表
+    // 无关，前端不该 render。所以这里走手写 persist 路径，emit 走 pin-mode-changed。
     if let Err(e) = store.read().await.persist(&app) {
         tracing::error!("persist failed: {}", e);
+        let _ = app.emit("usticky://persist-failed", e.to_string());
     }
     let _ = app.emit("usticky://pin-mode-changed", &mode);
-    let _ = snap;
     Ok(())
 }
 

@@ -1,7 +1,20 @@
 {
+  "commands": {
+    "error": {
+      "empty_title": "Title cannot be empty",
+      "too_long": "Title too long (max 280 characters)",
+      "not_found": "Todo not found",
+      "no_primary_monitor": "No primary monitor detected"
+    }
+  },
   "error": {
     "empty_title": "Title cannot be empty",
     "too_long": "Title too long (max {max} characters)",
     "not_found": "Todo not found"
+  },
+  "tray": {
+    "show": "Show floating window",
+    "hide": "Hide floating window",
+    "quit": "Quit Usticky"
   }
 }

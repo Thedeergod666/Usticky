@@ -76,7 +76,7 @@
   "alwaysOnTop": false,    // 默认 false，让用户选 pin_top / pin_bottom / normal
   "skipTaskbar": true, "shadow": false,
   "resizable": true,        // 即便"内容自适应"也要可拖
-  "minWidth": 180, "minHeight": 100,
+  "minWidth": 180, "minHeight": 160,
   "maxWidth": 420, "maxHeight": 2400
 }
 ```
@@ -181,10 +181,9 @@ window.addEventListener('beforeunload', () => unlisten?.());
 
 设置面板改配置 → 浮窗即时生效：
 ```ts
-listen('usticky://config-changed', async () => {
-  const cfg = await invoke('get_config');
-  renderPrefs = { ...renderPrefs, ...cfg };
-  if (lastRenderedSnap) render(lastRenderedSnap);
+listen('usticky://pin-mode-changed', async () => {
+  const cfg = await invoke('get_pin_mode');
+  // ... 重新设置 pin 控件 active 态
 });
 ```
 
@@ -218,14 +217,16 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 
 ✅ 项目目录 + git init
 ✅ Tauri 2 配置文件（package.json / Cargo.toml / tauri.conf.json / capabilities）
-✅ Vite 配置（port 1420 + assetsInlineLimit: 0）
+✅ Vite 配置（port 1421 + assetsInlineLimit: 0）
 ✅ 前端骨架（main.ts / styles.css / i18n / index.html）
 ✅ 后端骨架（lib.rs / main.rs / todo.rs / commands / tray / platform）
 ✅ i18n 字典（en + zh-CN，minimal）
 ✅ 占位 icon
-⏳ **未做**：SortableJS 集成、标记完成动画、撤销、IPC 真实持久化
-⏳ **未做**：全局快捷键 handler 接线（plugin 已声明，handler 占位）
-⏳ **未做**：tray 图标任务数 badge（v0.1 tray 是空壳）
+✅ SortableJS 拖拽排序
+✅ 标记完成动画
+✅ 全局快捷键接线（CmdOrCtrl+Shift+Space → quick-add → 聚焦 input）
+⏳ **未做**：Cmd+Z 撤销栈（v0.2 候选）
+⏳ **未做**：tray 图标任务数 badge（v0.1 是静态图标）
 
 ## v0.2 候选
 

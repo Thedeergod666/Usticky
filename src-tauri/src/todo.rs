@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tauri::Manager;
 
-rust_i18n::i18n!("locales");
+// rust_i18n::i18n!("locales") 在 lib.rs 顶部 crate 级初始化，此处不需要再调。
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -186,11 +186,17 @@ impl Store {
 
     /// 拖拽后批量更新 order。
     /// `ids` 是新顺序（按 status 内顺序传入，由 IPC caller 保证）。
+    ///
+    /// 只在 `t.order != i as i32` 时才刷新 updated_at —— 拖一下整 section
+    /// 都不改 order 时（例如前端重排但 ids 没变），不应产生"更新时间"噪声。
     pub fn reorder(&mut self, ids: &[String]) {
         for (i, id) in ids.iter().enumerate() {
             if let Some(t) = self.data.todos.iter_mut().find(|t| &t.id == id) {
-                t.order = i as i32;
-                t.updated_at = chrono::Utc::now().timestamp_millis();
+                let new_order = i as i32;
+                if t.order != new_order {
+                    t.order = new_order;
+                    t.updated_at = chrono::Utc::now().timestamp_millis();
+                }
             }
         }
     }

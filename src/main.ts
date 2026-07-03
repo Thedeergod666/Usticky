@@ -101,7 +101,11 @@ function dueLabel(dueAt: number): { text: string; cls: string } {
   if (daysFromToday >= 2 && daysFromToday <= 7) {
     return { text: t("app.due.days", { days: daysFromToday }), cls: "days" };
   }
-  // 远期或精度更高
+  // 远期：按"天"展示（i18n 字典 app.due.future / app.due.hours_minutes 已有 key）
+  if (daysFromToday > 7) {
+    return { text: t("app.due.future", { days: daysFromToday }), cls: "days" };
+  }
+  // 精度更高（今天内 / 几小时内）
   const minutes = Math.floor(ms / 60000);
   if (minutes < 60) return { text: t("app.due.minutes", { minutes }), cls: "days" };
   const hours = Math.floor(minutes / 60);
@@ -120,10 +124,17 @@ function render(snap: TodoSnapshot) {
     return;
   }
 
-  // 清掉旧内容（保留 input）
+  // 检测当前是否在拖拽 —— 若在拖，destroy Sortable 会让 drag 中断。
+  // 拖拽期间跳过一次重建，待 onEnd 后下一次 render 再统一刷新。
+  const dragging = sortableInstances.some((s) => (s as any).dragEl != null);
+  if (dragging) return;
+
+  // 清掉旧内容（保留 input / foot）
   cleanupSortables();
   const oldList = app.querySelector<HTMLElement>(".todo-list");
   if (oldList) oldList.remove();
+  // 切到非空时把空态引导页摘掉
+  app.querySelector<HTMLElement>(".empty-state")?.remove();
 
   const list = document.createElement("div");
   list.className = "todo-list";
@@ -193,14 +204,16 @@ function render(snap: TodoSnapshot) {
 
   // foot
   updateFoot(snap);
-  void autoResizeWindow(snap);
+  // 输入中禁止 autoResize —— scrollHeight 跳变会打断输入（AGENTS.md #18）
+  if (!app.querySelector<HTMLInputElement>(".todo-input input")?.matches(":focus")) {
+    void autoResizeWindow(snap);
+  }
 }
 
 function buildTodoRow(todo: Todo): HTMLElement {
   const row = document.createElement("div");
   row.className = `todo-card${todo.status === "done" ? " done" : ""}`;
   row.dataset.todoId = todo.id;
-  row.dataset.priority = todo.priority;
   row.dataset.status = todo.status;
 
   const check = document.createElement("div");
@@ -241,20 +254,54 @@ function buildTodoRow(todo: Todo): HTMLElement {
 
 function renderEmptyState() {
   cleanupSortables();
-  app.innerHTML = `
-    <div class="empty-state">
-      <div class="empty-state-title">${escapeHtml(t("app.empty.title"))}</div>
-      <div class="empty-state-subtitle">${escapeHtml(t("app.empty.subtitle"))}</div>
-      <button class="empty-state-cta focus-input">${escapeHtml(t("app.empty.cta"))}</button>
-    </div>
-  `;
-  void autoResizeWindowToContent();
+  // 关键：只清掉 .todo-list 和旧 .empty-state，**保留** .todo-input 和 .foot
+  // （旧实现 app.innerHTML = ... 会把 ensureInputBar 建的 input bar 整个冲掉，
+  //  导致首启空态时 input 不可见、CTA 点了也找不到 input → "addTask 没反应"）
+  app.querySelector<HTMLElement>(".todo-list")?.remove();
+  app.querySelector<HTMLElement>(".empty-state")?.remove();
+
+  const empty = document.createElement("div");
+  empty.className = "empty-state";
+
+  const title = document.createElement("div");
+  title.className = "empty-state-title";
+  title.textContent = t("app.empty.title");
+
+  const subtitle = document.createElement("div");
+  subtitle.className = "empty-state-subtitle";
+  subtitle.textContent = t("app.empty.subtitle");
+
+  const cta = document.createElement("button");
+  cta.className = "empty-state-cta focus-input";
+  cta.textContent = t("app.empty.cta");
+
+  empty.appendChild(title);
+  empty.appendChild(subtitle);
+  empty.appendChild(cta);
+
+  // 插在 .todo-input 之后、.foot 之前；如果 foot 不存在就 append 到末尾
+  const foot = app.querySelector<HTMLElement>(".foot");
+  if (foot) {
+    app.insertBefore(empty, foot);
+  } else {
+    app.appendChild(empty);
+  }
+
+  // 空态也要刷新 foot（count 文案 + pin-ctrl），否则从"5 项任务"切到空态文案陈旧
+  updateFoot({ todos: [], fetched_at: null });
+  if (!app.querySelector<HTMLInputElement>(".todo-input input")?.matches(":focus")) {
+    void autoResizeWindowToContent();
+  }
 }
 
 function updateFoot(snap: TodoSnapshot) {
   let foot = app.querySelector<HTMLElement>(".foot");
   const count = snap.todos.filter((x) => x.status === "pending").length;
-  const text = t("app.count.other", { count });
+  // 单复数：英文 1 task vs N tasks；中文一律用 app.count.other
+  const text =
+    count === 1
+      ? t("app.count.one", { count })
+      : t("app.count.other", { count });
 
   // pin mode 三档切换：紧凑的 segmented control，跟 .foot 共一行
   const pinCtrl = `
@@ -412,21 +459,32 @@ async function init() {
   onLocaleChange(() => {
     document.title = t("app.title");
     refreshPinCtrl();  // pin-ctrl 文案要随 locale 变（"Top"/"Bottom"/"Normal" ↔ "置顶"/"置底"/"默认"）
+    // input placeholder + hint 也需要随 locale 刷（创建时写死的）
+    const input = app.querySelector<HTMLInputElement>(".todo-input input");
+    if (input) input.placeholder = t("app.input.placeholder");
+    const hint = app.querySelector<HTMLElement>(".todo-input-hint");
+    if (hint) hint.textContent = t("app.input.shortcut_hint");
     if (lastRenderedSnap) render(lastRenderedSnap);
   });
 
+  let unlistenLocale: UnlistenFn | null = null;
   listen<string>("usticky://locale-changed", async (e) => {
     const newLocale = e.payload;
     if (newLocale === "en" || newLocale === "zh-CN") {
       if (newLocale !== getLocale()) await setLocale(newLocale);
     }
-  });
+  })
+    .then((fn) => (unlistenLocale = fn))
+    .catch((e) => console.error("[usticky] listen locale-changed failed", e));
 
   // ── Hover attribute toggle ──
   const setHoverAttr = (on: boolean) => {
     if (on) document.body.dataset.hover = "1";
     else delete document.body.dataset.hover;
   };
+  // macOS / Win 上非 key window CSS :hover 不生效，后端 hover emitter emit
+  // usticky://floating-hover 兜底驱动 body[data-hover]。JS mouseenter/leave
+  // 仍挂作非 macOS/Win 平台的二级兜底。
   document.body.addEventListener("mouseenter", () => setHoverAttr(true));
   document.body.addEventListener("mouseleave", () => setHoverAttr(false));
 
@@ -438,8 +496,23 @@ async function init() {
     .then((fn) => (unlistenTodos = fn))
     .catch((e) => console.error("[usticky] listen todos-changed failed", e));
 
+  // 后端 hover emitter 兜底（macOS / Win），与 JS mouseenter/leave 等效
+  let unlistenHover: UnlistenFn | null = null;
+  listen<boolean>("usticky://floating-hover", (e) => setHoverAttr(e.payload))
+    .then((fn) => (unlistenHover = fn))
+    .catch((e) => console.error("[usticky] listen floating-hover failed", e));
+
   // ── 渲染输入区（常驻） ──
   ensureInputBar();
+
+  // ── 启动时拉一次 pin mode —— 必须在首次 render 之前完成，
+  //    否则 foot 的 pin-ctrl 会用默认 pin_top 渲染一次再被覆盖（视觉闪烁）。
+  let unlistenPinMode: UnlistenFn | null = null;
+  try {
+    currentPinMode = await invoke<PinMode>("get_pin_mode");
+  } catch (e) {
+    console.error("[usticky] get_pin_mode failed", e);
+  }
 
   // ── 启动时拉一次 snapshot ──
   try {
@@ -449,16 +522,9 @@ async function init() {
     console.error("[usticky] get_todos failed", e);
     renderEmptyState();
   }
+  // pin mode 已稳定，绑定 hover-raise 监听（仅 PinBottom 模式实际挂）
+  setupPinModeHoverRaise(currentPinMode);
 
-  // ── 启动时拉一次 pin mode + 监听 pin-mode-changed 事件 ──
-  let unlistenPinMode: UnlistenFn | null = null;
-  try {
-    currentPinMode = await invoke<PinMode>("get_pin_mode");
-    refreshPinCtrl();
-    setupPinModeHoverRaise(currentPinMode);
-  } catch (e) {
-    console.error("[usticky] get_pin_mode failed", e);
-  }
   listen<PinMode>("usticky://pin-mode-changed", (e) => {
     if (e.payload !== currentPinMode) {
       currentPinMode = e.payload;
@@ -524,8 +590,10 @@ async function init() {
     unlistenTodos?.();
     unlistenQuickAdd?.();
     unlistenPinMode?.();
+    unlistenLocale?.();
+    unlistenHover?.();
     cleanupSortables();
-    // 摘掉 hover-raise listener
+    // 摘掉 hover-raise listener（仅在 PinBottom 模式注册过，需要命名引用）
     document.body.removeEventListener("mouseenter", onBodyHoverEnter);
     document.body.removeEventListener("mouseleave", onBodyHoverLeave);
   });
@@ -575,16 +643,26 @@ function ensureInputBar() {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       const v = input.value;
+      // 校验通过后才清空 —— 失败时回填，保留用户输入
+      const trimmed = v.trim();
+      if (!trimmed) {
+        showMiniFlash(t("app.error.empty_title"));
+        return;
+      }
+      if (trimmed.length > 280) {
+        showMiniFlash(t("app.error.too_long", { max: 280 }));
+        return;
+      }
       input.value = "";
-      await addTodo(v);
+      await addTodo(trimmed);
     } else if (e.key === "Escape") {
       input.blur();
-      w().hide().catch(() => {});
+      win().hide().catch(() => {});
     }
   });
 }
 
-function w() {
+function win() {
   return getCurrentWindow();
 }
 

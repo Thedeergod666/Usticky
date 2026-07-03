@@ -20,6 +20,11 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
+// rust_i18n crate 级初始化 —— 让 commands / tray 等模块都能直接 t!("xxx")。
+// 文件放在 src-tauri/locales/{en,zh-CN}.json，跟前端 en.json / zh-CN.json
+// 解耦（rust_i18n 不支持嵌套 dotted key，跟前端 dict 分开维护）。
+rust_i18n::i18n!("locales");
+
 mod commands;
 mod platform;
 mod todo;
@@ -58,8 +63,20 @@ pub fn run() {
                     let s = store.blocking_read();
                     s.last_window_geom().clone()
                 };
+                // clamp 到主显示器范围内 —— 上次插着副屏、副屏拔了的话，
+                // 直接 set_position 会把窗口扔到屏幕外。
+                let mon = app.primary_monitor().ok().flatten();
+                let (mx, my, mw, mh) = mon
+                    .map(|m| {
+                        let s = m.size();
+                        let p = m.position();
+                        (p.x, p.y, s.width as i32, s.height as i32)
+                    })
+                    .unwrap_or((0, 0, 1920, 1080));
                 if let (Some(x), Some(y)) = (geom.x, geom.y) {
-                    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+                    let cx = x.clamp(mx.saturating_sub(50), mx + mw - 50);
+                    let cy = y.clamp(my.saturating_sub(10), my + mh - 10);
+                    let _ = window.set_position(tauri::PhysicalPosition::new(cx, cy));
                 }
                 if let (Some(w), Some(h)) = (geom.width, geom.height) {
                     if w > 0 && h > 0 {
@@ -103,7 +120,9 @@ pub fn run() {
             // 所以无条件下调一次启动 tracker。
             platform::start_hover_emitter(app.handle().clone());
 
-            // 5. 注册浮窗位置/尺寸持久化（Musage 经验：spawn 异步写，不阻塞 UI 线程）
+            // 6. 注册浮窗位置/尺寸持久化（Musage 经验：spawn 异步写，不阻塞 UI 线程，
+            //    **关键**：spawn 里先 write guard 内 update 内存态 → drop guard →
+            //    再 persist 磁盘。write guard 跨 I/O 会让 IPC add_todo 排队。
             if let Some(window) = app.get_webview_window("floating") {
                 let store_for_geom = store.clone();
                 let app_handle_geom = app.handle().clone();
@@ -114,10 +133,13 @@ pub fn run() {
                         let app = app_handle_geom.clone();
                         let (x, y) = (pos.x, pos.y);
                         tauri::async_runtime::spawn(async move {
-                            let mut s = store.write().await;
-                            s.update_window_pos(Some(x), Some(y));
-                            if let Err(e) = s.persist(&app) {
+                            {
+                                let mut s = store.write().await;
+                                s.update_window_pos(Some(x), Some(y));
+                            } // drop guard 在 await 之间，避免与 add_todo 排队
+                            if let Err(e) = store.read().await.persist(&app) {
                                 tracing::error!("persist window pos failed: {}", e);
+                                let _ = app.emit("usticky://persist-failed", e.to_string());
                             }
                         });
                     }
@@ -128,10 +150,13 @@ pub fn run() {
                         let app = app_handle_geom.clone();
                         let (w, h) = (size.width, size.height);
                         tauri::async_runtime::spawn(async move {
-                            let mut s = store.write().await;
-                            s.update_window_size(Some(w), Some(h));
-                            if let Err(e) = s.persist(&app) {
+                            {
+                                let mut s = store.write().await;
+                                s.update_window_size(Some(w), Some(h));
+                            }
+                            if let Err(e) = store.read().await.persist(&app) {
                                 tracing::error!("persist window size failed: {}", e);
+                                let _ = app.emit("usticky://persist-failed", e.to_string());
                             }
                         });
                     }

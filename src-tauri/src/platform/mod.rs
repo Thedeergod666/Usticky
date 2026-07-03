@@ -13,8 +13,8 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-#[cfg(target_os = "linux")]
-pub mod linux;
+// Linux: 暂未实现 —— musage 也没做。等有用户报 bug 再写。
+// linux.rs 已删除（v0.1 不做任何 Linux 私有 API stub；plat 模块本身已是 no-op）
 
 // ── 跨平台统一 API ──
 //

@@ -11,10 +11,12 @@ const ver = pkg.version;
 const tauriPath = path.join(__dirname, "..", "src-tauri", "tauri.conf.json");
 const cargoPath = path.join(__dirname, "..", "src-tauri", "Cargo.toml");
 
-// tauri.conf.json
+// tauri.conf.json —— 只有 version 真正变化才重写，避免 git 假 diff
 const tauri = JSON.parse(fs.readFileSync(tauriPath, "utf8"));
-tauri.version = ver;
-fs.writeFileSync(tauriPath, JSON.stringify(tauri, null, 2) + "\n");
+if (tauri.version !== ver) {
+  tauri.version = ver;
+  fs.writeFileSync(tauriPath, JSON.stringify(tauri, null, 2) + "\n");
+}
 
 // Cargo.toml — 仅当 version 不一致时改
 let cargo = fs.readFileSync(cargoPath, "utf8");
