@@ -1,19 +1,20 @@
 /* Usticky 浮窗 —— iOS 26 / macOS 26 widget 风格
  *
- * 设计哲学（v1，源自 Musage v0.2 经验）：
+ * 设计哲学（v2，2026-07-03 用户反馈调整）：
  *   - 整窗 #app 完全透明，每个 .todo-card 是独立玻璃胶囊瓦片
- *   - 默认（idle）：瓦片半透 + 所有数据文字统一白色（仿 macOS 26 天气 widget）
- *   - 鼠标进入窗口（body[data-hover] #app）：瓦片背景升至 ~82% alpha + 强 blur +
- *     阴影 + 内描边，同时数字从白色平滑变为 iOS 语义色
- *   - 所有色彩切换走 CSS variable swap，单一 body[data-hover] #app 触发整组变化
- *   - ~280ms iOS spring 过渡
+ *   - **玻璃材质始终强开**（82% alpha + 28px blur）—— 不再 idle 半透 / hover 强开
+ *     原因：用户反馈"变动后过一段时间会褪色"，hover emitter 在 PinBottom /
+ *     Normal 模式下被其他 app 抢焦点时容易丢 inside 状态 → 玻璃忽强忽弱
+ *   - hover 状态只切换 iOS 语义色（数字从白变 ok/warn/alert），不动玻璃材质
+ *   - 所有色彩切换走 CSS variable swap，单一 body[data-hover] #app 触发
+ *   - ~280ms iOS spring 过渡（仅过渡 color / text-shadow，不过渡 backdrop-filter）
  *
  * 为什么用 body[data-hover] 而不是 :hover？
  * macOS 上 NSWindow 默认不向非 key window 派发 mouseMoved 事件，WKWebView 的
- * CSS :hover 在浮窗未聚焦时不会激活。Usticky v0.1 暂不实现 Rust hover emitter
- * （见 AGENTS.md v0.2 候选），先用 JS mouseenter/leave 兜底。Win/Linux 上
- * WebView 正常分发事件，CSS :hover 本来就能用 —— 但为了跨平台一致，统一走
- * JS toggle body.dataset.hover。
+ * CSS :hover 在浮窗未聚焦时不会激活。Rust hover emitter（platform/macos.rs 的
+ * start_hover_emitter，50ms tick NSEvent.mouseLocation + windowNumberAtPoint
+ * 命中测试）emit `usticky://floating-hover` 给前端 toggle body[data-hover]。
+ * JS mouseenter/leave 留作 Linux 兜底（不依赖 Rust 实现）。
  */
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -45,13 +46,15 @@ html, body {
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
   cursor: grab;
-
-  /* 玻璃材质 */
-  --tile-bg: rgba(22, 24, 30, 0.30);
-  --tile-blur: 10px;
-  --tile-saturate: 140%;
-  --tile-border: rgba(255, 255, 255, 0);
-  --tile-shadow: 0 0 0 rgba(0, 0, 0, 0);
+  /* 玻璃材质 —— 始终强开（v2 调整：不再 idle 半透 / hover 强开）
+     原因：hover emitter 在 PinBottom / Normal 模式下被其他 app 抢焦点时
+     容易丢 inside 状态，玻璃忽强忽弱视觉抖动。idle 直接用强玻璃值。 */
+  --tile-bg: rgba(28, 30, 38, 0.82);
+  --tile-blur: 28px;
+  --tile-saturate: 180%;
+  --tile-border: rgba(255, 255, 255, 0.10);
+  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.45),
+                 0 0 0 0.5px rgba(255, 255, 255, 0.04) inset;
 
   /* 文字层级（idle：偏白，靠 alpha 拉开主次） */
   --text-bright: rgba(255, 255, 255, 0.96);
@@ -59,7 +62,7 @@ html, body {
   --text-faint:  rgba(255, 255, 255, 0.44);
   --text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
 
-  /* 语义色（idle：全部统一为白） */
+  /* 语义色（idle：全部统一为白，hover 才上 iOS 语义色） */
   --c-data-ok:    rgba(255, 255, 255, 0.96);
   --c-data-cyan:  rgba(255, 255, 255, 0.96);
   --c-data-warn:  rgba(255, 255, 255, 0.96);
@@ -71,23 +74,20 @@ html, body {
 }
 #app:active { cursor: grabbing; }
 
-/* ── 鼠标进入窗口 → 唤醒玻璃材质 + iOS 语义色 ──
+/* ── 鼠标进入窗口 → 唤醒 iOS 语义色（不动玻璃材质）──
  *
- * ⚠️ 这里**故意不写 transition**。
- * `backdrop-filter: blur(28px)` 是非常昂贵的合成操作，每次 hover 状态
- * 翻转都会触发一次整窗重合成。如果给 backdrop-filter / CSS variable
- * 加 0.28s spring 过渡，Rust hover emitter 50ms tick 在浮窗边缘抖动时
+ * v2 调整（2026-07-03）：玻璃材质已移到 #app 默认值，hover 不再切换
+ * tile-bg / tile-blur / tile-shadow —— 避免 hover emitter 抖动时玻璃
+ * 忽强忽弱。hover 只换语义色（数字从白变 ok/warn/alert 等）+ 文字 alpha。
+ *
+ * ⚠️ 这里**故意不写 transition**给 backdrop-filter / box-shadow。
+ * 它们是非常昂贵的合成操作，每次 hover 状态翻转都会触发一次整窗重合成。
+ * 如果加 0.28s spring 过渡，Rust hover emitter 50ms tick 在浮窗边缘抖动时
  * 会反复 emit hover → CSS variable 反复重计算 → 重合成 → 视觉上
  * "光标闪烁"。代价：hover 进入没有 280ms 的 iOS 弹簧过渡，是离散切。
  * 视觉换性能 + 不闪烁 —— 透明浮窗场景下值得。
  */
 body[data-hover] #app {
-  --tile-bg: rgba(28, 30, 38, 0.82);
-  --tile-blur: 28px;
-  --tile-saturate: 180%;
-  --tile-border: rgba(255, 255, 255, 0.10);
-  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.45),
-                 0 0 0 0.5px rgba(255, 255, 255, 0.04) inset;
   --text-bright: #f4f5f7;
   --text-mute:   rgba(255, 255, 255, 0.72);
   --text-faint:  rgba(255, 255, 255, 0.52);
@@ -349,13 +349,12 @@ body[data-hover] #app .todo-due.days     { color: var(--c-data-cyan);  backgroun
   transform: translateX(-50%) translateY(0);
 }
 
-/* ── 省电模式（body[data-low-power]） ── */
+/* ── 省电模式（body[data-low-power]） ──
+ *
+ * v2 调整（2026-07-03）：省电模式保留强 alpha（视觉一致），但关掉 blur/saturate
+ * 合成层（这是真正的耗电大户）。alpha 不变保证不"褪色"，blur 关掉省电。
+ */
 body[data-low-power] #app {
-  --tile-bg: rgba(22, 24, 30, 0.78);
-  --tile-blur: 0;
-  --tile-saturate: 100%;
-}
-body[data-low-power][data-hover] #app {
   --tile-bg: rgba(28, 30, 38, 0.92);
   --tile-blur: 0;
   --tile-saturate: 100%;

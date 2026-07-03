@@ -12,9 +12,13 @@
     "too_long": "Title too long (max {max} characters)",
     "not_found": "Todo not found"
   },
+  "window": {
+    "settings": "Settings"
+  },
   "tray": {
     "show": "Show floating window",
     "hide": "Hide floating window",
+    "settings": "Settings...",
     "quit": "Quit Usticky"
   }
 }

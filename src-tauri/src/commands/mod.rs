@@ -5,7 +5,7 @@
 //
 // DTO 全部 #[serde(rename_all = "camelCase")] —— Tauri 2 对 struct 字段
 // 也走 camelCase 转换（Musage PR 1b 实测坑）。
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::todo::{PinMode, Todo, TodoStatus, TodoSnapshot};
 use crate::SharedStore;
@@ -246,5 +246,39 @@ pub async fn set_floating_hover_raise(
         return Ok(());
     }
     crate::platform::set_window_hover_raise(&app, hovering);
+    Ok(())
+}
+
+// ── 设置窗口 ──
+
+/// 打开设置窗口（已在则 focus，未建则动态创建）。
+///
+/// 不在 tauri.conf.json 的 windows 数组里声明 —— 用户只在点"设置..."时
+/// 才需要这个窗口，常驻会拖慢启动 + 占内存。动态创建 + 关闭时 destroy
+/// 是 Musage 同款路径。
+///
+/// 窗口属性沿用 Musage：常规带 decorations 窗口、可调整大小、居中、
+/// 适中的初始尺寸（窄到 ~620x520，能放下单页设置内容）。
+#[tauri::command]
+pub async fn open_settings_window(app: AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("settings") {
+        // 已开 —— 直接 focus，不重复创建（避免多实例 + 状态分裂）
+        w.show().map_err(|e| e.to_string())?;
+        w.set_focus().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let title = rust_i18n::t!("window.settings").to_string();
+    let _win = WebviewWindowBuilder::new(&app, "settings", WebviewUrl::App("settings.html".into()))
+        .title(title)
+        .inner_size(620.0, 520.0)
+        .min_inner_size(480.0, 360.0)
+        .resizable(true)
+        .decorations(true)
+        .transparent(false)
+        .shadow(true)
+        .visible(true)
+        .center()
+        .build()
+        .map_err(|e| format!("create settings window: {e}"))?;
     Ok(())
 }

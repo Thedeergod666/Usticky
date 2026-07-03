@@ -1,0 +1,242 @@
+// Usticky 设置面板入口
+//
+// 单页设计（不拆 nav tabs）：
+//   1. 浮窗层级（pin mode）— segmented control
+//   2. 语言 — en / zh-CN
+//   3. 浮窗 — 归位到主屏幕正中央
+//   4. 关于 — 版本 / 产品名 / GitHub
+//
+// 复用浮窗的 i18n helper（src/i18n/index.ts），保持单一来源 = 后端 locales。
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { t, initLocale, onLocaleChange, setLocale, getLocale } from "./i18n";
+import "./settings.css";
+
+type PinMode = "pin_top" | "pin_bottom" | "normal";
+type Locale = "en" | "zh-CN";
+
+const root = document.getElementById("settings-app")!;
+
+// ── mini flash ──
+let flashTimer: ReturnType<typeof setTimeout> | null = null;
+function flash(msg: string): void {
+  let el = document.querySelector<HTMLElement>(".flash");
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "flash";
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.classList.add("visible");
+  if (flashTimer) clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => el?.classList.remove("visible"), 2200);
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+}
+
+// ── 渲染 ──
+
+let currentPinMode: PinMode = "pin_top";
+let currentLocale: Locale = "zh-CN";
+let appVersion = "0.1.0";
+
+function render(): void {
+  // 标题
+  document.title = t("settings.title");
+
+  root.innerHTML = `
+    <div class="settings-title">${escapeHtml(t("settings.title"))}</div>
+
+    <section class="section">
+      <div class="section-header">
+        <div class="section-title">${escapeHtml(t("settings.section.window"))}</div>
+      </div>
+      <div class="section-body">
+        <div class="row">
+          <div class="row-label">${escapeHtml(t("settings.pin.label"))}</div>
+          <div class="segmented" data-pin>
+            <button data-pin-value="pin_top">${escapeHtml(t("settings.pin.top"))}</button>
+            <button data-pin-value="pin_bottom">${escapeHtml(t("settings.pin.bottom"))}</button>
+            <button data-pin-value="normal">${escapeHtml(t("settings.pin.normal"))}</button>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <div class="row-label">${escapeHtml(t("settings.reset.label"))}</div>
+            <div class="row-hint">${escapeHtml(t("settings.reset.hint"))}</div>
+          </div>
+          <button class="btn" data-action="reset-window">${escapeHtml(t("settings.reset.button"))}</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header">
+        <div class="section-title">${escapeHtml(t("settings.section.language"))}</div>
+      </div>
+      <div class="section-body">
+        <div class="row">
+          <div class="row-label">${escapeHtml(t("settings.language.label"))}</div>
+          <div class="segmented" data-locale>
+            <button data-locale-value="en">English</button>
+            <button data-locale-value="zh-CN">中文</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header">
+        <div class="section-title">${escapeHtml(t("settings.section.about"))}</div>
+      </div>
+      <div class="section-body">
+        <div class="about-logo">
+          <img src="/icon.png" alt="Usticky" />
+          <div>
+            <div class="about-name">Usticky</div>
+            <div class="about-version">v${escapeHtml(appVersion)}</div>
+          </div>
+        </div>
+        <div class="about-meta">
+          ${escapeHtml(t("settings.about.tagline"))}<br />
+          <a data-action="open-github">GitHub</a>
+        </div>
+      </div>
+    </section>
+  `;
+
+  refreshPinSegmented();
+  refreshLocaleSegmented();
+}
+
+function refreshPinSegmented(): void {
+  root.querySelectorAll<HTMLElement>("[data-pin] button").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.pinValue === currentPinMode);
+  });
+}
+
+function refreshLocaleSegmented(): void {
+  root.querySelectorAll<HTMLElement>("[data-locale] button").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.localeValue === currentLocale);
+  });
+}
+
+// ── 事件代理 ──
+root.addEventListener("click", async (e) => {
+  const target = e.target as HTMLElement;
+
+  // pin mode
+  const pinBtn = target.closest<HTMLElement>("[data-pin-value]");
+  if (pinBtn) {
+    const newMode = pinBtn.dataset.pinValue as PinMode | undefined;
+    if (newMode && newMode !== currentPinMode) {
+      try {
+        await invoke("set_pin_mode", { mode: newMode });
+        // 后端 emit usticky://pin-mode-changed，listener 会更新 currentPinMode + UI
+      } catch (err) {
+        console.error("[usticky] set_pin_mode failed", err);
+        flash(t("settings.error.save_failed"));
+      }
+    }
+    return;
+  }
+
+  // locale
+  const localeBtn = target.closest<HTMLElement>("[data-locale-value]");
+  if (localeBtn) {
+    const newLocale = localeBtn.dataset.localeValue as Locale | undefined;
+    if (newLocale && newLocale !== currentLocale) {
+      try {
+        await invoke("set_app_locale", { locale: newLocale });
+        // 后端 emit usticky://locale-changed，listener 会更新 dict + re-render
+      } catch (err) {
+        console.error("[usticky] set_app_locale failed", err);
+        flash(t("settings.error.save_failed"));
+      }
+    }
+    return;
+  }
+
+  // reset window
+  if (target.closest("[data-action='reset-window']")) {
+    try {
+      await invoke("reset_floating_window");
+      flash(t("settings.reset.done"));
+    } catch (err) {
+      console.error("[usticky] reset_floating_window failed", err);
+      flash(t("settings.reset.failed"));
+    }
+    return;
+  }
+
+  // open github
+  if (target.closest("[data-action='open-github']")) {
+    try {
+      await openUrl("https://github.com/Thedeergod666/Musage");
+    } catch (err) {
+      console.error("[usticky] openUrl failed", err);
+    }
+    return;
+  }
+});
+
+// ── 启动 ──
+async function init(): Promise<void> {
+  await initLocale();
+  currentLocale = getLocale() as Locale;
+
+  // 拉 pin mode
+  try {
+    currentPinMode = await invoke<PinMode>("get_pin_mode");
+  } catch (e) {
+    console.error("[usticky] get_pin_mode failed", e);
+  }
+
+  // 拉 app 版本
+  try {
+    appVersion = await getVersion();
+  } catch (e) {
+    console.debug("[usticky] getVersion failed, using default", e);
+  }
+
+  render();
+
+  // locale 切换：re-render（pin mode 按钮 / 标题等 i18n 文案要更新）
+  onLocaleChange((newLocale) => {
+    currentLocale = newLocale as Locale;
+    render();
+  });
+
+  // 监听后端 locale-changed（来自 tray 菜单 / 浮窗的切换）
+  let unlistenLocaleEvt: UnlistenFn | null = null;
+  listen<string>("usticky://locale-changed", async (e) => {
+    const newLocale = e.payload;
+    if (newLocale === "en" || newLocale === "zh-CN") {
+      if (newLocale !== getLocale()) await setLocale(newLocale);
+    }
+  })
+    .then((fn) => (unlistenLocaleEvt = fn))
+    .catch((e) => console.error("[usticky] listen locale-changed failed", e));
+
+  // 监听后端 pin-mode-changed（来自浮窗 foot 的切换）
+  let unlistenPin: UnlistenFn | null = null;
+  listen<PinMode>("usticky://pin-mode-changed", (e) => {
+    if (e.payload !== currentPinMode) {
+      currentPinMode = e.payload;
+      refreshPinSegmented();
+    }
+  })
+    .then((fn) => (unlistenPin = fn))
+    .catch((e) => console.error("[usticky] listen pin-mode-changed failed", e));
+
+  window.addEventListener("beforeunload", () => {
+    unlistenLocaleEvt?.();
+    unlistenPin?.();
+  });
+}
+
+init();

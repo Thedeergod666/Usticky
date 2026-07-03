@@ -17,7 +17,7 @@
 //   - PinBottom hover emitter 在 Musage 是 v0.2 才加的，Usticky v0.1 直接搬
 
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Listener, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 // rust_i18n crate 级初始化 —— 让 commands / tray 等模块都能直接 t!("xxx")。
@@ -51,6 +51,7 @@ pub fn run() {
             .build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // 1. 加载或初始化 todo store
             let store = Store::load_or_init(app.handle())
@@ -169,6 +170,23 @@ pub fn run() {
                 });
             }
 
+            // 7. locale 切换链路：tray 菜单 + settings 窗口 title 同步重建
+            //    单一来源 = 后端 locales/{en,zh-CN}.json，前端只镜像一份。
+            //    tray 重建走 tray::rebuild_tray（内部派发到 main thread 避免
+            //    NSStatusBar 跨线程 SIGTRAP）。settings 窗口可能没开，需判 None。
+            let app_for_locale = app.handle().clone();
+            app.listen("usticky://locale-changed", move |_| {
+                if let Err(e) = tray::rebuild_tray(&app_for_locale) {
+                    tracing::warn!(error = %e, "rebuild_tray 失败");
+                }
+                if let Some(w) = app_for_locale.get_webview_window("settings") {
+                    let title = rust_i18n::t!("window.settings").to_string();
+                    if let Err(e) = w.set_title(&title) {
+                        tracing::warn!(error = %e, "set settings window title 失败");
+                    }
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -186,6 +204,7 @@ pub fn run() {
             commands::get_pin_mode,
             commands::set_pin_mode,
             commands::set_floating_hover_raise,
+            commands::open_settings_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Usticky");

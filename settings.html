@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!--
+  设置面板入口 HTML。lang attr 在 src/i18n/index.ts initLocale() 时改。
+  单页设计（不拆 nav tabs，Usticky 设置项少）：
+    1. 浮窗层级（pin mode）— segmented control
+    2. 语言 — en / zh-CN
+    3. 浮窗 — 归位到主屏幕正中央
+    4. 关于 — 版本 / 产品名 / GitHub
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Usticky · Settings</title>
+  </head>
+  <body>
+    <div id="settings-app"></div>
+    <script type="module" src="/src/settings.ts"></script>
+  </body>
+</html>

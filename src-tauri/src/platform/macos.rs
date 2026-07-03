@@ -33,20 +33,22 @@ use std::time::Duration;
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSEvent, NSWindow};
-use objc2_core_graphics::{
-    kCGDesktopWindowLevel, kCGFloatingWindowLevel, kCGNormalWindowLevel, CGWindowLevel,
-};
+use objc2_core_graphics::{kCGFloatingWindowLevel, kCGNormalWindowLevel, CGWindowLevel};
 use objc2_foundation::NSPoint;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-/// 始终在底部：使用 `kCGDesktopWindowLevel - 1`。
+/// 始终在底部：`kCGNormalWindowLevel - 1`（= -1）。
 ///
-/// 为什么不直接用 kCGNormalWindowLevel - 1 (= -1)：
-/// macOS Sonoma+ 的 Dock / Mission Control 在 kCGNormalWindowLevel 之上的某些
-/// 场景会盖住 -1。桌面图标层 `kCGDesktopWindowLevel` 比 -1 更低且稳定。
-/// 这里取桌面图标之下 1 格：失焦时浮窗处于"桌面图标"之下，仍可见但不被
-/// 普通 app 遮挡 —— 跟 macOS `LEVEL_BELOW_NORMAL` 语义对齐。
-pub const LEVEL_BELOW_NORMAL: CGWindowLevel = kCGDesktopWindowLevel - 1;
+/// 高于桌面背景（`kCGDesktopWindowLevel`）和 Finder 桌面图标层，
+/// 低于所有普通 app 窗口（`kCGNormalWindowLevel` = 0）→ macOS 调度
+/// 一直把我们压在最底。AGENTS.md 第 6 节 + Musage 同款决策。
+///
+/// **2026-07-03 fix**：之前用 `kCGDesktopWindowLevel - 1` 想避开 Sonoma+
+/// Dock/Mission Control 偶发遮挡，结果反而把窗口压到 Finder 桌面图标层
+/// **之下**，`windowNumberAtPoint` 命中测试永远返回 Finder 桌面窗口而非
+/// 浮窗 → `is_floating_topmost_at` 恒 false → PinBottom hover 完全失效。
+/// 改回 `-1` 跟 Musage / AGENTS.md 对齐，hover 检测恢复正常。
+pub const LEVEL_BELOW_NORMAL: CGWindowLevel = kCGNormalWindowLevel - 1;
 
 /// 始终在顶部：等于 kCGFloatingWindowLevel。
 pub const LEVEL_FLOATING: CGWindowLevel = kCGFloatingWindowLevel;
@@ -100,18 +102,16 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
         .name("usticky-hover-emitter".into())
         .spawn(move || {
             tracing::debug!("hover emitter 启动");
-            let mut last_inside = false;
             let mut last_emitted = false;
-            // 边缘抖动防抖计数器：
-            // - 鼠标在浮窗边缘抖动时，windowNumberAtPoint 会在 inside/outside
-            //   之间反复切，每次切都会 emit hover 事件 → 前端 backdrop-filter
-            //   28px 反复重合成 → 视觉上"光标闪烁"。
-            // - 修复：要求连续 ≥ DEBOUNCE_TICKS 次同方向 hit-test 才确认翻转。
-            // - 50ms tick × 3 = 150ms 延迟，人手移动窗口跨越边缘的典型时间
-            //   （>100ms）已经足够，所以感知不到延迟。
-            const DEBOUNCE_TICKS: u8 = 3;
-            let mut pending_inside: Option<bool> = None;
-            let mut pending_count: u8 = 0;
+            // v2（2026-07-03）：去掉了 150ms 防抖（DEBOUNCE_TICKS=3）。
+            // 旧防抖是为了避免边缘抖动时 backdrop-filter 28px 反复重合成闪烁，
+            // 但 v2 把玻璃材质常驻强开后，hover 只切 color / text-shadow
+            // （CSS variable swap），这些属性的前端 transition（.todo-title
+            // 0.28s color 等）已经能吸收抖动 —— color 过渡中反复方向只是
+            // "颜色微微抖动"，不像 backdrop-filter 反复重合成那样刺眼。
+            // 前端 main.ts 的 setHoverAttr 还用 rAF 合并同帧多次 emit，
+            // 进一步降低 DOM 写入频率。
+            // 净效果：50ms tick 检测到就立即 emit，进入/离开都无感知延迟。
 
             loop {
                 thread::sleep(Duration::from_millis(50));
@@ -120,28 +120,7 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 
                 // 关键：用 NSWindow.windowNumberAtPoint 做命中测试 ——
                 // 不光检查"鼠标在不在浮窗 frame 内"，还要确认浮窗在该点是**最上层**。
-                let raw_inside = is_floating_topmost_at(&app, mouse);
-
-                // 边缘防抖：连续 DEBOUNCE_TICKS 次同方向才确认状态翻转
-                let inside = match pending_inside {
-                    Some(p) if p == raw_inside => {
-                        pending_count += 1;
-                        if pending_count >= DEBOUNCE_TICKS {
-                            // 状态翻转确认
-                            pending_inside = None;
-                            pending_count = 0;
-                            raw_inside
-                        } else {
-                            last_inside // 还没确认，保持上次 emit 状态
-                        }
-                    }
-                    _ => {
-                        // raw_inside 跟 pending 不一致 → 重置 pending
-                        pending_inside = Some(raw_inside);
-                        pending_count = 1;
-                        last_inside
-                    }
-                };
+                let inside = is_floating_topmost_at(&app, mouse);
 
                 if inside != last_emitted {
                     last_emitted = inside;
@@ -161,8 +140,6 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                         set_window_level(&app, level, false);
                     }
                 }
-
-                last_inside = inside;
             }
         });
     if let Err(e) = builder {

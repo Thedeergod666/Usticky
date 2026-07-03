@@ -1,0 +1,230 @@
+/* Usticky 设置面板样式
+ *
+ * 设计：原生 macOS 风格卡片，浅色背景，紧凑布局。
+ * 跟浮窗的玻璃质感不同 —— 设置面板是常规窗口，用纯色 + subtle shadow。
+ */
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  background: #f6f6f8;
+  color: #1d1d1f;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+               "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#settings-app {
+  max-width: 580px;
+  margin: 0 auto;
+  padding: 32px 28px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  user-select: none;
+}
+
+/* ── 标题 ── */
+.settings-title {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #1d1d1f;
+  padding-bottom: 4px;
+}
+
+/* ── Section 卡片 ── */
+.section {
+  background: #ffffff;
+  border: 0.5px solid rgba(0, 0, 0, 0.08);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 0.5px 1px rgba(0, 0, 0, 0.04);
+}
+.section-header {
+  padding: 14px 16px 6px;
+}
+.section-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: #6e6e73;
+}
+.section-body {
+  padding: 6px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ── Row（一行设置项） ── */
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  min-height: 32px;
+}
+.row + .row {
+  border-top: 0.5px solid rgba(0, 0, 0, 0.06);
+}
+.row-label {
+  flex: 1 1 auto;
+  font-size: 13px;
+  font-weight: 500;
+  color: #1d1d1f;
+}
+.row-hint {
+  font-size: 11px;
+  color: #86868b;
+  margin-top: 2px;
+  font-weight: 400;
+}
+
+/* ── Segmented control（pin mode） ── */
+.segmented {
+  display: inline-flex;
+  background: #ececee;
+  border-radius: 7px;
+  padding: 2px;
+  gap: 1px;
+  flex: 0 0 auto;
+}
+.segmented button {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  border: none;
+  background: transparent;
+  color: #424245;
+  padding: 5px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  white-space: nowrap;
+}
+.segmented button:hover:not(.active) {
+  color: #1d1d1f;
+}
+.segmented button.active {
+  background: #ffffff;
+  color: #1d1d1f;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+  font-weight: 600;
+}
+
+/* ── 语言选择（同样用 segmented） ── */
+
+/* ── 按钮 ── */
+.btn {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  border: 0.5px solid rgba(0, 0, 0, 0.15);
+  background: #ffffff;
+  color: #1d1d1f;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+  flex: 0 0 auto;
+}
+.btn:hover {
+  background: #f5f5f7;
+  border-color: rgba(0, 0, 0, 0.2);
+}
+.btn:active {
+  background: #e8e8eb;
+}
+.btn-primary {
+  background: #007aff;
+  color: #ffffff;
+  border-color: #007aff;
+}
+.btn-primary:hover {
+  background: #0066d6;
+  border-color: #0066d6;
+}
+
+/* ── 关于 section ── */
+.about-logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0 12px;
+}
+.about-logo img {
+  width: 48px;
+  height: 48px;
+  border-radius: 11px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+.about-name {
+  font-size: 16px;
+  font-weight: 700;
+  color: #1d1d1f;
+}
+.about-version {
+  font-size: 11px;
+  color: #86868b;
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.about-meta {
+  font-size: 11px;
+  color: #86868b;
+  line-height: 1.6;
+  padding: 8px 0;
+}
+.about-meta a {
+  color: #007aff;
+  text-decoration: none;
+  cursor: pointer;
+}
+.about-meta a:hover {
+  text-decoration: underline;
+}
+
+/* ── flash 提示 ── */
+.flash {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%) translateY(8px);
+  padding: 8px 16px;
+  background: rgba(28, 28, 30, 0.92);
+  color: #fff;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s, transform 0.2s;
+  z-index: 9999;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.flash.visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* ── 滚动条 ── */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.28);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track { background: transparent; }

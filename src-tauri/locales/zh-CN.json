@@ -12,9 +12,13 @@
     "too_long": "标题过长（最多 {max} 字符）",
     "not_found": "Todo 不存在"
   },
+  "window": {
+    "settings": "设置"
+  },
   "tray": {
     "show": "显示浮窗",
     "hide": "隐藏浮窗",
+    "settings": "设置...",
     "quit": "退出 Usticky"
   }
 }

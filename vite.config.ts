@@ -6,8 +6,7 @@ import { defineConfig } from "vite";
 //   - port=1421 / strictPort / host=127.0.0.1（tauri.conf.json devUrl 对齐）
 //   - assetsInlineLimit: 0（CSP `default-src 'self'` 不放 data: URI，
 //     不关的话 <4KB 资源会被 Vite 内联成 data: 然后被 CSP block 裂图）
-//   - rollupOptions.input 列出所有 HTML entry（Usticky 只有 index.html 一个，
-//     但留着 pattern 方便加 settings.html 时扩）
+//   - rollupOptions.input 列出所有 HTML entry（Usticky 浮窗 + 设置面板两个）
 //   - 关 modulePreload polyfill —— 跨平台 HTML byte-for-byte 一致
 const root = fileURLToPath(new URL("./", import.meta.url));
 
@@ -31,6 +30,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: `${root}index.html`,
+        settings: `${root}settings.html`,
       },
       output: {
         entryFileNames: "assets/[name].js",
