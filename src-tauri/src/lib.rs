@@ -187,6 +187,15 @@ pub fn run() {
                 }
             });
 
+            // 8. pin mode 切换链路：tray 子菜单的 checkmark 要跟着刷新
+            //    （浮窗 foot / 设置面板 / tray 子菜单任一处改 pin mode 都会 emit）
+            let app_for_pin = app.handle().clone();
+            app.listen("usticky://pin-mode-changed", move |_| {
+                if let Err(e) = tray::rebuild_tray(&app_for_pin) {
+                    tracing::warn!(error = %e, "rebuild_tray (pin mode) 失败");
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

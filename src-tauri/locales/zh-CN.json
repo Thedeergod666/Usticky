@@ -18,7 +18,13 @@
   "tray": {
     "show": "显示浮窗",
     "hide": "隐藏浮窗",
-    "settings": "设置...",
+    "settings": "设置",
+    "open_settings": "打开设置面板...",
+    "pin": {
+      "top": "置顶",
+      "bottom": "置底",
+      "normal": "默认"
+    },
     "quit": "退出 Usticky"
   }
 }

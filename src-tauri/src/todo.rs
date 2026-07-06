@@ -42,7 +42,7 @@ pub enum PinMode {
 
 impl Default for PinMode {
     fn default() -> Self {
-        Self::PinTop  // v0.1 默认置顶（alwaysOnTop: true 同源）
+        Self::PinBottom  // v0.1.2 默认置底（hover 时临时置顶，不挡其他 app）
     }
 }
 

@@ -49,7 +49,7 @@ let sortableInstances: Sortable[] = [];  // 保存实例，cleanup 用
 // 浮窗层级模式（pin_top / pin_bottom / normal）
 // 启动时从后端 get_pin_mode 拉，跟 usticky://pin-mode-changed 事件同步
 type PinMode = "pin_top" | "pin_bottom" | "normal";
-let currentPinMode: PinMode = "pin_top";  // 默认跟后端 PinMode::default() 对齐
+let currentPinMode: PinMode = "pin_bottom";  // 默认跟后端 PinMode::default() 对齐
 
 // ── mini flash（复用 Musage 模式） ──
 let miniFlashTimer: ReturnType<typeof setTimeout> | null = null;

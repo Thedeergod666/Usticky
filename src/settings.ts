@@ -40,7 +40,7 @@ function escapeHtml(s: string): string {
 
 // ── 渲染 ──
 
-let currentPinMode: PinMode = "pin_top";
+let currentPinMode: PinMode = "pin_bottom";
 let currentLocale: Locale = "zh-CN";
 let appVersion = "0.1.0";
 

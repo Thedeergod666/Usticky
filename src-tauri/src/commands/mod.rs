@@ -218,20 +218,30 @@ pub async fn set_pin_mode(
     store: State<'_, SharedStore>,
     mode: String,
 ) -> Result<(), String> {
-    let parsed = PinMode::from_str_opt(&mode)
+    set_pin_mode_core(&app, store.inner(), &mode).await
+}
+
+/// pin mode 切换的核心逻辑（command 和 tray menu handler 共用）。
+///
+/// 走手写 persist 路径 + emit `usticky://pin-mode-changed`（不走 persist_and_emit，
+/// 因为 pin mode 改了跟 todo 列表无关，前端不该 render todos）。
+pub async fn set_pin_mode_core(
+    app: &AppHandle,
+    store: &SharedStore,
+    mode: &str,
+) -> Result<(), String> {
+    let parsed = PinMode::from_str_opt(mode)
         .ok_or_else(|| format!("invalid pin mode: {}", mode))?;
-    apply_pin_mode_to_window(&app, parsed);
+    apply_pin_mode_to_window(app, parsed);
     {
         let mut s = store.write().await;
         s.set_pin_mode(parsed);
     }
-    // 复用 persist_and_emit —— 但它会 emit todos-changed，pin mode 改了跟 todo 列表
-    // 无关，前端不该 render。所以这里走手写 persist 路径，emit 走 pin-mode-changed。
-    if let Err(e) = store.read().await.persist(&app) {
+    if let Err(e) = store.read().await.persist(app) {
         tracing::error!("persist failed: {}", e);
         let _ = app.emit("usticky://persist-failed", e.to_string());
     }
-    let _ = app.emit("usticky://pin-mode-changed", &mode);
+    let _ = app.emit("usticky://pin-mode-changed", mode);
     Ok(())
 }
 

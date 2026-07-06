@@ -18,7 +18,13 @@
   "tray": {
     "show": "Show floating window",
     "hide": "Hide floating window",
-    "settings": "Settings...",
+    "settings": "Settings",
+    "open_settings": "Open Settings Panel...",
+    "pin": {
+      "top": "Top",
+      "bottom": "Bottom",
+      "normal": "Normal"
+    },
     "quit": "Quit Usticky"
   }
 }
