@@ -180,7 +180,13 @@ pub async fn reset_floating_window(
 pub async fn resize_floating_window(app: AppHandle, height: f64) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("floating") {
         let cur = w.outer_size().map_err(|e| e.to_string())?;
-        w.set_size(tauri::PhysicalSize::new(cur.width, height as u32))
+        // 前端传的 height 是 CSS 像素（logical），PhysicalSize 期望物理像素。
+        // 不转 dpr 的话 Retina（scale=2）上窗口实际高度只有预期的一半，
+        // 视觉上就是"自适应不工作"。
+        let scale = w.scale_factor().unwrap_or(1.0);
+        let new_h_physical = (height * scale).round() as u32;
+        // width 沿用 outer_size 返回的物理像素，不改动用户拖拽的宽度
+        w.set_size(tauri::PhysicalSize::new(cur.width, new_h_physical))
             .map_err(|e| e.to_string())?;
     }
     Ok(())

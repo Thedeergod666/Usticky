@@ -1,6 +1,6 @@
 # Usticky 项目说明
 
-> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.1.0 骨架** / 2026-07-02。
+> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.1 骨架 + 设置面板 + 三档 pin mode** / 2026-07-06。
 
 ## 这是什么
 
@@ -50,7 +50,7 @@
 | `src/main.ts` 的 `lastGoodSnap` + `TRANSIENT_ERROR_KINDS` | **不需要**（todo 没有"瞬态错误"概念） |
 | `src-tauri/src/lib.rs` 的 `WindowEvent::Moved/Resized` 持久化 | **直接抄** —— spawn 异步任务，**不**在 UI 线程 blocking_write |
 | `src-tauri/src/commands/mod.rs` 的 `reset_floating_window` / `resize_floating_window` | **直接抄** |
-| `src-tauri/src/platform/macos.rs` 的 PinBottom + hover emitter | **可选 v2+** —— Usticky v0.1 不做（先看用户对"被前景 app 抢焦点"的容忍度） |
+| `src-tauri/src/platform/macos.rs` 的 PinBottom + hover emitter | **已做（v0.1.2）** —— 三档 pin mode（PinTop/PinBottom/Normal，默认 PinBottom）+ 50ms tick hover emitter（`NSEvent.mouseLocation` + `windowNumberAtPoint` 命中测试）。Win 端 best-effort 实现（`HWND_BOTTOM`/`TOPMOST` dual-path），Linux no-op stub |
 | `src-tauri/tauri.conf.json` 的 CSP / 浮窗 windows 配置 | **整段抄**，改 label / productName |
 | `src-tauri/capabilities/` 的拆分模式 | **抄** —— 浮窗 capabilities vs 全局 capabilities 分开 |
 | `src-tauri/entitlements.plist` | **整段抄**（Usticky 不联网，可以把 `network.client` 删掉，留 `network.server` 给未来 updater） |
@@ -114,9 +114,9 @@ macOS 上 `set_always_on_top(false)` 不够 —— 窗口变 `kCGNormalWindowLev
 
 但 level -1 时 JS `mouseenter` 触发不到（WKWebView 在非 key window 不分发 mouseMoved）。解法：Rust 端 background thread 轮询 `NSEvent.mouseLocation()` + 窗口 `frame` 做 point-in-rect，emit `musage://floating-hover` 事件给前端 toggle `body[data-hover]`。
 
-**Win 上做不到稳定 hover-raise** —— Win32 z-order 是平铺列表，OS 焦点调度持续 demote。建议 PinBottom 只在 macOS 做，Win/Linux 直接走 pin_top。
+**Win 上做不到稳定 hover-raise** —— Win32 z-order 是平铺列表，OS 焦点调度持续 demote。Win 端 best-effort 实现（`HWND_BOTTOM`/`TOPMOST` dual-path + `SetWindowLongPtrW` 改 `WS_EX_TOPMOST` style bit + `GetAncestor(GA_ROOT)` 命中测试，详见 [platform/windows.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/platform/windows.rs)）。Linux no-op stub（`set_always_on_top(true)` 已是最实用方案）。
 
-**Usticky 决策**：v0.1 不做 PinBottom，先看用户对"被前景 app 抢焦点"的容忍度。
+**Usticky 决策**：v0.1.2 已实现三档 pin mode（PinTop / PinBottom / Normal，**默认 PinBottom**）。hover 临时置顶走 `NSWindow.setLevel` + `NSEvent.mouseLocation` 全局轮询 + `windowNumberAtPoint` 命中测试（详见 [platform/macos.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/platform/macos.rs)）。dwell-time hysteresis（enter 3 ticks / exit 2 ticks）防边缘抖动振荡。
 
 ### 7. iOS 26 玻璃质感 / 待机省电双模式
 
@@ -189,6 +189,8 @@ listen('usticky://pin-mode-changed', async () => {
 
 **不**走 `get_snapshot` + `render` —— 后端每次 IPC 都会 emit，自己 + 事件会 render 两遍 → 闪烁。**用 `lastRenderedSnap` 缓存**直接 render。
 
+**✅ v0.1.2 已实现**：浮窗 [main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) + 设置面板 [settings.ts](file:///Users/wyh/Project/Usticky/src/settings.ts) 都监听 `usticky://pin-mode-changed` / `usticky://locale-changed`，后端 `set_pin_mode_core` / `set_app_locale` emit。tray 子菜单的 checkmark 由 [lib.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/lib.rs) 的 listener 调 `tray::rebuild_tray` 刷新。
+
 ### 15. locale 切换链路
 
 ```
@@ -213,37 +215,63 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 - **撤销栈最多 50 条**（避免无限增长）
 - **快捷键不抢系统**：`CmdOrCtrl+Shift+Space` 是跟 Raycast 错开的安全位
 
-## v0.1 骨架当前状态
+## v0.1 当前状态
+
+### v0.1.0 骨架（2026-07-02）
 
 ✅ 项目目录 + git init
 ✅ Tauri 2 配置文件（package.json / Cargo.toml / tauri.conf.json / capabilities）
 ✅ Vite 配置（port 1421 + assetsInlineLimit: 0）
 ✅ 前端骨架（main.ts / styles.css / i18n / index.html）
 ✅ 后端骨架（lib.rs / main.rs / todo.rs / commands / tray / platform）
-✅ i18n 字典（en + zh-CN，minimal）
+✅ i18n 字典（en + zh-CN，前端 dict 已覆盖空态 / 输入 / due 标签 / 设置面板 / tray 全文案）
 ✅ 占位 icon
-✅ SortableJS 拖拽排序
-✅ 标记完成动画
 ✅ 全局快捷键接线（CmdOrCtrl+Shift+Space → quick-add → 聚焦 input）
-⏳ **未做**：Cmd+Z 撤销栈（v0.2 候选）
-⏳ **未做**：tray 图标任务数 badge（v0.1 是静态图标）
+
+### v0.1.1（2026-07-02，搬 Musage 三档 pin mode）
+
+✅ `todo.rs` `PinMode` enum（PinTop / PinBottom / Normal）+ 持久化到 `todos.json`
+✅ `platform/macos.rs`：`NSWindow.setLevel` 切三档（`kCGFloatingWindowLevel` / `kCGNormalWindowLevel - 1` / `kCGNormalWindowLevel`）
+✅ `platform/windows.rs`：`HWND_TOPMOST` / `HWND_BOTTOM` / `HWND_NOTOPMOST` dual-path（`SetWindowPos` + `SetWindowLongPtrW` 改 `WS_EX_TOPMOST`）
+✅ `platform/mod.rs`：跨平台统一 API + Linux no-op stub
+
+### v0.1.2（2026-07-03 → 2026-07-06，hover emitter + 设置面板 + tray 子菜单）
+
+✅ Hover emitter（50ms tick，macOS `NSEvent.mouseLocation` + `windowNumberAtPoint` 命中测试；Win `GetCursorPos` + `WindowFromPoint` + `GetAncestor(GA_ROOT)`）
+✅ Hover dwell-time hysteresis（enter 3 ticks / exit 2 ticks，防边缘抖动振荡）
+✅ Hover 双路径（Rust emit `usticky://floating-hover` + JS `mouseenter`/`mouseleave` 40ms debounce）—— 失焦时主动 `setHoverAttr(false)` 清 stale state
+✅ SortableJS 拖拽排序（pending / done section 各一个 Sortable 实例，`onEnd` 批量 `reorder_todos`）
+✅ 标记完成动画（`.vanishing` class + 300ms 延迟后才调 IPC，失败回滚 class）
+✅ 设置面板（[settings.html](file:///Users/wyh/Project/Usticky/settings.html) + [src/settings.ts](file:///Users/wyh/Project/Usticky/src/settings.ts) + [src/settings.css](file:///Users/wyh/Project/Usticky/src/settings.css)）：单页设计，pin mode segmented control + 语言切换 + 浮窗归位 + 关于
+✅ `open_settings_window` 命令（动态创建 webview，已开则 focus，关闭时 destroy，不在 tauri.conf.json 常驻）
+✅ Tray Settings 子菜单（pin mode 三档 `CheckMenuItem` + "Open Settings Panel..."）—— locale / pin mode 切换时 `rebuild_tray` 走 `run_on_main_thread` 派发避免 NSStatusBar SIGTRAP
+✅ Tray icon 改 U 字母（[scripts/generate_icons.py](file:///Users/wyh/Project/Usticky/scripts/generate_icons.py)：白底圆角 + 黑色加粗 U + ring 装饰，每个尺寸原生渲染，macOS 用 `iconutil` 拼真 .icns）
+✅ `reset_floating_window` / `resize_floating_window` / `hide_floating_window` / `show_floating_window` 命令
+✅ `set_floating_hover_raise` 命令（前端兜底信号，macOS/Win 上 tracker 已自行处理，此处 no-op）
+✅ locale 切换链路：tray + settings 窗口 title 同步重建（`usticky://locale-changed` listener）
+✅ Pin mode 跨 webview 同步（`usticky://pin-mode-changed` listener 在浮窗 / 设置面板 / tray 三处生效）
+✅ `persist_and_emit` 失败时 emit `usticky://persist-failed`（不再静默吞掉，前端 mini-flash 提示）
+
+### 仍未做
+
+⏳ **Cmd+Z 撤销栈**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 已占位 keydown listener，TODO 未实现，v0.2 候选）
+⏳ **tray 图标任务数 badge**（v0.1 是静态图标 `tray-base.png`，v0.2 候选）
 
 ## v0.2 候选
 
 | Feature | 价值 | 复杂度 |
 |---|---|---|
-| SortableJS 拖拽排序 | 必备 | ⭐ |
-| 标记完成动画 + 撤销（Cmd+Z） | 必备 | ⭐⭐ |
+| Cmd+Z 撤销栈（最多 50 条） | 必备 | ⭐⭐ |
 | 全局快捷键冲突检测 | 必备 | ⭐ |
-| 设置面板（位置/透明度/主题色/快捷键改绑） | 必备 | ⭐⭐ |
 | 全文搜索（Cmd+F 浮窗内） | 列表长时必备 | ⭐⭐ |
-| iCloud 同步（CloudKit） | 多设备 | ⭐⭐⭐ |
+| tray 图标任务总数 badge | 锦上添花 | ⭐⭐ |
 | 提醒通知（tauri-plugin-notification） | 临近 deadline 弹 | ⭐⭐ |
 | 标签分组（折叠） | 工作流成熟后 | ⭐⭐ |
+| iCloud 同步（CloudKit） | 多设备 | ⭐⭐⭐ |
 
 ## 已知坑（来自 Musage 同款决策）
 
-详见 [docs/quirks.md](docs/quirks.md)（v0.1 完成后整理）。
+详见 `docs/quirks.md`（**尚未整理** —— v0.1.2 hover emitter / PinBottom 调试期间的多条 fix 散落在 [platform/macos.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/platform/macos.rs) / [platform/windows.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/platform/windows.rs) / [main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 的内联注释里，待 v0.2 阶段统一归纳）。
 
 ## 文件结构
 
@@ -254,36 +282,41 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ├── CHANGELOG.md
 ├── package.json / pnpm-lock.yaml
 ├── tsconfig.json / vite.config.ts
-├── scripts/sync-version.cjs
-├── index.html
+├── scripts/
+│   ├── sync-version.cjs      ← 三处 version 同步
+│   └── generate_icons.py     ← U 字母 icon 生成（PNG/ICO/ICNS + tray-base.png）
+├── index.html                ← 浮窗入口
+├── settings.html             ← 设置面板入口（动态创建 webview，非常驻）
 ├── src/
-│   ├── main.ts               ← 浮窗：渲染 + 拖拽 + 输入 + 快捷键
+│   ├── main.ts               ← 浮窗：渲染 + 拖拽 + 输入 + 快捷键 + hover 双路径
 │   ├── styles.css            ← iOS 26 玻璃质感（沿用 Musage）
+│   ├── settings.ts           ← 设置面板：pin mode + 语言 + 归位 + 关于
+│   ├── settings.css          ← 设置面板样式
 │   ├── assets.d.ts
 │   └── i18n/
-│       ├── index.ts
-│       ├── en.json
+│       ├── index.ts          ← 前端 i18n helper（locale 持久化 + onLocaleChange）
+│       ├── en.json           ← 前端 dict（dotted key，覆盖空态/due/设置/tray）
 │       └── zh-CN.json
 └── src-tauri/
     ├── Cargo.toml
-    ├── tauri.conf.json
+    ├── tauri.conf.json       ← 浮窗 windows 配置（只声明 floating，settings 动态建）
     ├── build.rs
     ├── entitlements.plist
     ├── capabilities/
     │   ├── default.json      ← 浮窗 capabilities
     │   └── global.json       ← 全局 IPC capabilities
-    ├── icons/                ← 占位
-    ├── locales/              ← en.json + zh-CN.json
+    ├── icons/                ← generate_icons.py 产物（含 tray-base.png）
+    ├── locales/              ← en.json + zh-CN.json（rust-i18n 后端单一来源）
     └── src/
         ├── main.rs           ← Windows / Linux 入口
-        ├── lib.rs            ← Tauri Builder
-        ├── todo.rs           ← Todo struct + JSON storage
-        ├── tray.rs           ← 系统托盘
+        ├── lib.rs            ← Tauri Builder + 快捷键 + 窗口事件持久化 + locale/pin mode listener
+        ├── todo.rs           ← Todo + PinMode + StoreData + JSON storage（原子写 + 0600 + .bak）
+        ├── tray.rs           ← 系统托盘（Settings 子菜单 + pin mode checkmark + rebuild_tray）
         ├── commands/
-        │   ├── mod.rs        ← list/add/update/delete/reorder
-        │   └── i18n.rs       ← set_app_locale
+        │   └── mod.rs        ← CRUD + 浮窗控制 + i18n + pin mode + open_settings_window
         └── platform/
-            ├── mod.rs
-            ├── macos.rs      ← v2+ PinBottom（v0.1 stub）
-            └── windows.rs    ← stub
+            ├── mod.rs        ← 跨平台统一 API（pub use plat::*）
+            ├── macos.rs      ← PinBottom/PinTop/Normal + hover emitter（已实现）
+            ├── windows.rs    ← HWND_TOPMOST/BOTTOM dual-path + hover emitter（best-effort）
+            └── (linux)       ← mod.rs 内 no-op stub（无 linux.rs 文件）
 ```

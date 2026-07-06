@@ -43,27 +43,32 @@ Usticky/
 ├── CHANGELOG.md
 ├── package.json / pnpm-lock.yaml
 ├── tsconfig.json / vite.config.ts
-├── scripts/sync-version.cjs  ← 三处 version 同步
+├── scripts/
+│   ├── sync-version.cjs      ← 三处 version 同步
+│   └── generate_icons.py     ← U 字母 icon 生成（PNG/ICO/ICNS + tray-base.png）
 ├── index.html                ← 浮窗入口
+├── settings.html             ← 设置面板入口（动态创建 webview，非常驻）
 ├── src/
-│   ├── main.ts               ← 渲染 + 拖拽 + 输入 + 快捷键
+│   ├── main.ts               ← 浮窗：渲染 + 拖拽 + 输入 + 快捷键 + hover 双路径
 │   ├── styles.css            ← iOS 26 玻璃质感（沿用 Musage）
+│   ├── settings.ts           ← 设置面板：pin mode + 语言 + 归位 + 关于
+│   ├── settings.css          ← 设置面板样式
 │   ├── assets.d.ts           ← ?url 模块声明
 │   └── i18n/                 ← en.json + zh-CN.json + index.ts
 └── src-tauri/
     ├── Cargo.toml
-    ├── tauri.conf.json       ← bundle targets: nsis + dmg
+    ├── tauri.conf.json       ← bundle targets: nsis + dmg；windows 只声明 floating
     ├── build.rs / entitlements.plist
     ├── capabilities/
-    ├── icons/
-    ├── locales/              ← en.json + zh-CN.json
+    ├── icons/                ← generate_icons.py 产物（含 tray-base.png）
+    ├── locales/              ← en.json + zh-CN.json（rust-i18n 后端单一来源）
     └── src/
         ├── main.rs           ← Windows / Linux 入口
-        ├── lib.rs            ← Tauri Builder + storage init
-        ├── todo.rs           ← Todo struct + storage trait + JSON impl
-        ├── tray.rs           ← 系统托盘（任务数 badge）
-        ├── commands/         ← IPC: list/add/update/delete/reorder
-        └── platform/         ← macOS private API（可选 v2+）
+        ├── lib.rs            ← Tauri Builder + 快捷键 + 窗口事件持久化 + locale/pin mode listener
+        ├── todo.rs           ← Todo + PinMode + StoreData + JSON storage（原子写 + 0600 + .bak）
+        ├── tray.rs           ← 系统托盘（Settings 子菜单 + pin mode checkmark）
+        ├── commands/mod.rs   ← CRUD + 浮窗控制 + i18n + pin mode + open_settings_window
+        └── platform/         ← macOS NSWindow.setLevel + hover emitter / Win HWND dual-path / Linux no-op
 ```
 
 ## Relationship to Musage
@@ -79,8 +84,9 @@ Usticky 直接借用 [Musage](~/Project/Musage) 的浮窗经验（详见 [AGENTS
 | 浮窗位置/尺寸自动记忆 | → 直接复制 |
 | iOS 26 玻璃 CSS + 省电模式 | → 直接复制 + 改类名 |
 | i18n 双 locale 架构 | → 直接复制（en + zh-CN） |
+| PinBottom 私有 API + hover emitter | → **v0.1.2 已搬**（三档 pin mode + 50ms tick 全局鼠标轮询） |
 
-不借用 Musage 的：11 provider / API 轮询 / tray 动态进度条 / PinBottom 私有 API（v2+ 才考虑）。
+不借用 Musage 的：11 provider / API 轮询 / tray 动态进度条（Usticky tray 是静态图标，任务总数 badge 留待 v0.2）。
 
 ## License
 

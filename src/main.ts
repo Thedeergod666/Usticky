@@ -203,7 +203,12 @@ function render(snap: TodoSnapshot) {
   }
 
   // 输入中禁止 autoResize —— scrollHeight 跳变会打断输入（AGENTS.md #18）
-  if (!app.querySelector<HTMLInputElement>(".todo-input input")?.matches(":focus")) {
+  // 但"输入中"的判定是 input 有内容（正在打字），不是聚焦本身 ——
+  // Enter 添加后 input 仍聚焦但已清空，此时 resize 是安全的，否则
+  // "添加新 todo"永远等不到 resize（用户每次按 Enter 都被这里挡掉）。
+  const inputEl = app.querySelector<HTMLInputElement>(".todo-input input");
+  const typing = inputEl?.matches(":focus") && (inputEl.value.length > 0);
+  if (!typing) {
     void autoResizeWindow(snap);
   }
 }
@@ -547,6 +552,8 @@ async function init() {
   } catch (e) {
     console.error("[usticky] get_pin_mode failed", e);
   }
+  // sync 到 body[data-pin-mode] —— CSS 据此在 PinBottom idle 进一步淡化 done 卡
+  document.body.dataset.pinMode = currentPinMode;
 
   // ── 启动时拉一次 snapshot ──
   try {
@@ -562,20 +569,52 @@ async function init() {
   listen<PinMode>("usticky://pin-mode-changed", (e) => {
     if (e.payload !== currentPinMode) {
       currentPinMode = e.payload;
+      document.body.dataset.pinMode = currentPinMode;
       setupPinModeHoverRaise(currentPinMode);
     }
   })
     .then((fn) => (unlistenPinMode = fn))
     .catch((e) => console.error("[usticky] listen pin-mode-changed failed", e));
 
-  // ── 浮窗拖动：左键 mousedown 但 target 是 .todo-card 或 input/button 时跳过 ──
+  // ── 浮窗拖动：左键 mousedown 但 target 是 .todo-card 或 button 时跳过 ──
+  // 输入区（.todo-input / input）也允许拖窗，但要走阈值法：
+  //   - 单击（mousedown→mouseup 无明显位移）→ 默认行为，聚焦 input 打字
+  //   - 拖动（位移 > 5px）→ startDragging，把整个浮窗拖走
+  // 否则输入框无法既当拖把又当输入框。AGENTS.md #11 的 .todo-row 冲突原则
+  // 在此扩展为"input 既要聚焦又要拖窗"，用位移阈值区分意图。
   const w = getCurrentWindow();
+  const DRAG_THRESHOLD = 5;
   app.addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
     const target = e.target as HTMLElement;
-    if (target.closest(".todo-card, input, button, .todo-input")) return;
-    e.preventDefault();
-    w.startDragging().catch((err) => console.debug("[usticky] startDragging failed", err));
+    if (target.closest(".todo-card, button")) return;
+    const inInput = !!target.closest("input, .todo-input");
+    if (!inInput) {
+      e.preventDefault();
+      w.startDragging().catch((err) => console.debug("[usticky] startDragging failed", err));
+      return;
+    }
+    // 输入区：阈值法，避免抢走 click→focus
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let started = false;
+    const onMove = (ev: MouseEvent) => {
+      if (started) return;
+      if (Math.abs(ev.clientX - startX) > DRAG_THRESHOLD ||
+          Math.abs(ev.clientY - startY) > DRAG_THRESHOLD) {
+        started = true;
+        cleanup();
+        e.preventDefault();
+        w.startDragging().catch((err) => console.debug("[usticky] startDragging failed", err));
+      }
+    };
+    const onUp = () => cleanup();
+    const cleanup = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
   });
 
   // ── 全局快捷键：监听后端 emit 的 quick-add 事件 → 聚焦 input ──

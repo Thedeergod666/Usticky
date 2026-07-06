@@ -36,7 +36,12 @@ html, body {
 /* ── 整窗容器 ── */
 #app {
   width: 100%;
-  height: 100%;
+  /* height 不固定 —— 让 #app 塌缩到内容高度，scrollHeight 才能反映真实内容。
+   * 之前用 height:100% 导致 #app 永远撑满窗口，todo 减少时 scrollHeight
+   * 不会缩到窗口以下 → resizeWindowToContent 比对 currentH===desired 跳过
+   * 缩小 → 浮窗"只长不缩"。max-height:100% 保留：内容超过窗口（屏幕高度
+   * clamp 后）时由 overflow-y 滚动兜底。 */
+  max-height: 100%;
   padding: 5px;
   display: flex;
   flex-direction: column;
@@ -123,7 +128,8 @@ body[data-hover] #app {
   transition:
     background-color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
     border-color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
-    transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+    transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1);
   cursor: grab;
 }
 .todo-card:active { cursor: grabbing; }
@@ -133,6 +139,34 @@ body[data-hover] #app {
 .todo-card.done .todo-title {
   text-decoration: line-through;
   color: var(--text-faint);
+}
+
+/* Pending 卡 idle 轻淡化：未 hover 时整卡 opacity 降到 0.72，让玻璃胶囊
+ * 退到背景里；hover 时撤销淡化，跟用户注意力同步显形。
+ * 跟 done 卡的 PinBottom 淡化（0.5）拉开档次 —— pending 是"待办"主体，
+ * 不能比 done 还淡，否则主次倒置。opacity transition 已在 .todo-card 上。 */
+body:not([data-hover]) .todo-card:not(.done):not(.vanishing) {
+  opacity: 0.72;
+}
+body[data-hover] .todo-card:not(.done):not(.vanishing) {
+  opacity: 1;
+}
+
+/* PinBottom 模式 idle：进一步淡化已完成任务（整卡 opacity 淡化，idle 时不抢视觉）
+ * 仅 PinBottom —— 这是"置底常驻"场景，done 任务该退到背景里；
+ * pin_top / normal 模式下 done 卡维持原有 --text-faint 弱化即可。
+ * hover 时撤销淡化（见下）—— 让用户检阅时 done 与 pending 一样清晰。 */
+body[data-pin-mode="pin_bottom"]:not([data-hover]) .todo-card.done {
+  opacity: 0.5;
+}
+/* PinBottom 模式 hover：done 卡恢复到跟 pending 一样明显
+ * opacity 回 1 + 标题色升到 --text-bright（同 pending）。
+ * 保留 line-through —— 它是"已完成"的状态指示，不该随 hover 丢。 */
+body[data-pin-mode="pin_bottom"][data-hover] .todo-card.done {
+  opacity: 1;
+}
+body[data-pin-mode="pin_bottom"][data-hover] .todo-card.done .todo-title {
+  color: var(--text-bright);
 }
 .todo-card.vanishing {
   transform: translateX(-30%);
@@ -284,7 +318,10 @@ body[data-hover] #app .todo-due.days     { color: var(--c-data-cyan);  backgroun
   text-transform: uppercase;
   letter-spacing: 0.8px;
   color: var(--text-faint);
-  padding: 4px 4px 0;
+  /* padding-top: 0 —— 让 header 上下间距统一走 .todo-list 的 6px gap。
+     原来 padding-top: 4px 让 done header 上方间距 = 6+4 = 10px，比下方 6px
+     不对称，视觉上 pending → done 之间空一大块。去掉后上下对称都 6px。 */
+  padding: 0 4px;
   text-shadow: var(--text-shadow);
   transition: color 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
