@@ -485,41 +485,39 @@ async function init() {
   //      NSEvent.mouseLocation 全局轮询绕过）
   //   2. JS mouseenter/mouseleave（Win/Linux 主路径；macOS 聚焦态下兜底）
   //
-  // 沿用 Musage 2026-07-03 fix 的三层保险（v0.2.x 闪烁修复）：
-  //   (a) 失焦 / 页面隐藏时把 body mouseenter 视为 spurious 忽略；
-  //       顺手挡住 deactivate→reactivate 切换瞬间 WKWebView 的 spurious
-  //       mouseenter 路径。
-  //   (b) hover 显形 40ms debounce —— enter→leave 抖动被吞；正常 hover
-  //       仅延后 40ms 不可察觉。leave 方向不 debounce（撤销要快）。
+  // 沿用 Musage fix 的两层保险（v0.2.x 闪烁修复）：
+  //   (a) 页面隐藏时把 body mouseenter 视为 spurious 忽略（visibilitychange
+  //       主动清 hover）。
+  //   (b) hover 显形 40ms debounce —— enter→leave 抖动被吞；正常 hover 仅
+  //       延后 40ms 不可察觉。leave 方向不 debounce（撤销要快）。
   //   (c) Rust emit 同值去重 —— hover emitter 内部已有 dwell-time
-  //       hysteresis（enter 2 ticks / exit 1 tick），这里再做一层保险
+  //       hysteresis（enter 3 ticks / exit 2 ticks），这里再做一层保险
   //       避免 CSS spring 动画进行中反复重置起始点。
+  //
+  // **2026-07-06 fix**：去掉 `!focused` 守卫。原来的守卫目的是挡 deactivate→
+  // reactivate 切换瞬间的 spurious mouseenter，但**副作用是 un-focused 窗口
+  // 的合法 hover 全部被吞** —— 用户 hover 浮窗时鼠标进入事件被 Rust / JS
+  // 双路径同时挡掉，必须点一下让窗口获焦后第二次 hover 才生效，体验上就是
+  // "hover 没动效得点一下才有"。CSS 设计意图是 hover 在 un-focused 浮窗也
+  // 应该工作（透明浮窗的鼠标反馈是用户唯一的交互指示），所以这个守卫直接
+  // 违反设计意图。40ms debounce + 失焦时主动 setHoverAttr(false) + visibility
+  // change 清理已经够防 spurious，focus check 多此一举。
   const setHoverAttr = (on: boolean) => {
     if (on) document.body.dataset.hover = "1";
     else delete document.body.dataset.hover;
   };
-  // (a) 失焦 / 页面隐藏时把 body mouseenter 视为 spurious 忽略
-  // 启动时先 query 真实焦点状态，**不要**默认 focused = true：
-  // Musage 在 lib.rs 启动时调 set_focus() 所以默认对，但 Usticky v0.1 启动不抢焦点
-  // （用户偏好 "浮窗不抢焦点" 的承诺），窗口初始是 un-focused。如果默认 true，
-  // 启动后第一次 hover 进 un-focused 窗口会被守卫吞掉，必须点一下让窗口
-  // 获焦后第二次 hover 才生效 —— 表现为"hover 没动效得点一下才有"。
-  // 启动期 await 这个 Promise：失败时保守用 true（旧的 hack 默认），
-  // 反正 onFocusChanged 很快会纠正。
-  let focused = true;
+  // (a) 失焦时主动清 hover 状态：用户切到别 app 回来时不要"粘"住上次的 hover
+  //     显形（避免 stale state）。**注意**：这里只清状态，**不**挡后续 hover
+  //     —— un-focused 浮窗的合法 hover 必须能 toggle。
+  //     失焦瞬间 WKWebView 偶发派发的 spurious enter 不会触发显形，因为：
+  //     (1) 失焦时我们主动 setHoverAttr(false)，spurious enter 要走 40ms
+  //         debounce 才会显形，40ms 内用户的真实操作会覆盖；
+  //     (2) 失焦后 WKWebView 在 macOS 不向 un-focused webview 派 mouseMoved
+  //         / mouseenter 事件，spurious enter 实际很少触发。
   let pageVisible = true;
   const wForFocus = getCurrentWindow();
   wForFocus
-    .isFocused()
-    .then((f) => {
-      focused = f;
-    })
-    .catch(() => {
-      // isFocused 失败时保持默认 true（保留旧行为，onFocusChanged 首次回调会修正）
-    });
-  wForFocus
     .onFocusChanged(({ payload: f }) => {
-      focused = f;
       if (!f) setHoverAttr(false);
     })
     .catch(() => {});
@@ -532,7 +530,7 @@ async function init() {
   let hoverEnterTimer: ReturnType<typeof setTimeout> | null = null;
   const HOVER_DEBOUNCE_MS = 40;
   const onBodyMouseEnter = () => {
-    if (!focused || !pageVisible) return; // 失焦 / 隐藏态 → spurious 忽略
+    if (!pageVisible) return; // 隐藏态 → spurious 忽略
     if (hoverEnterTimer !== null) clearTimeout(hoverEnterTimer);
     hoverEnterTimer = setTimeout(() => {
       hoverEnterTimer = null;
@@ -560,11 +558,13 @@ async function init() {
   // 后端 hover emitter 兜底（macOS / Win），与 JS mouseenter/leave 等效
   // (c) Rust emit 同值去重：避免 CSS spring 动画进行中反复重置起始点。
   //     Rust 端已有 dwell-time hysteresis，这里再做一层保险。
-  //     失焦 / 隐藏态下 Rust 仍可能 emit true（50ms tick 周期），挡掉。
+  //     **不挡 payload=true**：un-focused 浮窗的合法 hover 由 Rust 路径触发。
+  //     失焦时 `onFocusChanged` 主动 setHoverAttr(false) 已清状态；visibility
+  //     hidden 时 pageVisible=false 守卫挡掉。focus check 已被证明是 bug。
   let unlistenHover: UnlistenFn | null = null;
   let lastHoverPayload: boolean | null = null;
   listen<boolean>("usticky://floating-hover", (e) => {
-    if (e.payload && (!focused || !pageVisible)) return;
+    if (e.payload && !pageVisible) return;
     if (lastHoverPayload === e.payload) return;
     lastHoverPayload = e.payload;
     // Rust 路径直接同步切（已经过 50ms tick 去抖）；cancel pending enter
