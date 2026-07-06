@@ -48,6 +48,40 @@ fn current_pin_mode<R: Runtime>(app: &AppHandle<R>) -> PinMode {
     }
 }
 
+/// 读 store 当前 quick-add 快捷键（accelerator 字符串）。
+fn current_quick_add_shortcut<R: Runtime>(app: &AppHandle<R>) -> String {
+    match app.try_state::<SharedStore>() {
+        Some(store) => store.blocking_read().quick_add_shortcut(),
+        None => crate::todo::default_quick_add_shortcut(),
+    }
+}
+
+/// 把 accelerator 字符串（如 `"Cmd+Shift+Space"`）转成更友好的展示形式
+/// （如 macOS 上 `"⌘⇧Space"`、其他平台 `"Ctrl+Shift+Space"`）。
+/// 仅用于 tray menu label / 设置面板显示，不影响实际注册逻辑。
+fn format_shortcut_for_display(s: &str) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let mut out = String::new();
+        for part in s.split('+') {
+            let p = part.trim();
+            match p.to_lowercase().as_str() {
+                "cmd" | "command" | "super" | "meta" | "cmdorctrl" | "cmdorcontrol"
+                    | "commandorctrl" | "commandorcontrol" => out.push('⌘'),
+                "ctrl" | "control" => out.push('⌃'),
+                "shift" => out.push('⇧'),
+                "alt" | "option" | "opt" => out.push('⌥'),
+                _ => out.push_str(p),
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        s.to_string()
+    }
+}
+
 /// 构造 tray 菜单（独立成函数，方便 [`rebuild_tray`] 在 locale / pin mode 切换时复用）。
 ///
 /// 所有 label 走 t!()（i18n）。pin mode 项用 CheckMenuItem，checkmark 跟当前
@@ -95,6 +129,18 @@ fn build_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         true,
         None::<&str>,
     )?;
+    let sep_settings = PredefinedMenuItem::separator(app)?;
+    let cur_sc = current_quick_add_shortcut(app);
+    let sc_label = format!("{} ({})",
+        rust_i18n::t!("tray.quick_add_change").to_string(),
+        format_shortcut_for_display(&cur_sc));
+    let change_shortcut_i = MenuItem::with_id(
+        app,
+        "change_shortcut",
+        sc_label,
+        true,
+        None::<&str>,
+    )?;
     let settings_sub = Submenu::with_items(
         app,
         rust_i18n::t!("tray.settings").to_string(),
@@ -105,6 +151,8 @@ fn build_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &pin_normal_i as &dyn IsMenuItem<R>,
             &sep_pin as &dyn IsMenuItem<R>,
             &open_settings_i as &dyn IsMenuItem<R>,
+            &sep_settings as &dyn IsMenuItem<R>,
+            &change_shortcut_i as &dyn IsMenuItem<R>,
         ],
     )?;
 
@@ -144,6 +192,16 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
             "settings" => {
+                let app2 = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = commands::open_settings_window(app2).await {
+                        tracing::warn!(error = %e, "打开设置失败");
+                    }
+                });
+            }
+            "change_shortcut" => {
+                // 打开设置面板 —— 快捷键的录入 UI 在设置面板里。
+                // 直接在 tray 菜单里做录入（NSMenu 不支持捕获 keydown）。
                 let app2 = app.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = commands::open_settings_window(app2).await {

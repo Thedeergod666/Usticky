@@ -152,6 +152,26 @@ html, body {
   border-color: #0066d6;
 }
 
+/* ── 快捷键录入按钮 ──
+ * recording 状态：蓝色边框 + 脉冲动画，让用户清楚现在在录入 */
+.shortcut-btn {
+  min-width: 110px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.shortcut-btn.recording {
+  background: #007aff;
+  color: #ffffff;
+  border-color: #007aff;
+  animation: shortcut-pulse 1.2s ease-in-out infinite;
+}
+@keyframes shortcut-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 122, 255, 0.4); }
+  50%      { box-shadow: 0 0 0 4px rgba(0, 122, 255, 0); }
+}
+
 /* ── 关于 section ── */
 .about-logo {
   display: flex;

@@ -102,8 +102,9 @@ pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) 
 /// 里 inside 持续翻转 → 每次翻转 emit 一次 → 前端每次都 toggle
 /// body[data-hover] → CSS spring 反复起头又被瞬间打断 → 肉眼看到闪。
 ///
-/// 修复：enter 阈值 3 ticks（150ms）/ exit 阈值 2 ticks（100ms）。
-/// 离开比进入略快 —— 用户离开时希望玻璃及时撤销；进入时多 1 tick 防抖。
+/// 修复：enter 阈值 1 tick（50ms）/ exit 阈值 2 ticks（100ms）。
+/// 离开比进入略慢 —— exit 多 1 tick 防 level 切换 stale 振荡；enter
+/// 不阈值化，鼠标进入立即触发。
 ///
 /// **2026-07-06 fix**：之前 Usticky 把阈值改成 enter 2 / exit 1 想加速响应，
 /// 但 exit=1 太激进 —— PinBottom 模式 hover 临时置顶时，level 切换瞬间
@@ -112,6 +113,17 @@ pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) 
 /// 下一 tick 又 inside=true → 重新 enter → 形成 1-2s 周期的振荡，
 /// 表现为"毛玻璃效果出现后过一回消失"。改回 Musage 的 3/2 阈值，
 /// 给 level 切换留足 z-order 稳定时间，振荡消失。
+///
+/// **2026-07-06 fix #2**：用户反馈"hover 时间过短时不自动置顶"。
+/// 根因：enter=3 (150ms) 阈值下，用户 hover < 150ms 就离开时，
+/// `inside` 在 pending_ticks 累计到阈值前就回到与 last_inside 相同
+/// 的值（last_inside 仍是 false），命中 `inside == last_inside` 分支
+/// → pending_ticks 被重置为 0 → 整个 hover 被 swallowing，enter
+/// 永远不触发 → PinBottom 模式下窗口不置顶。
+/// 修复：ENTER_THRESHOLD=1（50ms 内即触发）。EXIT_THRESHOLD 保持 2
+/// 不动 —— exit 阈值是 level 切换 stale 振荡的关键防线（见上 fix），
+/// 不能动。enter=1 副作用是鼠标快速掠过浮窗边缘时可能触发一次
+/// "瞬间置顶→降回"，但这正是用户期望的"短 hover 也要置顶"行为。
 pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
     if TRACKER_RUNNING.swap(true, Ordering::SeqCst) {
         return; // 已在跑
@@ -151,8 +163,8 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                     pending_ticks = pending_ticks.saturating_add(1);
                 }
 
-                const ENTER_THRESHOLD: u8 = 3; // 150ms
-                const EXIT_THRESHOLD: u8 = 2;  // 100ms
+                const ENTER_THRESHOLD: u8 = 1; // 50ms —— 短 hover 也要触发置顶
+                const EXIT_THRESHOLD: u8 = 2;  // 100ms —— 防 level 切换 stale 振荡
                 let threshold = if pending_value { ENTER_THRESHOLD } else { EXIT_THRESHOLD };
 
                 if pending_ticks < threshold {

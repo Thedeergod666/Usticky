@@ -265,6 +265,50 @@ pub async fn set_floating_hover_raise(
     Ok(())
 }
 
+// ── Quick-add 快捷键 ──
+
+/// 返回当前持久化的 quick-add 快捷键（accelerator 字符串，如 `"Cmd+Shift+Space"`）。
+/// 没存过则返回平台默认（macOS = Cmd，其他 = Ctrl）。
+#[tauri::command]
+pub async fn get_quick_add_shortcut(store: State<'_, SharedStore>) -> Result<String, String> {
+    Ok(store.read().await.quick_add_shortcut())
+}
+
+/// 设置并注册新的 quick-add 快捷键。
+///
+/// 流程：
+///   1. 用 `parse_shortcut` 校验字符串能解析（不能解析返 Err）
+///   2. 写 store + 持久化
+///   3. 调 [`register_quick_add_shortcut`]（先 unregister_all 再注册新的）
+///   4. emit `usticky://shortcut-changed` —— 浮窗 input hint + 设置面板 + tray
+///      label 都听这个事件刷新
+///
+/// 校验失败时**不**写 store —— 防止坏值落盘导致下次启动快捷键失效。
+#[tauri::command]
+pub async fn set_quick_add_shortcut(
+    app: AppHandle,
+    store: State<'_, SharedStore>,
+    accelerator: String,
+) -> Result<(), String> {
+    // 1. 校验：能 parse 才放行
+    crate::parse_shortcut(&accelerator)
+        .map_err(|e| format!("invalid shortcut: {e}"))?;
+    // 2. 写 store + persist
+    {
+        let mut s = store.write().await;
+        s.set_quick_add_shortcut(accelerator.clone());
+    }
+    if let Err(e) = store.read().await.persist(&app) {
+        tracing::error!("persist failed: {}", e);
+        let _ = app.emit("usticky://persist-failed", e.to_string());
+    }
+    // 3. 重新注册（unregister_all + on_shortcut）
+    crate::register_quick_add_shortcut(&app, store.inner());
+    // 4. emit 同步给前端 / tray
+    let _ = app.emit("usticky://shortcut-changed", accelerator);
+    Ok(())
+}
+
 // ── 设置窗口 ──
 
 /// 打开设置窗口（已在则 focus，未建则动态创建）。

@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 use tauri::{Emitter, Listener, Manager};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 // rust_i18n crate 级初始化 —— 让 commands / tray 等模块都能直接 t!("xxx")。
 // 文件放在 src-tauri/locales/{en,zh-CN}.json，跟前端 en.json / zh-CN.json
@@ -33,6 +33,50 @@ mod tray;
 use todo::{PinMode, Store};
 
 pub type SharedStore = Arc<tokio::sync::RwLock<Store>>;
+
+/// 把 accelerator 字符串（如 `"Cmd+Shift+Space"`）解析成 [`Shortcut`]。
+///
+/// 直接走 `global-hotkey` 0.8 自带的字符串解析器（大小写不敏感、支持
+/// `Cmd`/`Command`/`Super`/`CmdOrCtrl` 等多种别名 + 全部 `Code` 变体）。
+/// **关键**：在 macOS 上 `Cmd`/`Super`/`CmdOrCtrl` → `Modifiers::SUPER`
+/// （⌘ Command 键），`Ctrl`/`Control` → `Modifiers::CONTROL`（⌃ Control 键）。
+/// 旧代码错用 `Modifiers::CONTROL` 当 ⌘ Cmd，注册的实际是 ⌃⇧Space。
+fn parse_shortcut(s: &str) -> Result<Shortcut, String> {
+    Shortcut::try_from(s).map_err(|e| format!("parse shortcut {:?}: {}", s, e))
+}
+
+/// 注册当前 store 里的 quick-add 快捷键。先 `unregister_all` 再注册，
+/// 用于启动时 + `set_quick_add_shortcut` 切换时。
+///
+/// 失败不致命（极端情况下用户存了个 parse 不出来的字符串）—— log + emit
+/// `usticky://persist-failed` 让前端提示，但 app 继续跑（快捷键只是不可用）。
+fn register_quick_add_shortcut(app: &tauri::AppHandle, store: &SharedStore) {
+    let accelerator = store.blocking_read().quick_add_shortcut();
+    let gs = app.global_shortcut();
+    // unregister_all 不会清掉其他 plugin 注册的快捷键（只清自己 register 的）
+    let _ = gs.unregister_all();
+    let parsed = match parse_shortcut(&accelerator) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("register_quick_add_shortcut: {}", e);
+            let _ = app.emit("usticky://persist-failed", e);
+            return;
+        }
+    };
+    let app_handle = app.clone();
+    if let Err(e) = gs.on_shortcut(parsed, move |_app, _shortcut, event| {
+        if event.state() == ShortcutState::Pressed {
+            if let Some(w) = app_handle.get_webview_window("floating") {
+                let _ = w.show();
+                let _ = w.set_focus();
+                let _ = app_handle.emit("usticky://quick-add", ());
+            }
+        }
+    }) {
+        tracing::error!("on_shortcut failed: {}", e);
+        let _ = app.emit("usticky://persist-failed", format!("register shortcut: {e}"));
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -88,21 +132,12 @@ pub fn run() {
 
             app.manage(store.clone());
 
-            // 3. 注册全局快捷键：CmdOrCtrl+Shift+Space → emit quick-add
-            let shortcut = Shortcut::new(
-                Some(Modifiers::CONTROL | Modifiers::SHIFT),
-                Code::Space,
-            );
-            let app_handle = app.handle().clone();
-            app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, event| {
-                if event.state() == ShortcutState::Pressed {
-                    if let Some(w) = app_handle.get_webview_window("floating") {
-                        let _ = w.show();
-                        let _ = w.set_focus();
-                        let _ = app_handle.emit("usticky://quick-add", ());
-                    }
-                }
-            })?;
+            // 3. 注册全局快捷键（quick-add）：从 store 读 accelerator 字符串，
+            //    走 [`parse_shortcut`] 解析（macOS 上 `Cmd` → SUPER / ⌘）。
+            //    旧代码硬编码 `Modifiers::CONTROL | SHIFT`，在 macOS 上注册的
+            //    是 ⌃⇧Space 而不是 ⌘⇧Space —— 这是 AGENTS.md 写的快捷键
+            //    "没生效"的根因。改成字符串解析后用户可自行改键。
+            register_quick_add_shortcut(app.handle(), &store);
 
             // 4. 系统托盘（v0.1 stub：显示/隐藏/退出）
             tray::build_tray(app.handle())?;
@@ -196,6 +231,15 @@ pub fn run() {
                 }
             });
 
+            // 9. quick-add 快捷键切换链路：tray 子菜单显示当前快捷键的 label
+            //    要跟着刷新。设置面板 + 浮窗 input hint 也通过这个事件同步。
+            let app_for_sc = app.handle().clone();
+            app.listen("usticky://shortcut-changed", move |_| {
+                if let Err(e) = tray::rebuild_tray(&app_for_sc) {
+                    tracing::warn!(error = %e, "rebuild_tray (shortcut) 失败");
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -214,6 +258,8 @@ pub fn run() {
             commands::set_pin_mode,
             commands::set_floating_hover_raise,
             commands::open_settings_window,
+            commands::get_quick_add_shortcut,
+            commands::set_quick_add_shortcut,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Usticky");

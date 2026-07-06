@@ -92,11 +92,16 @@ pub struct WindowGeom {
 /// `todos` 是平铺数组 —— Usticky 不分层不分项目，简单就是好。
 /// `window_geom` 单独存（避免 todos 的 update 触发不必要的窗口几何 persist）。
 /// `pin_mode` 跨重启保留 —— PinBottom 用户一般不会反复切，存盘一次保终身。
+/// `quick_add_shortcut` 跨重启保留 —— 用户改完后希望下次启动仍是自己设的键。
+/// 默认值见 [`Store::quick_add_shortcut`]（macOS = `Cmd+Shift+Space`，
+/// 其他平台 = `Ctrl+Shift+Space`），用 global-hotkey 的 `CmdOrCtrl` 关键字
+/// 也可以让平台分支在 parse 时自动处理。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StoreData {
     pub todos: Vec<Todo>,
     pub window_geom: WindowGeom,
     pub pin_mode: Option<PinMode>,
+    pub quick_add_shortcut: Option<String>,
 }
 
 /// Store —— 内存态 + 文件路径。
@@ -222,6 +227,26 @@ impl Store {
     pub fn set_pin_mode(&mut self, mode: PinMode) {
         self.data.pin_mode = Some(mode);
     }
+
+    /// 当前快速唤出快捷键（accelerator 字符串，如 `"Cmd+Shift+Space"`）。
+    /// 没存过就用平台默认（macOS = Cmd，其他 = Ctrl）。
+    pub fn quick_add_shortcut(&self) -> String {
+        self.data.quick_add_shortcut.clone()
+            .unwrap_or_else(default_quick_add_shortcut)
+    }
+
+    pub fn set_quick_add_shortcut(&mut self, accelerator: String) {
+        self.data.quick_add_shortcut = Some(accelerator);
+    }
+}
+
+/// 平台默认快捷键。macOS 用 ⌘ Cmd，其他平台用 Ctrl —— 跟 AGENTS.md
+/// 写的 `CmdOrCtrl+Shift+Space` 语义一致。
+pub fn default_quick_add_shortcut() -> String {
+    #[cfg(target_os = "macos")]
+    { "Cmd+Shift+Space".to_string() }
+    #[cfg(not(target_os = "macos"))]
+    { "Ctrl+Shift+Space".to_string() }
 }
 
 /// AppConfig —— 跨重启保留的少量配置（目前只有 locale）。

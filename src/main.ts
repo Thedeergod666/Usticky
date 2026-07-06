@@ -51,6 +51,44 @@ let sortableInstances: Sortable[] = [];  // 保存实例，cleanup 用
 type PinMode = "pin_top" | "pin_bottom" | "normal";
 let currentPinMode: PinMode = "pin_bottom";  // 默认跟后端 PinMode::default() 对齐
 
+// 当前 quick-add 快捷键（accelerator 字符串，如 "Cmd+Shift+Space"）
+// 启动时从后端 get_quick_add_shortcut 拉，跟 usticky://shortcut-changed 事件同步。
+// 用于 input hint 显示（替换原来写死的 i18n 字符串 "⌘⇧Space"）。
+let currentShortcut: string = "Cmd+Shift+Space";
+
+/// 把 accelerator 字符串转展示形式（macOS: `⌘⇧Space`）。
+/// 跟 settings.ts 同款逻辑，前端两个 webview 各实现一份（避免引入共享 module）。
+function formatShortcutForDisplay(s: string): string {
+  const isMac = /mac/i.test(navigator.platform);
+  if (!isMac) return s;
+  const parts = s.split("+").map((p) => p.trim());
+  let out = "";
+  for (const p of parts) {
+    switch (p.toLowerCase()) {
+      case "cmd": case "command": case "super": case "meta":
+      case "cmdorctrl": case "cmdorcontrol":
+      case "commandorctrl": case "commandorcontrol":
+        out += "⌘"; break;
+      case "ctrl": case "control":
+        out += "⌃"; break;
+      case "shift":
+        out += "⇧"; break;
+      case "alt": case "option": case "opt":
+        out += "⌥"; break;
+      default:
+        out += p;
+    }
+  }
+  return out;
+}
+
+/// 把 input hint 刷成 currentShortcut 的展示形式。
+/// 在启动拉到 shortcut 后 + shortcut-changed 事件触发时调用。
+function updateInputHint() {
+  const hint = app.querySelector<HTMLElement>(".todo-input-hint");
+  if (hint) hint.textContent = formatShortcutForDisplay(currentShortcut);
+}
+
 // ── mini flash（复用 Musage 模式） ──
 let miniFlashTimer: ReturnType<typeof setTimeout> | null = null;
 function showMiniFlash(msg: string): void {
@@ -414,11 +452,10 @@ async function init() {
 
   onLocaleChange(() => {
     document.title = t("app.title");
-    // input placeholder + hint 也需要随 locale 刷（创建时写死的）
+    // input placeholder 也需要随 locale 刷（创建时写死的）
+    // hint 走 currentShortcut（不再用 i18n 的 shortcut_hint），不随 locale 变
     const input = app.querySelector<HTMLInputElement>(".todo-input input");
     if (input) input.placeholder = t("app.input.placeholder");
-    const hint = app.querySelector<HTMLElement>(".todo-input-hint");
-    if (hint) hint.textContent = t("app.input.shortcut_hint");
     if (lastRenderedSnap) render(lastRenderedSnap);
   });
 
@@ -542,7 +579,16 @@ async function init() {
     .catch((e) => console.error("[usticky] listen floating-hover failed", e));
 
   // ── 渲染输入区（常驻） ──
+  // 在拉 quick_add_shortcut 之前调，确保 hint 元素存在；拉到 shortcut 后再 updateInputHint 刷
   ensureInputBar();
+
+  // ── 启动时拉一次 quick-add 快捷键 —— input hint 用 ──
+  try {
+    currentShortcut = await invoke<string>("get_quick_add_shortcut");
+    updateInputHint();
+  } catch (e) {
+    console.error("[usticky] get_quick_add_shortcut failed", e);
+  }
 
   // ── 启动时拉一次 pin mode —— 必须在首次 render 之前完成，
   //    否则 foot 的 pin-ctrl 会用默认 pin_top 渲染一次再被覆盖（视觉闪烁）。
@@ -575,6 +621,17 @@ async function init() {
   })
     .then((fn) => (unlistenPinMode = fn))
     .catch((e) => console.error("[usticky] listen pin-mode-changed failed", e));
+
+  // ── quick-add 快捷键切换链路：设置面板改完后，浮窗 input hint 同步刷 ──
+  let unlistenShortcut: UnlistenFn | null = null;
+  listen<string>("usticky://shortcut-changed", (e) => {
+    if (e.payload !== currentShortcut) {
+      currentShortcut = e.payload;
+      updateInputHint();
+    }
+  })
+    .then((fn) => (unlistenShortcut = fn))
+    .catch((e) => console.error("[usticky] listen shortcut-changed failed", e));
 
   // ── 浮窗拖动：左键 mousedown 但 target 是 .todo-card 或 button 时跳过 ──
   // 输入区（.todo-input / input）也允许拖窗，但要走阈值法：
@@ -653,6 +710,7 @@ async function init() {
     unlistenPinMode?.();
     unlistenLocale?.();
     unlistenHover?.();
+    unlistenShortcut?.();
     cleanupSortables();
     // 摘掉 hover listener（setHoverAttr 路径，命名引用）
     document.body.removeEventListener("mouseenter", onBodyMouseEnter);
@@ -697,7 +755,7 @@ function ensureInputBar() {
   bar.innerHTML = `
     <input type="text" maxlength="280" autocomplete="off" spellcheck="false"
            placeholder="${escapeHtml(t("app.input.placeholder"))}" />
-    <span class="todo-input-hint">${escapeHtml(t("app.input.shortcut_hint"))}</span>
+    <span class="todo-input-hint">${escapeHtml(formatShortcutForDisplay(currentShortcut))}</span>
   `;
   // 插到最前（render 会保留）
   app.insertBefore(bar, app.firstChild);
