@@ -503,9 +503,18 @@ async function init() {
   // 违反设计意图。40ms debounce + 失焦时主动 setHoverAttr(false) + visibility
   // change 清理已经够防 spurious，focus check 多此一举。
   const setHoverAttr = (on: boolean) => {
-    if (on) document.body.dataset.hover = "1";
-    else delete document.body.dataset.hover;
+    if (on) {
+      if (document.body.dataset.hover === "1") return;
+      document.body.dataset.hover = "1";
+    } else {
+      if (!("hover" in document.body.dataset)) return;
+      delete document.body.dataset.hover;
+      // hover 撤销 -> 清 Rust 路径同值去重状态，允许多次进入 hover
+      lastHoverPayload = null;
+    }
   };
+  // 提前到 setHoverAttr 之前闭包共享，让 onFocusChanged 失焦时也能清 dedup
+  let lastHoverPayload: boolean | null = null;
   // (a) 失焦时主动清 hover 状态：用户切到别 app 回来时不要"粘"住上次的 hover
   //     显形（避免 stale state）。**注意**：这里只清状态，**不**挡后续 hover
   //     —— un-focused 浮窗的合法 hover 必须能 toggle。
@@ -562,7 +571,6 @@ async function init() {
   //     失焦时 `onFocusChanged` 主动 setHoverAttr(false) 已清状态；visibility
   //     hidden 时 pageVisible=false 守卫挡掉。focus check 已被证明是 bug。
   let unlistenHover: UnlistenFn | null = null;
-  let lastHoverPayload: boolean | null = null;
   listen<boolean>("usticky://floating-hover", (e) => {
     if (e.payload && !pageVisible) return;
     if (lastHoverPayload === e.payload) return;
