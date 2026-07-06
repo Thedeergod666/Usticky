@@ -13,8 +13,6 @@
   "app.action.undo": "撤销",
   "app.action.delete": "删除",
   "app.action.edit": "编辑",
-  "app.count.one": "{count} 项任务",
-  "app.count.other": "{count} 项任务",
   "app.due.overdue": "已逾期",
   "app.due.today": "今天",
   "app.due.tomorrow": "明天",

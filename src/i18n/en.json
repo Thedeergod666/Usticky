@@ -13,8 +13,6 @@
   "app.action.undo": "Undo",
   "app.action.delete": "Delete",
   "app.action.edit": "Edit",
-  "app.count.one": "{count} task",
-  "app.count.other": "{count} tasks",
   "app.due.overdue": "Overdue",
   "app.due.today": "Today",
   "app.due.tomorrow": "Tomorrow",

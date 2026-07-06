@@ -202,8 +202,6 @@ function render(snap: TodoSnapshot) {
     );
   }
 
-  // foot
-  updateFoot(snap);
   // 输入中禁止 autoResize —— scrollHeight 跳变会打断输入（AGENTS.md #18）
   if (!app.querySelector<HTMLInputElement>(".todo-input input")?.matches(":focus")) {
     void autoResizeWindow(snap);
@@ -279,37 +277,10 @@ function renderEmptyState() {
   empty.appendChild(subtitle);
   empty.appendChild(cta);
 
-  // 插在 .todo-input 之后、.foot 之前；如果 foot 不存在就 append 到末尾
-  const foot = app.querySelector<HTMLElement>(".foot");
-  if (foot) {
-    app.insertBefore(empty, foot);
-  } else {
-    app.appendChild(empty);
-  }
+  app.appendChild(empty);
 
-  // 空态也要刷新 foot（count 文案 + pin-ctrl），否则从"5 项任务"切到空态文案陈旧
-  updateFoot({ todos: [], fetched_at: null });
   if (!app.querySelector<HTMLInputElement>(".todo-input input")?.matches(":focus")) {
     void autoResizeWindowToContent();
-  }
-}
-
-function updateFoot(snap: TodoSnapshot) {
-  let foot = app.querySelector<HTMLElement>(".foot");
-  const count = snap.todos.filter((x) => x.status === "pending").length;
-  // 单复数：英文 1 task vs N tasks；中文一律用 app.count.other
-  const text =
-    count === 1
-      ? t("app.count.one", { count })
-      : t("app.count.other", { count });
-
-  if (foot) {
-    foot.innerHTML = `<span class="foot-text">${escapeHtml(text)}</span>`;
-  } else {
-    foot = document.createElement("div");
-    foot.className = "foot";
-    foot.innerHTML = `<span class="foot-text">${escapeHtml(text)}</span>`;
-    app.appendChild(foot);
   }
 }
 
