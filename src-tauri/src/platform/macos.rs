@@ -4,7 +4,8 @@
 //!   2. **全局鼠标位置轮询，把 hover 状态广播给前端**
 //!      —— 因为 macOS 上非 key window 不分发 mouseMoved 事件，WKWebView 的
 //!      CSS `:hover` 在浮窗未聚焦时不会激活，会导致"必须先点一下窗口 hover 才生效"
-//!      的体验坑。用 `NSEvent.mouseLocation` + 窗口 frame 做 point-in-rect 判断，
+//!      的体验坑。用 `NSEvent.mouseLocation` + `NSWindow.windowNumberAtPoint`
+//!      做命中测试（不仅检查鼠标在 frame 内，还确认浮窗是该点 topmost 窗口），
 //!      完全绕过 WebKit 的事件流依赖。
 //!
 //! ## Hover tracker 生命周期
@@ -31,6 +32,7 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
+use objc2::MainThreadMarker;
 use objc2_app_kit::{NSEvent, NSWindow};
 use objc2_core_graphics::{kCGFloatingWindowLevel, kCGNormalWindowLevel, CGWindowLevel};
 use objc2_foundation::NSPoint;
@@ -82,7 +84,7 @@ pub fn set_window_pin_top<R: Runtime>(app: &AppHandle<R>) {
 /// Normal 模式：level 切回 0，关闭 hover 切 level。
 pub fn set_window_normal<R: Runtime>(app: &AppHandle<R>) {
     LEVEL_SWITCHING_ACTIVE.store(false, Ordering::SeqCst);
-    set_window_level(app, kCGNormalWindowLevel, true); // 失焦隐藏，跟普通窗口一致
+    set_window_level(app, kCGNormalWindowLevel, false); // H15 fix: 不失焦隐藏，浮窗始终可见
 }
 
 /// hover 切 level 的"前端兜底信号"：macOS 上 tracker 已自行处理，此处 no-op。
@@ -100,10 +102,16 @@ pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) 
 /// 里 inside 持续翻转 → 每次翻转 emit 一次 → 前端每次都 toggle
 /// body[data-hover] → CSS spring 反复起头又被瞬间打断 → 肉眼看到闪。
 ///
-/// 修复：enter 阈值 2 ticks（100ms）/ exit 阈值 1 tick（50ms）。
-/// 离开比进入快 —— 用户离开时希望玻璃及时撤销；进入时多 1 tick 防抖。
-/// Usticky 比 Musage（enter 3 / exit 2）略激进：因为玻璃材质已常驻强开，
-/// hover 只切 color / text-shadow，抖动视觉影响小，可以更快响应。
+/// 修复：enter 阈值 3 ticks（150ms）/ exit 阈值 2 ticks（100ms）。
+/// 离开比进入略快 —— 用户离开时希望玻璃及时撤销；进入时多 1 tick 防抖。
+///
+/// **2026-07-06 fix**：之前 Usticky 把阈值改成 enter 2 / exit 1 想加速响应，
+/// 但 exit=1 太激进 —— PinBottom 模式 hover 临时置顶时，level 切换瞬间
+/// `windowNumberAtPoint` 偶发返回 stale 值（窗口 z-order 还没稳定），
+/// 单 tick false 就触发 exit → hover 撤销 → 窗口降回 below-normal →
+/// 下一 tick 又 inside=true → 重新 enter → 形成 1-2s 周期的振荡，
+/// 表现为"毛玻璃效果出现后过一回消失"。改回 Musage 的 3/2 阈值，
+/// 给 level 切换留足 z-order 稳定时间，振荡消失。
 pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
     if TRACKER_RUNNING.swap(true, Ordering::SeqCst) {
         return; // 已在跑
@@ -114,15 +122,11 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
             tracing::debug!("hover emitter 启动");
             let mut last_inside = false;
             // dwell-time hysteresis（沿用 Musage 2026-07-03 fix）：
-            // - **enter**：inside=true 必须连续 ≥2 个 tick（100ms）才采纳，
+            // - **enter**：inside=true 必须连续 ≥3 个 tick（150ms）才采纳，
             //   抖动短脉冲被吞。
-            // - **exit**：inside=false 必须连续 ≥1 个 tick（50ms）就采纳，
-            //   离开要快（用户离开时希望玻璃及时撤销）。
+            // - **exit**：inside=false 必须连续 ≥2 个 tick（100ms）才采纳，略快
+            //   因为用户离开时希望玻璃及时撤销（vs enter 多 1 tick 防误触发）。
             // - **enter→exit 切换瞬间 reset 计数器**：避免在过渡中误累计。
-            //
-            // Usticky 比 Musage 略激进（Musage enter 3 / exit 2）：因为 v2
-            // 把玻璃材质常驻强开后，hover 只切 color / text-shadow，抖动
-            // 视觉影响小，可以更快响应。
             let mut pending_ticks: u8 = 0;
             let mut pending_value = false;
             loop {
@@ -147,8 +151,8 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                     pending_ticks = pending_ticks.saturating_add(1);
                 }
 
-                const ENTER_THRESHOLD: u8 = 2; // 100ms
-                const EXIT_THRESHOLD: u8 = 1;  // 50ms
+                const ENTER_THRESHOLD: u8 = 3; // 150ms
+                const EXIT_THRESHOLD: u8 = 2;  // 100ms
                 let threshold = if pending_value { ENTER_THRESHOLD } else { EXIT_THRESHOLD };
 
                 if pending_ticks < threshold {
@@ -185,14 +189,18 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 
 /// 把浮窗的 NSWindow level 切到 `level`。dispatch 到 main thread（AppKit 强制要求）。
 ///
-/// `hides_on_deactivate` 控制 setHidesOnDeactivate —— 失焦时是否隐藏。
-/// - Normal 模式：传 true（跟普通窗口行为一致）
-/// - PinTop 模式：传 false（"始终置顶"的承诺 = 失焦也得在）
-/// - PinBottom 模式：传 false（鼠标 hover 临时置顶，要求浮窗随时可达）
+/// `hides_on_deactivate` 参数保留兼容现有调用，但**实际不再生效** —— 所有模式
+/// 都硬编码 `setHidesOnDeactivate(false)`（沿用 Musage H15 fix）。
+///
+/// 原因（Musage 2026-07-03 audit）：之前 Normal/PinTop 模式设 true → app 失焦时
+/// 浮窗完全 `hide()`（不是"被遮盖"而是"消失"），违反"始终可见的悬浮窗"产品定义。
+/// macOS 普通窗口失焦只是被其他 app 遮盖（level=0 已实现该语义），不是 hide()。
+/// 同时失焦 hide 会让 `is_visible()` 返 false → hover emitter 误判 inside=false →
+/// 玻璃效果在 app 失焦瞬间错误撤销，是问题 2（hover 后过一回消失）的诱因之一。
 pub fn set_window_level<R: Runtime>(
     app: &AppHandle<R>,
     level: CGWindowLevel,
-    hides_on_deactivate: bool,
+    _hides_on_deactivate: bool,
 ) {
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
@@ -202,35 +210,33 @@ pub fn set_window_level<R: Runtime>(
                     // SAFETY: `ptr` 来自 webview_window 的 NSWindow，整个 app 生命周期有效。
                     let window: &NSWindow = unsafe { &*ptr.cast::<NSWindow>() };
                     window.setLevel(level as _);
-                    window.setHidesOnDeactivate(hides_on_deactivate);
+                    window.setHidesOnDeactivate(false);
                 }
             }
         }
     });
 }
 
-/// 命中测试：鼠标在 `point` 处时，浮窗是否被 hover。
+/// 命中测试：鼠标在 `point` 处时，浮窗是否是**最上层**窗口。
 ///
-/// **v2 实现（2026-07-03 fix）**：改用 `frame + visible` 检测，**不再用**
-/// `windowNumberAtPoint`。
+/// 用 `+[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:]` 传 0
+/// （穿透所有 app 检查整个屏幕），返回该点 topmost window 的 ID。
+/// 与浮窗自己的 `windowNumber` 比对：
+/// - 相等 → 鼠标 hover 在浮窗**可见**部分
+/// - 不等 → 别的窗口盖在那里，用户在跟那个窗口交互，不该触发置顶/玻璃显形
 ///
-/// 旧实现的 bug：浮窗 `transparent: true` → `NSWindow.opaque = false`，
-/// `windowNumberAtPoint` 在 webview 内容像素 alpha 低于阈值时**跳过该窗口**。
-/// Usticky 的 `#app` 完全透明，只有 `.todo-card` 有 82% alpha，所以鼠标
-/// 停在 #app padding / 卡片间隙时命中测试返回浮窗下方的窗口 →
-/// `is_floating_topmost_at` 返 false → emit hover=false → 玻璃消失。
-/// 体验上表现为"hover 时过一回会消失" + "离开时先出现然后消失"。
+/// 解决 PinBottom 模式下浮窗被部分遮挡时，鼠标移到被盖的区域也误触发的问题
+/// （问题 1），以及由此引发的 JS mouseleave / Rust frame.contains 不一致
+/// 导致 hover 状态振荡、玻璃"出现后过一回消失"（问题 2）。
 ///
-/// 新实现用 `frame.contains(point)` + `is_visible()`：
-/// - PinTop / Normal 模式：浮窗始终在最顶层（或跟普通窗口一样），frame 检测足够
-/// - PinBottom 模式：浮窗被遮挡时，frame 检测会触发 hover=true → 浮窗提升到
-///   floating level。这是 PinBottom 模式的预期行为（"hover 临时置顶"），
-///   用户选了 PinBottom 就接受了这个。原来 windowNumberAtPoint 想"避免被
-///   遮挡时误触发"，但代价是 transparent 区域命中测试失效，得不偿失。
+/// **2026-07-06 fix**：之前误诊 `windowNumberAtPoint` 会跳过 transparent 窗口
+/// 的低 alpha 像素（#app padding / 卡片间隙），改用 `frame.contains` 绕开。
+/// 但 `frame.contains` 不检查遮挡 → PinBottom 模式下鼠标在被遮挡区域也
+/// 触发 hover=true → 窗口误置顶（问题 1）。实测 `windowNumberAtPoint`
+/// 对 non-opaque 窗口仍按 frame 命中（不按 per-pixel alpha），Musage 同款
+/// 实现已稳定运行，不存在"transparent 区域命中失效"问题。改回该方案。
 ///
-/// 全局复用 `std::sync::Mutex<Option<bool>>` + `Condvar` 单槽位
-/// （外层包 `OnceLock<Arc<...>>` 复用），避免 20Hz × 24h 的 allocator churn。
-///
+/// dispatch 到 main thread（NSWindow API 强制要求）。channel 同步等待。
 /// 拿不到 / 超时 / 浮窗未上屏 → 保守返回 false。
 fn is_floating_topmost_at<R: Runtime>(app: &AppHandle<R>, point: NSPoint) -> bool {
     use std::sync::{Arc, Condvar, Mutex};
@@ -252,35 +258,30 @@ fn is_floating_topmost_at<R: Runtime>(app: &AppHandle<R>, point: NSPoint) -> boo
     let dispatch_result = app.run_on_main_thread(move || {
         let result = (|| -> Option<bool> {
             let win = app2.get_webview_window("floating")?;
-            // 浮窗必须可见（hide 状态下不触发 hover）
-            if !win.is_visible().ok()? {
-                return Some(false);
-            }
             let ptr = win.ns_window().ok()?;
             if ptr.is_null() {
                 return None;
             }
             // SAFETY: ptr 来自 webview_window 的 NSWindow，整个 app 生命周期有效。
             let window: &NSWindow = unsafe { &*ptr.cast::<NSWindow>() };
-            // 用 NSWindow.frame() 拿屏幕坐标系（原点左下，跟 NSEvent.mouseLocation 一致）
-            // 做 point-in-rect 检测。不再用 windowNumberAtPoint —— transparent 窗口
-            // 的命中测试会跳过 alpha 低的像素，导致 #app padding / 卡片间隙误判。
-            let frame = window.frame();
-            let in_frame = point.x >= frame.origin.x
-                && point.x <= frame.origin.x + frame.size.width
-                && point.y >= frame.origin.y
-                && point.y <= frame.origin.y + frame.size.height;
-            Some(in_frame)
+            let our_id = window.windowNumber();
+            if our_id == 0 {
+                // 窗口还没上屏（极少见，初始化竞态）→ 直接 false
+                return Some(false);
+            }
+            // 传 0 = 不排除任何窗口，返回整个屏幕在该点 topmost window 的 number
+            let Some(mtm) = MainThreadMarker::new() else {
+                return Some(false);
+            };
+            let topmost = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(point, 0, mtm);
+            Some(topmost == our_id)
         })();
-        // 写结果前先清空旧值 —— 避免读到上一次的 stale 值
         {
             let mut g = slot2.slot.lock().unwrap_or_else(|e| e.into_inner());
             *g = Some(result.unwrap_or(false));
         }
         slot2.cvar.notify_all();
     });
-    // 主线程无法调度 (临时忙 / 退出中) —— 立即把 slot 填 false 让
-    // cvar notify_all 提前返 poll 路径，避免调用方空等 50ms。
     if let Err(e) = dispatch_result {
         tracing::trace!(
             error = %e,
