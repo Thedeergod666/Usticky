@@ -16,8 +16,7 @@
     "settings": "Settings"
   },
   "tray": {
-    "show": "Show floating window",
-    "hide": "Hide floating window",
+    "toggle": "Toggle floating window",
     "settings": "Settings",
     "open_settings": "Open Settings Panel...",
     "pin": {

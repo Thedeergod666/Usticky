@@ -10,8 +10,7 @@
 // v0.2 候选：任务总数 badge（参考 Musage 的动态绘制）。
 //
 // 菜单结构：
-//   Show floating window
-//   Hide floating window
+//   Toggle floating window
 //   ---
 //   [Settings ▸]
 //     Top        ✓
@@ -54,17 +53,10 @@ fn current_pin_mode<R: Runtime>(app: &AppHandle<R>) -> PinMode {
 /// 所有 label 走 t!()（i18n）。pin mode 项用 CheckMenuItem，checkmark 跟当前
 /// 持久化的 pin mode 对齐。
 fn build_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
-    let show_i = MenuItem::with_id(
+    let toggle_i = MenuItem::with_id(
         app,
-        "show",
-        rust_i18n::t!("tray.show").to_string(),
-        true,
-        None::<&str>,
-    )?;
-    let hide_i = MenuItem::with_id(
-        app,
-        "hide",
-        rust_i18n::t!("tray.hide").to_string(),
+        "toggle",
+        rust_i18n::t!("tray.toggle").to_string(),
         true,
         None::<&str>,
     )?;
@@ -124,7 +116,7 @@ fn build_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         true,
         None::<&str>,
     )?;
-    Menu::with_items(app, &[&show_i, &hide_i, &sep_i, &settings_sub, &quit_i])
+    Menu::with_items(app, &[&toggle_i, &sep_i, &settings_sub, &quit_i])
 }
 
 pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -140,15 +132,15 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 .expect("tray icon")
         }))
         .on_menu_event(move |app, event| match event.id().as_ref() {
-            "show" => {
+            "toggle" => {
                 if let Some(w) = app.get_webview_window("floating") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
-            "hide" => {
-                if let Some(w) = app.get_webview_window("floating") {
-                    let _ = w.hide();
+                    let is_visible = w.is_visible().unwrap_or(false);
+                    if is_visible {
+                        let _ = w.hide();
+                    } else {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
                 }
             }
             "settings" => {

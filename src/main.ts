@@ -303,34 +303,14 @@ function updateFoot(snap: TodoSnapshot) {
       ? t("app.count.one", { count })
       : t("app.count.other", { count });
 
-  // pin mode 三档切换：紧凑的 segmented control，跟 .foot 共一行
-  const pinCtrl = `
-    <div class="pin-ctrl" data-pin="${currentPinMode}">
-      <span class="pin-ctrl-label">${escapeHtml(t("app.pin.label"))}</span>
-      <button class="pin-btn ${currentPinMode === "pin_top" ? "active" : ""}" data-pin-value="pin_top">${escapeHtml(t("app.pin.top"))}</button>
-      <button class="pin-btn ${currentPinMode === "pin_bottom" ? "active" : ""}" data-pin-value="pin_bottom">${escapeHtml(t("app.pin.bottom"))}</button>
-      <button class="pin-btn ${currentPinMode === "normal" ? "active" : ""}" data-pin-value="normal">${escapeHtml(t("app.pin.normal"))}</button>
-    </div>
-  `;
-
   if (foot) {
-    foot.innerHTML = `<span class="foot-text">${escapeHtml(text)}</span>${pinCtrl}`;
+    foot.innerHTML = `<span class="foot-text">${escapeHtml(text)}</span>`;
   } else {
     foot = document.createElement("div");
     foot.className = "foot";
-    foot.innerHTML = `<span class="foot-text">${escapeHtml(text)}</span>${pinCtrl}`;
+    foot.innerHTML = `<span class="foot-text">${escapeHtml(text)}</span>`;
     app.appendChild(foot);
   }
-}
-
-/// 只刷新 pin-ctrl 的 active 状态（避免整个 foot 重建）
-function refreshPinCtrl() {
-  const ctrl = app.querySelector<HTMLElement>(".pin-ctrl");
-  if (!ctrl) return;
-  ctrl.dataset.pin = currentPinMode;
-  ctrl.querySelectorAll<HTMLElement>(".pin-btn").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.pinValue === currentPinMode);
-  });
 }
 
 // ── 自适应高度 ──
@@ -458,7 +438,6 @@ async function init() {
 
   onLocaleChange(() => {
     document.title = t("app.title");
-    refreshPinCtrl();  // pin-ctrl 文案要随 locale 变（"Top"/"Bottom"/"Normal" ↔ "置顶"/"置底"/"默认"）
     // input placeholder + hint 也需要随 locale 刷（创建时写死的）
     const input = app.querySelector<HTMLInputElement>(".todo-input input");
     if (input) input.placeholder = t("app.input.placeholder");
@@ -612,7 +591,6 @@ async function init() {
   listen<PinMode>("usticky://pin-mode-changed", (e) => {
     if (e.payload !== currentPinMode) {
       currentPinMode = e.payload;
-      refreshPinCtrl();
       setupPinModeHoverRaise(currentPinMode);
     }
   })
@@ -649,23 +627,12 @@ async function init() {
     }
   });
 
-  // ── 事件代理：empty state CTA / due label click / pin mode 切换 ──
+  // ── 事件代理：empty state CTA / due label click ──
   app.addEventListener("click", async (e) => {
     const target = e.target as HTMLElement;
     if (target.closest(".focus-input")) {
       const input = app.querySelector<HTMLInputElement>(".todo-input input");
       if (input) input.focus();
-    } else if (target.closest(".pin-btn")) {
-      const btn = target.closest<HTMLElement>(".pin-btn");
-      const newMode = btn?.dataset.pinValue as PinMode | undefined;
-      if (newMode && newMode !== currentPinMode) {
-        try {
-          await invoke("set_pin_mode", { mode: newMode });
-          // 后端会 emit usticky://pin-mode-changed，handler 在上面已经接好
-        } catch (err) {
-          console.error("[usticky] set_pin_mode failed", err);
-        }
-      }
     }
   });
 

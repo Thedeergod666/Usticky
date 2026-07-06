@@ -16,8 +16,7 @@
     "settings": "设置"
   },
   "tray": {
-    "show": "显示浮窗",
-    "hide": "隐藏浮窗",
+    "toggle": "切换浮窗显隐",
     "settings": "设置",
     "open_settings": "打开设置面板...",
     "pin": {
