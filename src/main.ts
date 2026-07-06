@@ -499,9 +499,25 @@ async function init() {
     else delete document.body.dataset.hover;
   };
   // (a) 失焦 / 页面隐藏时把 body mouseenter 视为 spurious 忽略
+  // 启动时先 query 真实焦点状态，**不要**默认 focused = true：
+  // Musage 在 lib.rs 启动时调 set_focus() 所以默认对，但 Usticky v0.1 启动不抢焦点
+  // （用户偏好 "浮窗不抢焦点" 的承诺），窗口初始是 un-focused。如果默认 true，
+  // 启动后第一次 hover 进 un-focused 窗口会被守卫吞掉，必须点一下让窗口
+  // 获焦后第二次 hover 才生效 —— 表现为"hover 没动效得点一下才有"。
+  // 启动期 await 这个 Promise：失败时保守用 true（旧的 hack 默认），
+  // 反正 onFocusChanged 很快会纠正。
   let focused = true;
   let pageVisible = true;
-  getCurrentWindow()
+  const wForFocus = getCurrentWindow();
+  wForFocus
+    .isFocused()
+    .then((f) => {
+      focused = f;
+    })
+    .catch(() => {
+      // isFocused 失败时保持默认 true（保留旧行为，onFocusChanged 首次回调会修正）
+    });
+  wForFocus
     .onFocusChanged(({ payload: f }) => {
       focused = f;
       if (!f) setHoverAttr(false);
