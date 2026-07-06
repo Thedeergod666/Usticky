@@ -16,6 +16,7 @@
 //   - tray 动态进度条（Usticky tray 是"任务总数 badge"，v0.1 stub）
 //   - PinBottom hover emitter 在 Musage 是 v0.2 才加的，Usticky v0.1 直接搬
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Listener, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -33,6 +34,18 @@ mod tray;
 use todo::{PinMode, Store};
 
 pub type SharedStore = Arc<tokio::sync::RwLock<Store>>;
+
+/// 是否处于 "quick-add 临时置顶" 状态。
+///
+/// true = 我们通过快捷键唤出了浮窗，需要 dismiss 时还原 level + 切回原 app。
+/// false = 浮窗隐藏 / 用户通过其他途径（tray toggle / 等）显示。
+///
+/// 切换语义（详见 lib.rs 顶部 doc）：
+///   - 快捷键 + !visible → save prev app + raise + show + focus + set true
+///   - 快捷键 + visible → hide + (若 true: 还原 level + activate prev app + set false)
+///   - hide_floating_window 命令 / tray toggle hide / Esc → 同"快捷键 + visible"分支
+///   - show_floating_window 命令 / tray toggle show → set false（清除残留状态）
+static QUICK_ADD_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// 把 accelerator 字符串（如 `"Cmd+Shift+Space"`）解析成 [`Shortcut`]。
 ///
@@ -64,18 +77,66 @@ fn register_quick_add_shortcut(app: &tauri::AppHandle, store: &SharedStore) {
         }
     };
     let app_handle = app.clone();
+    let store_ref = store.clone();
     if let Err(e) = gs.on_shortcut(parsed, move |_app, _shortcut, event| {
-        if event.state() == ShortcutState::Pressed {
-            if let Some(w) = app_handle.get_webview_window("floating") {
-                let _ = w.show();
-                let _ = w.set_focus();
-                let _ = app_handle.emit("usticky://quick-add", ());
-            }
+        if event.state() != ShortcutState::Pressed {
+            return;
+        }
+        // toggle 行为：
+        //   - 浮窗不可见 → 唤出（save prev app + raise + show + focus）
+        //   - 浮窗可见 → 隐藏 + 还原 level + 切回原 app
+        let Some(w) = app_handle.get_webview_window("floating") else { return };
+        let visible = w.is_visible().unwrap_or(false);
+        if !visible {
+            // ── show 分支 ──
+            // 顺序：save prev app → raise level → show → focus → emit
+            // raise 必须在 show 之前，否则 PinBottom 模式下浮窗先在 -1
+            // 显示一帧才升到 3，视觉上会闪一下被其他 app 盖住的画面
+            platform::save_previous_app_for_quick_add();
+            platform::raise_for_quick_add(&app_handle);
+            QUICK_ADD_ACTIVE.store(true, Ordering::SeqCst);
+            let _ = w.show();
+            let _ = w.set_focus();
+            let _ = app_handle.emit("usticky://quick-add", ());
+        } else {
+            // ── hide 分支 ──
+            dismiss_floating_window(&app_handle, &store_ref);
         }
     }) {
         tracing::error!("on_shortcut failed: {}", e);
         let _ = app.emit("usticky://persist-failed", format!("register shortcut: {e}"));
     }
+}
+
+/// dismiss 浮窗：hide + 还原 level + 切回原 app（仅当 QUICK_ADD_ACTIVE=true）。
+///
+/// 三个调用点：
+///   1. 快捷键 visible 分支
+///   2. `hide_floating_window` IPC 命令（前端 Esc 调它）
+///   3. tray toggle 的 hide 分支
+///
+/// 顺序：hide → 还原 level（必须在 hide 之后，否则 PinBottom 模式下浮窗
+/// 先从 FLOATING 降到 -1 还显示一帧才隐藏，视觉上会闪一下被其他 app 盖住的画面）
+/// → activate prev app。
+pub fn dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore) {
+    let was_active = QUICK_ADD_ACTIVE.swap(false, Ordering::SeqCst);
+    if let Some(w) = app.get_webview_window("floating") {
+        let _ = w.hide();
+    }
+    if was_active {
+        let mode = store.blocking_read().pin_mode();
+        platform::restore_level_after_quick_add(app, mode);
+        platform::activate_previous_app_after_quick_add();
+    }
+}
+
+/// 标记 quick-add 状态已清除（用于 `show_floating_window` / tray toggle show 分支）。
+///
+/// show 路径不主动激活 quick-add 模式 —— 只有快捷键才走 raise + save prev app。
+/// 但要清除残留的 QUICK_ADD_ACTIVE=true 状态，防止下次 hide 时误以为是我们
+/// raise 的、去做无意义的 restore + activate。
+pub fn clear_quick_add_active() {
+    QUICK_ADD_ACTIVE.store(false, Ordering::SeqCst);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

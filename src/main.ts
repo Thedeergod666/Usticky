@@ -379,10 +379,11 @@ async function addTodo(title: string) {
 }
 
 async function toggleDone(todo: Todo) {
-  // 乐观更新 DOM：先加 .vanishing 动画，动画结束后再调 IPC
+  // 乐观更新 DOM：先加 .vanishing 动画（变成一条线 → 继续缩窄到 0），
+  // 动画结束后再调 IPC。500ms 匹配 CSS @keyframes vanish-to-line 总时长。
   const row = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(todo.id)}"]`);
   if (todo.status === "pending") {
-    // 标完成
+    // 标完成：pending 行 vanishing → done section 出现新行
     if (row) {
       row.classList.add("vanishing");
       setTimeout(async () => {
@@ -392,17 +393,31 @@ async function toggleDone(todo: Todo) {
           console.error("[usticky] update_todo failed", e);
           row.classList.remove("vanishing");
         }
-      }, 300);
+      }, 500);
     } else {
       await invoke("update_todo", { id: todo.id, status: "done" });
     }
   } else {
-    // 撤销完成
-    try {
-      await invoke("update_todo", { id: todo.id, status: "pending" });
-      showMiniFlash(t("app.undo.flash", { title: todo.title }));
-    } catch (e) {
-      console.error("[usticky] undo failed", e);
+    // 撤销完成：done 行 vanishing（变成一条线 → 继续缩窄）→ pending section 出现新行
+    // 即"done 移到 pending 行，原有 done 行变成一条线并继续缩窄高度"
+    if (row) {
+      row.classList.add("vanishing");
+      setTimeout(async () => {
+        try {
+          await invoke("update_todo", { id: todo.id, status: "pending" });
+          showMiniFlash(t("app.undo.flash", { title: todo.title }));
+        } catch (e) {
+          console.error("[usticky] undo failed", e);
+          row.classList.remove("vanishing");
+        }
+      }, 500);
+    } else {
+      try {
+        await invoke("update_todo", { id: todo.id, status: "pending" });
+        showMiniFlash(t("app.undo.flash", { title: todo.title }));
+      } catch (e) {
+        console.error("[usticky] undo failed", e);
+      }
     }
   }
 }
@@ -419,7 +434,7 @@ async function deleteTodo(todo: Todo) {
         console.error("[usticky] delete_todo failed", e);
         row.classList.remove("vanishing");
       }
-    }, 300);
+    }, 500);
   } else {
     await invoke("delete_todo", { id: todo.id });
   }
@@ -779,13 +794,11 @@ function ensureInputBar() {
       await addTodo(trimmed);
     } else if (e.key === "Escape") {
       input.blur();
-      win().hide().catch(() => {});
+      // 走 hide_floating_window 命令 —— 跟 quick-add 状态联动：
+      // 若浮窗是 quick-add 唤起的，hide 时要还原 level + 切回原 app
+      invoke("hide_floating_window").catch((e) => console.error("[usticky] hide_floating_window failed", e));
     }
   });
-}
-
-function win() {
-  return getCurrentWindow();
 }
 
 init();

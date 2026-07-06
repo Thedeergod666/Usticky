@@ -59,6 +59,7 @@
 //!      - `inside` 切到 `false`（edge-trigger）→ drop 到 `HWND_BOTTOM`
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
@@ -66,10 +67,13 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::{HWND as WIN_HWND, POINT, RECT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetCursorPos, GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, SetWindowPos,
-    WindowFromPoint, GA_ROOT, GWLP_EXSTYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
+    AllowSetForegroundWindow, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
+    GetWindowRect, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WindowFromPoint,
+    ASFW_ANY, GA_ROOT, GWLP_EXSTYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
 };
+
+use crate::todo::PinMode;
 
 /// Hover tracker thread 是否已启动（idempotent 防重入）。
 static TRACKER_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -189,6 +193,68 @@ pub fn set_window_normal<R: Runtime>(app: &AppHandle<R>) {
 /// 保留是为了让 commands.rs 在跨平台调用时不必 `#[cfg]`。
 pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) {
     // no-op —— tracker 自己处理
+}
+
+// ── Quick-add 临时置顶 + 切回原应用 ──
+//
+// 跟 macOS 同套接口（详见 platform/macos.rs 顶部 doc）。Win 实现要点：
+//   - 用 GetForegroundWindow 保存原前台 HWND，dismiss 时 SetForegroundWindow 切回
+//   - Win32 SetForegroundWindow 有权限限制（调用方必须是当前前台进程等），
+//     调用前先 AllowSetForegroundWindow(ASFW_ANY) 放权
+
+/// 保存的"原前台 HWND"。None = 没保存过（dismiss 时不切回，让 OS 自然降级）。
+static SAVED_PREV_HWND: OnceLock<std::sync::Mutex<Option<WIN_HWND>>> = OnceLock::new();
+
+pub fn save_previous_app_for_quick_add() {
+    // SAFETY: GetForegroundWindow 是 thread-safe Win32 API
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return;
+    }
+    // 拿浮窗 hwnd 比对 —— 如果自己就是前台（极少见），不覆盖
+    // 这里拿不到 app handle（这个函数没有 app 参数），简单跳过自检：
+    // 实际场景下 quick-add 是全局快捷键，触发时前台几乎不可能是 Usticky 自己
+    let lock = SAVED_PREV_HWND.get_or_init(|| std::sync::Mutex::new(None));
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(foreground);
+}
+
+pub fn activate_previous_app_after_quick_add() {
+    let lock = SAVED_PREV_HWND.get_or_init(|| std::sync::Mutex::new(None));
+    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(hwnd) = *guard else { return };
+    if hwnd.is_null() {
+        return;
+    }
+    // SAFETY: AllowSetForegroundWindow + SetForegroundWindow 都是 thread-safe
+    unsafe {
+        // 放权让任何进程都能接 foreground —— 不调的话 SetForegroundWindow
+        // 大概率被 OS 拒绝（除非 Usticky 此刻刚好是前台进程，那 dismiss 路径
+        // 上调用方就是前台，可以直接调；保守起见还是放权）
+        AllowSetForegroundWindow(ASFW_ANY);
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// 唤出浮窗时调：disable hover 切 z-order + 设 TopMost。
+pub fn raise_for_quick_add<R: Runtime>(app: &AppHandle<R>) {
+    LEVEL_SWITCHING_ACTIVE.store(false, Ordering::SeqCst);
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(win) = app2.get_webview_window("floating") {
+            if let Ok(hwnd) = win.hwnd() {
+                unsafe { apply_z_order(hwnd.0, ZOrder::TopMost) };
+            }
+        }
+    });
+}
+
+/// dismiss 时调：按 pin mode 还原 z-order + LEVEL_SWITCHING_ACTIVE。
+pub fn restore_level_after_quick_add<R: Runtime>(app: &AppHandle<R>, mode: PinMode) {
+    match mode {
+        PinMode::PinTop => set_window_pin_top(app),
+        PinMode::PinBottom => set_window_pin_bottom(app),
+        PinMode::Normal => set_window_normal(app),
+    }
 }
 
 /// 启动 hover emitter 线程。idempotent —— 第二次调用立即返回。

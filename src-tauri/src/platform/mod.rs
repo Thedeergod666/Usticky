@@ -37,9 +37,15 @@ mod plat {
     // Tauri 的 set_always_on_top(true) 走 GTK Wayland/X11 走 WM_WINDOW_ROLE，
     // 没私有 API 可调，alwaysOnTop: true 已经是最实用的方案。
     use tauri::{AppHandle, Runtime};
+    use crate::todo::PinMode;
     pub fn set_window_pin_top<R: Runtime>(_app: &AppHandle<R>) {}
     pub fn set_window_pin_bottom<R: Runtime>(_app: &AppHandle<R>) {}
     pub fn set_window_normal<R: Runtime>(_app: &AppHandle<R>) {}
     pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) {}
     pub fn start_hover_emitter<R: Runtime>(_app: AppHandle<R>) {}
+    // Quick-add 临时置顶 + 切回原应用：Linux no-op（无稳定切回原 app 路径）
+    pub fn save_previous_app_for_quick_add() {}
+    pub fn activate_previous_app_after_quick_add() {}
+    pub fn raise_for_quick_add<R: Runtime>(_app: &AppHandle<R>) {}
+    pub fn restore_level_after_quick_add<R: Runtime>(_app: &AppHandle<R>, _mode: PinMode) {}
 }

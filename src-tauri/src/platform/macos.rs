@@ -28,15 +28,19 @@
 //!   `set_always_on_top(true)`。PinTop 模式用它，hover 临时置顶也用它。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSEvent, NSWindow};
+use objc2_app_kit::{
+    NSApplicationActivationOptions, NSEvent, NSRunningApplication, NSWindow, NSWorkspace,
+};
 use objc2_core_graphics::{kCGFloatingWindowLevel, kCGNormalWindowLevel, CGWindowLevel};
 use objc2_foundation::NSPoint;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
+
+use crate::todo::PinMode;
 
 /// 始终在底部：`kCGNormalWindowLevel - 1`（= -1）。
 ///
@@ -91,6 +95,80 @@ pub fn set_window_normal<R: Runtime>(app: &AppHandle<R>) {
 /// 保留是为了让 commands.rs 在跨平台调用时不必 `#[cfg]`。
 pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) {
     // no-op —— tracker 自己处理 level 切换
+}
+
+// ── Quick-add 临时置顶 + 切回原应用 ──
+//
+// 用户场景：Cmd+Shift+Space 唤出浮窗 → 自动置顶（即便 PinBottom 模式）→
+// 焦点进输入框 → 写完按 Esc 或再按一次快捷键 → 浮窗隐藏 + 焦点切回原应用。
+//
+// 实现要点：
+//   1. 唤出时保存当前 frontmost app（用户正在用的应用），便于 dismiss 时切回
+//   2. 唤出时把 level 切到 FLOATING（即便 PinBottom），并 disable hover 切 level
+//      —— 否则 hover emitter 会跟我们打架（鼠标位置不在浮窗内 → 切回 BELOW_NORMAL）
+//   3. dismiss 时把 level + LEVEL_SWITCHING_ACTIVE 按 pin mode 还原
+//   4. dismiss 时 activate 保存的 app —— macOS 上 `orderOut:` 不会自动切回原 app
+
+/// 保存"按下快捷键前的 frontmost app"，用于 dismiss 时切回。
+///
+/// 必须在 `show()` **之前**调 —— 否则 frontmost 就是我们自己。
+/// 如果当前 frontmost 就是 Usticky（极少见，比如浮窗已可见但失焦时又按快捷键），
+/// 不覆盖已保存的值 —— 保留上次有效保存。
+pub fn save_previous_app_for_quick_add() {
+    let workspace = NSWorkspace::sharedWorkspace();
+    let frontmost = workspace.frontmostApplication();
+    let Some(app) = frontmost else { return };
+    let current_pid = NSRunningApplication::currentApplication().processIdentifier();
+    if app.processIdentifier() == current_pid {
+        // 自己是 frontmost —— 不覆盖
+        return;
+    }
+    let mutex = SAVED_PREV_APP.get_or_init(|| Mutex::new(None));
+    *mutex.lock().unwrap_or_else(|e| e.into_inner()) = Some(app);
+}
+
+/// dismiss 时调：激活之前保存的 app，把焦点切回去。
+///
+/// macOS 14+ 推荐 `activate()`，但 objc2-app-kit 0.3.2 只暴露了 deprecated 的
+/// `activateWithOptions(_:)`。实测在 macOS 26 上仍工作，先用着 —— 后续升级
+/// objc2-app-kit 后再切 `activate()`。
+pub fn activate_previous_app_after_quick_add() {
+    let mutex = SAVED_PREV_APP.get_or_init(|| Mutex::new(None));
+    let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(app) = guard.as_ref() else { return };
+    // ActivateAllWindows：把目标 app 的所有窗口都拉到前面（vs 只拉 key window）
+    let options = NSApplicationActivationOptions::ActivateAllWindows;
+    let _ = app.activateWithOptions(options);
+    // 不清空 SAVED_PREV_APP —— 下次 quick-add 时 save_previous_app_for_quick_add
+    // 会覆盖（如果新 frontmost 不是我们自己）。这样即使 dismiss 后没立刻 save
+    // 也保留上次值，行为更稳。
+}
+
+/// 保存的"原 frontmost app"。OnceLock<Mutex<Option<Retained<NSRunningApplication>>>>。
+/// Retained 是 thread-safe 的（内部 refcount 原子），Mutex 只是串行化访问。
+static SAVED_PREV_APP: OnceLock<Mutex<Option<objc2::rc::Retained<NSRunningApplication>>>> =
+    OnceLock::new();
+
+/// 唤出浮窗时调：把 level 切到 FLOATING（即便 PinBottom），并 disable hover 切 level。
+///
+/// 必须**在 show() 之前**调 —— 否则 PinBottom 模式下浮窗先在 -1 显示一帧才升到 3，
+/// 视觉上会闪一下被其他 app 盖住的画面。
+pub fn raise_for_quick_add<R: Runtime>(app: &AppHandle<R>) {
+    // 先 disable hover 切 level —— 防止 raise 后第一个 hover tick 立刻把 level 切回
+    LEVEL_SWITCHING_ACTIVE.store(false, Ordering::SeqCst);
+    set_window_level(app, LEVEL_FLOATING, false);
+}
+
+/// dismiss 时调：按当前 pin mode 还原 level + LEVEL_SWITCHING_ACTIVE。
+///
+/// 必须在 `hide()` **之后**调 —— 否则 PinBottom 模式下浮窗先从 FLOATING 降到 -1
+/// 还显示一帧才隐藏，视觉上会闪一下被其他 app 盖住的画面。
+pub fn restore_level_after_quick_add<R: Runtime>(app: &AppHandle<R>, mode: PinMode) {
+    match mode {
+        PinMode::PinTop => set_window_pin_top(app),
+        PinMode::PinBottom => set_window_pin_bottom(app),
+        PinMode::Normal => set_window_normal(app),
+    }
 }
 
 /// 启动 hover emitter 线程。idempotent —— 第二次调用立即返回。

@@ -181,11 +181,17 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         }))
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "toggle" => {
+                // 走统一 show / dismiss 路径 —— 保持 quick-add 状态一致性
                 if let Some(w) = app.get_webview_window("floating") {
                     let is_visible = w.is_visible().unwrap_or(false);
                     if is_visible {
-                        let _ = w.hide();
+                        if let Some(store) = app.try_state::<crate::SharedStore>() {
+                            crate::dismiss_floating_window(app, store.inner());
+                        } else {
+                            let _ = w.hide();
+                        }
                     } else {
+                        crate::clear_quick_add_active();
                         let _ = w.show();
                         let _ = w.set_focus();
                     }

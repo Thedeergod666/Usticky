@@ -168,18 +168,44 @@ body[data-pin-mode="pin_bottom"][data-hover] .todo-card.done {
 body[data-pin-mode="pin_bottom"][data-hover] .todo-card.done .todo-title {
   color: var(--text-bright);
 }
+/* vanishing 两阶段动画：先变成一条线，再继续缩窄到 0
+ * 0%   → 50%  高度从原值缩到 2px，padding 清零，文字被 overflow:hidden
+ *             裁掉，只剩 background + border 作为一条横线（opacity 半透）
+ * 50%  → 100% 高度从 2px 继续缩到 0，border 消失，opacity 降到 0
+ *
+ * 用于 "标记完成" / "撤销完成" / "删除" 三种场景 —— 行从原位置消失时
+ * 都走这个动画。500ms 总时长（两阶段各 250ms）。 */
+@keyframes vanish-to-line {
+  0% {
+    opacity: 1;
+    max-height: 200px;
+    padding: 9px 13px 10px;
+    margin: 0;
+    border-width: 1px;
+  }
+  50% {
+    /* 第一阶段：变成一条线 —— 高度 2px，padding 清零，
+     * 文字被 overflow:hidden 裁掉，边框 + 背景作为一条横线。 */
+    opacity: 0.55;
+    max-height: 2px;
+    padding: 0 13px;
+    margin: 0;
+    border-width: 1px;
+  }
+  100% {
+    /* 第二阶段：继续缩窄 —— 高度 0 + border 消失 + 完全透明 */
+    opacity: 0;
+    max-height: 0;
+    padding: 0;
+    margin: 0;
+    border-width: 0;
+  }
+}
 .todo-card.vanishing {
-  transform: translateX(-30%);
-  opacity: 0;
-  max-height: 0;
-  padding-top: 0;
-  padding-bottom: 0;
-  margin: 0;
-  border-width: 0;
+  animation: vanish-to-line 0.5s cubic-bezier(0.22, 1, 0.36, 1) forwards;
   overflow: hidden;
   /* 动画期间禁止点击 —— 否则重复点 ✓/× 触发多次 IPC */
   pointer-events: none;
-  transition: all 0.3s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 /* 完成 checkbox */
