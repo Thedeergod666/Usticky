@@ -110,7 +110,15 @@ body[data-hover] #app {
 /* ── Todo 卡片 ── */
 .todo-card {
   display: flex;
-  align-items: center;
+  /* flex-start（不是 center）—— checkbox / due / delete 都贴顶对齐。
+   * 原因：title 在 hover-expand 时会从单行折成 2-4 行（见
+   * .todo-card.title-expanded .todo-title），align-items: center 会让
+   * checkbox 在 title 变长时跟着垂直居中 → 视觉"跳一下"。贴顶对齐
+   * 的话 hover-expand 前后 checkbox 位置完全不变，只 title 自己往下长。
+   *
+   * 单行时跟原来居中相比 checkbox 视觉差 ~0.5px（padding 9px vs
+   * 居中位置 9.5px），肉眼不可察觉。比"hover 时跳一下"好得多。 */
+  align-items: flex-start;
   gap: 10px;
   padding: 9px 13px 10px;
   background: var(--tile-bg);
@@ -141,33 +149,36 @@ body[data-hover] #app {
   color: var(--text-faint);
 }
 
-/* Pending 卡 idle 轻淡化：未 hover 时整卡 opacity 降到 0.72，让玻璃胶囊
- * 退到背景里；hover 时撤销淡化，跟用户注意力同步显形。
- * 跟 done 卡的 PinBottom 淡化（0.5）拉开档次 —— pending 是"待办"主体，
- * 不能比 done 还淡，否则主次倒置。opacity transition 已在 .todo-card 上。 */
-body:not([data-hover]) .todo-card:not(.done):not(.vanishing) {
+/* Pending 卡**不再** idle 淡化：
+ * 之前用 opacity 0.72 / 1.0 切 idle/hover —— 但 hover 状态机（Rust 50ms tick
+ * dispatch main thread）偶发返 false 时 body[data-hover] 被清掉 →
+ * opacity 0.72 触发 → 视觉上"丢失"+ "更深"（用户反馈 2 秒后丢失现象）。
+ *
+ * 即使 L1 后端已修（dispatch 失败保留 last_inside），opacity 这一维度的
+ * 任何残余抖动仍然会被肉眼感知为"褪色"。直接去掉它 —— 玻璃材质
+ * + 数字语义色已经提供 idle/hover 区分，opacity 是冗余的"第二维度"。
+ * 保留这条注释以便后续改回时知道为什么删。 */
+/* body:not([data-hover]) .todo-card:not(.done):not(.vanishing) {
   opacity: 0.72;
 }
 body[data-hover] .todo-card:not(.done):not(.vanishing) {
   opacity: 1;
-}
+} */
 
-/* PinBottom 模式 idle：进一步淡化已完成任务（整卡 opacity 淡化，idle 时不抢视觉）
- * 仅 PinBottom —— 这是"置底常驻"场景，done 任务该退到背景里；
- * pin_top / normal 模式下 done 卡维持原有 --text-faint 弱化即可。
- * hover 时撤销淡化（见下）—— 让用户检阅时 done 与 pending 一样清晰。 */
-body[data-pin-mode="pin_bottom"]:not([data-hover]) .todo-card.done {
+/* PinBottom 模式 done 卡**不再**淡化：
+ * 同上面 pending 卡的"褪色问题"—— hover 抖动会触发 opacity 切换 → 视觉上
+ * done 卡忽隐忽现。done 卡的状态指示靠 .todo-title 的 line-through +
+ * --text-faint 的弱化，已经足够区分；不再叠一层 opacity。
+ * 保留这条注释以便后续改回时知道为什么删。 */
+/* body[data-pin-mode="pin_bottom"]:not([data-hover]) .todo-card.done {
   opacity: 0.5;
 }
-/* PinBottom 模式 hover：done 卡恢复到跟 pending 一样明显
- * opacity 回 1 + 标题色升到 --text-bright（同 pending）。
- * 保留 line-through —— 它是"已完成"的状态指示，不该随 hover 丢。 */
 body[data-pin-mode="pin_bottom"][data-hover] .todo-card.done {
   opacity: 1;
 }
 body[data-pin-mode="pin_bottom"][data-hover] .todo-card.done .todo-title {
   color: var(--text-bright);
-}
+} */
 /* vanishing 两阶段动画：先变成一条线，再继续缩窄到 0
  * 0%   → 50%  高度从原值缩到 2px，padding 清零，文字被 overflow:hidden
  *             裁掉，只剩 background + border 作为一条横线（opacity 半透）
@@ -258,8 +269,8 @@ body[data-pin-mode="pin_bottom"][data-hover] .todo-card.done .todo-title {
  *     保留 .todo-title 上的原生 title= tooltip 给"真要看全文"的用户。
  *   - 不加 height / max-height transition —— 跟 styles.css:88-94 一致，
  *     layout 属性不做 spring；展开瞬时即可。
- *   - align-items: center 在 .todo-card（line 113）已生效，1-4 行 wrap
- *     时 checkbox/due/delete 跟着垂直居中，视觉无问题。
+ *   - .todo-card 已用 align-items: flex-start（见 line 113 注释），
+ *     checkbox 在 hover-expand 前后位置不变，只 title 往下长。
  *   - word-break: break-word + overflow-wrap: anywhere —— CJK 长串字符
  *     和超长英文 token 都能在边界断行，不会撑出 flex 容器。 */
 .todo-card.title-expanded .todo-title {
