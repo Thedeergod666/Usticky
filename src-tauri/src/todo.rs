@@ -11,7 +11,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -108,9 +108,17 @@ pub struct StoreData {
 ///
 /// Mutex 保护 `data_path`（首次 load 后就 stable，理论上不需要 Mutex，
 /// 但留着方便以后切 sqlite 时的 connection pool）。
+///
+/// `persist_lock` 串行化磁盘 I/O：
+///   拖窗时 WindowEvent::Moved/Resized 在 macOS 上以 ~60Hz 派发，每个事件
+///   spawn 一个新 task 调 `Store::persist`。多个 task 并发调 `persist_to_disk`
+///   会同时打开同一个 `tmp` 文件 → 后到的 chmod/rename 失败（"atomic rename"
+///   失败是因为前一个 rename 已经把 tmp 搬走了 / 目标已被替换）。`persist_lock`
+///   保证同一时刻只有一个 task 走完"写 tmp + chmod + rename"全流程。
 pub struct Store {
     data: StoreData,
     data_path: Mutex<Option<PathBuf>>,
+    persist_lock: Mutex<()>,
 }
 
 impl Store {
@@ -137,6 +145,7 @@ impl Store {
         Ok(Self {
             data,
             data_path: Mutex::new(Some(data_path)),
+            persist_lock: Mutex::new(()),
         })
     }
 
@@ -285,7 +294,16 @@ impl Store {
     }
 
     /// 持久化 + emit。
+    ///
+    /// 拿 `persist_lock` 串行化磁盘 I/O：拖窗时 Moved/Resized 事件 ~60Hz
+    /// 派发，每个事件 spawn 出的 task 都进这里 —— 没锁就并发打开 tmp 文件，
+    /// chmod 和 rename 互相覆盖，触发 "atomic rename failed" 噪声日志。
+    ///
+    /// poison 恢复（`unwrap_or_else(|e| e.into_inner())`）跟其他 Mutex 同款：
+    /// 一旦 task panic 不让后续 persist 全部卡死。
     pub fn persist(&self, _app: &AppHandle) -> Result<()> {
+        let _guard: MutexGuard<()> = self.persist_lock.lock()
+            .unwrap_or_else(|e| e.into_inner());
         let path = self.data_path.lock().unwrap().clone()
             .context("data_path not initialized")?;
         persist_to_disk(&path, &self.data)
