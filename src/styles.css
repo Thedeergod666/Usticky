@@ -250,6 +250,29 @@ body[data-pin-mode="pin_bottom"][data-hover] .todo-card.done .todo-title {
   white-space: nowrap;
 }
 
+/* ── hover-expand：被截断的 title 在卡片 hover 时换行展开 ──
+ *
+ * 触发：JS 在 .todo-card 的 mouseenter/mouseleave 上 toggle .title-expanded。
+ * 设计取舍：
+ *   - 4 行 clamp：避免 500 字 title 撑成 50 行巨型窗口；超过 4 行
+ *     保留 .todo-title 上的原生 title= tooltip 给"真要看全文"的用户。
+ *   - 不加 height / max-height transition —— 跟 styles.css:88-94 一致，
+ *     layout 属性不做 spring；展开瞬时即可。
+ *   - align-items: center 在 .todo-card（line 113）已生效，1-4 行 wrap
+ *     时 checkbox/due/delete 跟着垂直居中，视觉无问题。
+ *   - word-break: break-word + overflow-wrap: anywhere —— CJK 长串字符
+ *     和超长英文 token 都能在边界断行，不会撑出 flex 容器。 */
+.todo-card.title-expanded .todo-title {
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
 /* due 时间标签 */
 .todo-due {
   flex: 0 0 auto;
@@ -338,35 +361,34 @@ body[data-hover] #app .todo-due.days     { color: var(--c-data-cyan);  backgroun
   white-space: nowrap;  /* 防止 hint 文字本身被换行（防御性，默认 inline 不会换） */
 }
 
-/* 窄窗模式（两档）：
+/* 窄窗模式（两档 —— 文字 + 容器都缩到极简）：
  *
- *   正常（≥ 280）→ 10px 字号 + 背景框 + 2px/6px padding（iOS 26 胶囊质感）
- *   紧凑（< 280）→ 9px 字号 + 无背景 + 1px/4px padding，省 ~14px
- *   图标（< 240）→ 9px 字号 + 无背景 + 0 padding + gap 缩到 4px，
- *                  hint 内容裁到 '⌘⇧'（去 Space 文字），最窄档。
+ *   正常（≥ 280）→ 10px 字号 + 背景框 + 2px/6px padding（iOS 26 胶囊）
+ *   图标（< 280）→ 9px 字号 + 无背景 + 1px/2px padding + gap 4px +
+ *                  容器 padding 8px/8px，hint 文字 '⌘⇧'（去 'Space'）
  *
- * 阈值：
- *   280 = minWidth 240 + 40px 余量，给紧凑档提供触发空间
- *   240 = minWidth 边界，浮窗到最窄时 hint 必成图标版（否则必挤）
+ * 阈值 280 = minWidth 240 + 40px 余量。
  *
  * 由 main.ts 的 syncNarrowMode() 根据 window.innerWidth 设
- * body[data-narrow] = "" / "1" / "2" 触发。
+ * body[data-narrow] = "" / "1" 触发。
  *
- * 三档取舍：
- *   - 不用 display:none 隐藏 hint（用户期望"图标不被挤压"）
- *   - 不到最窄不用 '⌘⇧' 简写（'⌘⇧Space' 才是完整信息）
- *   - input 字号不变（用户已习惯 13px + 占位符宽度节奏） */
-body[data-narrow="1"] .todo-input-hint {
-  font-size: 9px;
-  font-weight: 500;
-  padding: 1px 4px;
-  background: transparent;
-  border-radius: 3px;
-  letter-spacing: 0;
+ * 为什么不做 3 档（之前 compact 240-279 用 '⌘⇧Space' 完整版）：
+ *   用户实测 260px 浮窗下 compact 版 '⌘⇧Space' 仍被裁 —— 中文
+ *   13px 字号下 input 占位符 '要做的事？回车保存' 实际渲染 ~135px
+ *   （比英文 'What needs doing? Press Enter' 宽 ~25px），加上
+ *   hint '⌘⇧Space' 9px 紧凑版 ~46px + gap 6px + padding 32px
+ *   ≈ 219px 临界点已超 240 minWidth。tier 1 直接用 '⌘⇧' 图标版
+ *   是唯一 fit 方案，放弃 240-279 区间保留 'Space' 文字。
+ *
+ * 为什么不用 display:none：
+ *   用户明确反馈'图标不被挤压'，不能用'消失'替代。tier 1 '⌘⇧'
+ *   icon 仍是可见的快捷键提示（modifier only），失去的是 key
+ *   字母 —— 用户已在快捷键录入流程里设过键，icon 已够提醒。 */
+body[data-narrow="1"] .todo-input {
+  gap: 4px;
+  padding: 8px 8px;
 }
-body[data-narrow="1"] .todo-input { gap: 6px; }
-
-body[data-narrow="2"] .todo-input-hint {
+body[data-narrow="1"] .todo-input-hint {
   font-size: 9px;
   font-weight: 500;
   padding: 1px 2px;
@@ -374,7 +396,6 @@ body[data-narrow="2"] .todo-input-hint {
   border-radius: 2px;
   letter-spacing: 0;
 }
-body[data-narrow="2"] .todo-input { gap: 4px; padding: 8px 8px; }
 
 /* ── Section header (Pending / Done) ── */
 .section-header {

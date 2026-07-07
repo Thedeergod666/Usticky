@@ -116,51 +116,52 @@ function formatShortcutIcon(s: string): string {
 }
 
 /// 浮窗宽度的"窄窗档位"（CSS 据此调 hint 字号 / 文字 / 容器 padding）。
-type NarrowTier = 0 | 1 | 2;
+type NarrowTier = 0 | 1;
 
 /// 浮窗宽度档位阈值（px）。
 ///
-///  - tier 0（正常，≥ COMPACT_THRESHOLD）：hint = 10px + 背景框 + '⌘⇧Space'
-///  - tier 1（紧凑，ICON_THRESHOLD ≤ w < COMPACT_THRESHOLD）：
-///          hint = 9px + 无背景 + '⌘⇧Space'（省 ~14px）
-///  - tier 2（图标，w < ICON_THRESHOLD）：
-///          hint = 9px + 无背景 + '⌘⇧'（去掉 'Space' 文字，再省 ~20px）
+///  - tier 0（正常，≥ NARROW_THRESHOLD）：hint = 10px + 背景框 + '⌘⇧Space'
+///  - tier 1（图标，w < NARROW_THRESHOLD）：
+///          hint = 9px + 无背景 + '⌘⇧'（去 'Space' 文字，再省 ~20px）
 ///
-/// ICON_THRESHOLD = minWidth 240：浮窗到最窄时 hint 必成图标版（否则必挤）。
-/// COMPACT_THRESHOLD = 280：minWidth 240 + 40px 余量，给紧凑档提供触发空间。
-const COMPACT_THRESHOLD = 280;
-const ICON_THRESHOLD = 240;
+/// 两档而不是三档的原因：用户实测 240-279px 区间 compact 版
+/// '⌘⇧Space' 仍被推出浮窗 —— 中文 13px 字号下 input 占位符
+/// '要做的事？回车保存' 实际渲染 ~135px（比英文 'What needs doing?
+/// Press Enter' 宽 ~25px），加上 hint '⌘⇧Space' (~46px) + gap + padding
+/// 在 260px 就开始裁字。tier 1 阈值取 minWidth 240 + 40px = 280，
+/// 280 以下 hint 直接 '⌘⇧' 图标版，足够 fit。
+const NARROW_THRESHOLD = 280;
 
 /// 算当前宽度的档位。
 function computeNarrowTier(): NarrowTier {
   const w = window.innerWidth;
-  if (w < ICON_THRESHOLD) return 2;
-  if (w < COMPACT_THRESHOLD) return 1;
+  if (w < NARROW_THRESHOLD) return 1;
   return 0;
 }
 
 /// 把 input hint 刷成 currentShortcut 的展示形式。
-/// tier=2 时用图标版（`⌘⇧` 去 'Space'）省最宽档的字符。
-/// tier=0/1 用完整版（`⌘⇧Space`）保信息密度。
+/// tier=1 时用图标版（`⌘⇧` 去 'Space'）省字符宽度。
+/// tier=0 用完整版（`⌘⇧Space`）保信息密度。
 function updateInputHint(tier: NarrowTier = 0) {
   const hint = app.querySelector<HTMLElement>(".todo-input-hint");
   if (hint) {
-    hint.textContent = tier === 2
+    hint.textContent = tier === 1
       ? formatShortcutIcon(currentShortcut)
       : formatShortcutForDisplay(currentShortcut);
   }
 }
 
 /// 根据 `window.innerWidth` 切档：设 `body[data-narrow]` 触发 CSS，
-/// 同时调 `updateInputHint(tier)` 切文字（tier 2 时 hint 变 `⌘⇧`）。
+/// 同时调 `updateInputHint(tier)` 切文字（tier 1 时 hint 变 `⌘⇧`）。
 ///
-/// 三档策略：
+/// 两档策略：
 ///   - 不用 display:none 隐藏 hint（用户期望"图标不被挤压"）
-///   - 不到最窄不用 '⌘⇧' 简写（'⌘⇧Space' 才是完整信息）
+///   - tier 1 直接用 '⌘⇧' 图标版，不用 '⌘⇧Space' 完整版
+///     （240-279 区间中文系统实测 fit 不了完整版）
 ///   - input 字号不变（用户已习惯 13px + 占位符宽度节奏）
 function syncNarrowMode() {
   const tier = computeNarrowTier();
-  document.body.dataset.narrow = tier === 0 ? "" : String(tier);
+  document.body.dataset.narrow = tier === 0 ? "" : "1";
   updateInputHint(tier);
 }
 
@@ -365,6 +366,16 @@ function buildTodoRow(todo: Todo): HTMLElement {
   });
   row.appendChild(del);
 
+  // hover-expand：卡片 hover 时展开截断的 title，离开时收回。
+  // 复用 scheduleHoverResize 的 rAF coalescing + delta 检测，
+  // 同帧跨卡切换只触发一次 resize IPC，视觉无抖动。
+  row.addEventListener("mouseenter", () => {
+    scheduleHoverResize(row, true);
+  });
+  row.addEventListener("mouseleave", () => {
+    scheduleHoverResize(row, false);
+  });
+
   return row;
 }
 
@@ -403,6 +414,54 @@ function renderEmptyState() {
 }
 
 // ── 自适应高度 ──
+
+/// hover-expand：截断的 title 在卡片 hover 时换行展开（独立路径，绕开
+/// autoResizeWindow 的 contentFingerprint 去重 —— 文本变化不该触发结构
+/// resize，但 hover 是用户主动意图，每次都要按需 fit）。
+const TITLE_EXPAND_CLASS = "title-expanded";
+// delta < 4px 视为不变化，跳过 resize（避免 1px 抖动触发 IPC）
+const HOVER_RESIZE_DELTA_PX = 4;
+// rAF coalescing：同一帧内多次 mouseenter/mouseleave 只触发一次 resize
+let hoverResizePending = false;
+
+/// 把卡片切到 expanded/collapsed 态，rAF 后测 delta 决定是否 resize。
+///
+/// 不在 input 打字时调用（typing 检测跟 render 一致 line 266-270），
+/// 不在 vanish 动画中调用，幂等切换（已是目标态直接返回）。
+///
+/// 未截断的 title 也走这条路径 —— toggle class 后视觉不变，
+/// scrollHeight delta = 0，delta 检测自然 skip resize，零副作用。
+function scheduleHoverResize(card: HTMLElement, expanding: boolean) {
+  const appEl = document.getElementById("app");
+  if (!appEl) return;
+
+  // 防御：节点已在 vanish 动画中（被删 / 即将被删）
+  if (card.classList.contains("vanishing")) return;
+  if (!card.isConnected) return;
+
+  // 输入中禁止 resize —— 跟 line 266-270 的 typing 检测保持一致
+  const inputEl = app.querySelector<HTMLInputElement>(".todo-input input");
+  if (inputEl?.matches(":focus") && inputEl.value.length > 0) return;
+
+  // 已经是目标态 → 跳过（鼠标快速进出同一卡 / 重复 enter）
+  const wasExpanded = card.classList.contains(TITLE_EXPAND_CLASS);
+  if (expanding === wasExpanded) return;
+
+  const beforeH = appEl.scrollHeight;
+  card.classList.toggle(TITLE_EXPAND_CLASS, expanding);
+
+  // rAF coalescing：同一帧内多次调用只测一次 / resize 一次
+  if (hoverResizePending) return;
+  hoverResizePending = true;
+  requestAnimationFrame(() => {
+    hoverResizePending = false;
+    const afterH = appEl.scrollHeight;
+    const delta = afterH - beforeH;
+    if (Math.abs(delta) < HOVER_RESIZE_DELTA_PX) return;
+    void resizeWindowToContent(appEl);
+  });
+}
+
 async function autoResizeWindow(snap: TodoSnapshot) {
   await new Promise<void>((r) => requestAnimationFrame(() => r()));
   const appEl = document.getElementById("app");
