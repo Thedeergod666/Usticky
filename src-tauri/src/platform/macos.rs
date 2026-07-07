@@ -238,6 +238,32 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
             // - **enter→exit 切换瞬间 reset 计数器**：避免在过渡中误累计。
             let mut pending_ticks: u8 = 0;
             let mut pending_value = false;
+
+            // **2026-07-03 fix（玻璃 2 秒后丢失问题）**：
+            //
+            // Usticky v0.1 默认强玻璃（alpha 0.82 + blur 28px always-on），
+            // 持续 GPU 高负载。macOS 合成层持续重排 → main thread 持续忙
+            // → `is_floating_topmost_at` 的 `run_on_main_thread` 50ms 超时
+            // → 持续返 false → "假 exit" → 浮窗玻璃持续 1.5~3 秒丢失。
+            //
+            // 修复策略：dispatch timeout / 失败时**不立刻采纳 false**，
+            // 保留 last_inside。只有当连续 **3 个 tick（150ms）** 都是
+            // timeout/失败 才兜底采纳 false。这给 main thread "喘息窗口"，
+            // GPU 忙的 1.5~3 秒窗口期不会被假 exit 误触。
+            //
+            // 为什么 enter 阈值不增加（仍是 1 tick）：
+            // - 用户期望"短 hover 也要触发置顶"（2026-07-06 fix 调优过）
+            // - 进入浮窗时 GPU 不会突然忙起来（idle 状态低负载），dispatch
+            //   几乎一定能 < 50ms 拿到结果，timeout 极少见
+            // - 真要 enter timeout 多半是窗口未上屏等真异常，保留即采纳的
+            //   语义错误代价低（晚一个 tick 进入）
+            //
+            // 为什么 fix 在 hover emitter 而不是 is_floating_topmost_at：
+            // 改 is_floating_topmost_at 返"未知"会让调用方复杂化；改 emitter
+            // 状态机是最小改动，跟现有 dwell-time hysteresis 协同工作。
+            let mut consecutive_dispatch_failures: u8 = 0;
+            const DISPATCH_FAILURE_THRESHOLD: u8 = 3; // 3 × 50ms = 150ms
+
             loop {
                 thread::sleep(Duration::from_millis(50));
 
@@ -245,7 +271,41 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 
                 // 关键：用 NSWindow.windowNumberAtPoint 做命中测试 ——
                 // 不光检查"鼠标在不在浮窗 frame 内"，还要确认浮窗在该点是**最上层**。
-                let inside = is_floating_topmost_at(&app, mouse);
+                // **2026-07-03 fix**：当 inside=false 但**已知上次 inside=true 且
+                // 当前是 dispatch 失败**，保守认为"可能还在浮窗里" → 不采纳 false。
+                // 用 inside_unreliable 替代直接 inside 走下面的状态机。
+                let (inside, dispatch_failed) = is_floating_topmost_at_with_status(&app, mouse);
+
+                // dispatch 失败时（main thread 忙 / 窗口未上屏 / MainThreadMarker 不可用），
+                // 走"未知"路径：保留 last_inside，不更新 pending_value
+                if dispatch_failed {
+                    consecutive_dispatch_failures =
+                        consecutive_dispatch_failures.saturating_add(1);
+                    if consecutive_dispatch_failures >= DISPATCH_FAILURE_THRESHOLD {
+                        // 连续 3 tick dispatch 都失败（150ms）→ 兜底采纳 false
+                        // （跟 EXIT_THRESHOLD 一致，避免阈值碎裂）
+                        if last_inside {
+                            last_inside = false;
+                            pending_ticks = 0;
+                            pending_value = false;
+                            if let Err(e) = app.emit("usticky://floating-hover", false) {
+                                tracing::trace!(error = %e, "emit hover 失败");
+                            }
+                            if LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst) {
+                                set_window_level(&app, LEVEL_BELOW_NORMAL, false);
+                            }
+                            tracing::debug!(
+                                "dispatch 连续失败 {} 次，兜底采纳 false（防永久卡 hover=true）",
+                                DISPATCH_FAILURE_THRESHOLD
+                            );
+                        }
+                    }
+                    // dispatch 失败期间**不 emit hover-pos**（坐标可能 stale，且
+                    // 不希望前端在错误状态下继续切 .todo-card hover）
+                    continue;
+                }
+
+                consecutive_dispatch_failures = 0; // 重置失败计数
 
                 if inside == last_inside {
                     pending_ticks = 0;
@@ -372,12 +432,23 @@ pub fn set_window_level<R: Runtime>(
 /// 实现已稳定运行，不存在"transparent 区域命中失效"问题。改回该方案。
 ///
 /// dispatch 到 main thread（NSWindow API 强制要求）。channel 同步等待。
-/// 拿不到 / 超时 / 浮窗未上屏 → 保守返回 false。
-fn is_floating_topmost_at<R: Runtime>(app: &AppHandle<R>, point: NSPoint) -> bool {
+///
+/// **2026-07-03 扩展**：拆出 `_with_status` 变体，把"真实判定 false"和
+/// "dispatch 失败/超时/未上屏/MainThreadMarker 不可用"区分开 ——
+/// 调用方（hover emitter）看到后者按"未知"处理，保留 last_known_inside。
+/// 解决 Usticky 默认强玻璃 always-on 下 GPU 持续高负载 → main thread 忙
+/// → dispatch 持续 timeout → 持续 false → 1.5~3 秒玻璃丢失的问题。
+///
+/// 注：旧 `is_floating_topmost_at`（无 status 返回 bool）已无调用方——
+/// `_with_status` 替代，删 dead code。
+fn is_floating_topmost_at_with_status<R: Runtime>(
+    app: &AppHandle<R>,
+    point: NSPoint,
+) -> (bool, bool) {
     use std::sync::{Arc, Condvar, Mutex};
 
     struct OneSlot {
-        slot: Mutex<Option<bool>>,
+        slot: Mutex<Option<(bool, bool)>>, // (inside, dispatch_failed)
         cvar: Condvar,
     }
     static SLOT: OnceLock<Arc<OneSlot>> = OnceLock::new();
@@ -401,31 +472,38 @@ fn is_floating_topmost_at<R: Runtime>(app: &AppHandle<R>, point: NSPoint) -> boo
             let window: &NSWindow = unsafe { &*ptr.cast::<NSWindow>() };
             let our_id = window.windowNumber();
             if our_id == 0 {
-                // 窗口还没上屏（极少见，初始化竞态）→ 直接 false
-                return Some(false);
+                // 窗口还没上屏（极少见，初始化竞态）→ 当作 dispatch 失败
+                return None;
             }
-            // 传 0 = 不排除任何窗口，返回整个屏幕在该点 topmost window 的 number
             let Some(mtm) = MainThreadMarker::new() else {
-                return Some(false);
+                tracing::trace!("is_floating_topmost_at: MainThreadMarker 不可用，跳过本 tick");
+                return None;
             };
             let topmost = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(point, 0, mtm);
             Some(topmost == our_id)
         })();
+        // (inside, dispatch_failed) 区分"真实判定"和"未知"：
+        //   - Some(inside)            → (inside, false)
+        //   - None（窗口未上屏 / MTM 不可用）→ (false, true)
+        let payload = match result {
+            Some(inside) => (inside, false),
+            None => (false, true),
+        };
         {
             let mut g = slot2.slot.lock().unwrap_or_else(|e| e.into_inner());
-            *g = Some(result.unwrap_or(false));
+            *g = Some(payload);
         }
         slot2.cvar.notify_all();
     });
     if let Err(e) = dispatch_result {
         tracing::trace!(
             error = %e,
-            "is_floating_topmost_at: dispatch to main thread 失败，立即返 false"
+            "is_floating_topmost_at: dispatch to main thread 失败，立即返 (false, true)"
         );
         {
             let mut g = slot.slot.lock().unwrap_or_else(|e| e.into_inner());
             if g.is_none() {
-                *g = Some(false);
+                *g = Some((false, true));
             }
         }
         slot.cvar.notify_all();
@@ -446,5 +524,6 @@ fn is_floating_topmost_at<R: Runtime>(app: &AppHandle<R>, point: NSPoint) -> boo
             .unwrap_or_else(|e| e.into_inner());
         guard = g;
     }
-    guard.unwrap_or(false)
+    // 超时仍 None → (false, true) 兜底（dispatch 失败的语义，让 hover emitter 走"未知"路径）
+    guard.unwrap_or((false, true))
 }

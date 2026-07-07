@@ -756,10 +756,30 @@ async function init() {
   let rustPathActive = false;
   let rustHoveredCardId: string | null = null;
   let unlistenHover: UnlistenFn | null = null;
+  // **2026-07-03 fix（玻璃 2 秒后丢失问题）**：
+  // 之前同值去重（`lastHoverPayload === e.payload`）是无时间窗口的永久短路 —— 如果
+  // hover emitter 因 main thread 忙持续返 false 数十 tick，前端收到一次 false
+  // 后 lastHoverPayload=false 锁死，之后即使 hover emitter 恢复返 true
+  // （macOS 合成层重排期结束 ~1.5~3s 后），也会被 `lastHoverPayload === e.payload`
+  // 永久短路 → body[data-hover] 永远清不掉。
+  //
+  // 修复：dedup 加 800ms TTL。800ms 内同 payload 直接吞（防 hover emitter
+  // 边缘抖动反复 emit），超过 800ms 强制允许 emit，让 hover emitter 的真实
+  // 状态变化穿透 dedup。
+  //
+  // 800ms = 16 ticks（50ms × 16）—— 比 macOS 合成层重排稳定时间（~1.5~3s）
+  // 短，确保真恢复时能立即穿透；又比 hover emitter 边缘抖动窗口长，确保
+  // 真抖动被吞。
+  let lastHoverEmitAt = 0;
+  const HOVER_DEDUP_TTL_MS = 800;
   listen<boolean>("usticky://floating-hover", (e) => {
     if (e.payload && !pageVisible) return;
-    if (lastHoverPayload === e.payload) return;
+    const now = performance.now();
+    if (lastHoverPayload === e.payload && (now - lastHoverEmitAt) < HOVER_DEDUP_TTL_MS) {
+      return;
+    }
     lastHoverPayload = e.payload;
+    lastHoverEmitAt = now;
     // Rust 路径直接同步切（已经过 50ms tick 去抖）；cancel pending enter
     // timer（如果用户从 enter 进入但 40ms 内 Rust 也 emit true，按 Rust 为准）
     if (hoverEnterTimer !== null) {
