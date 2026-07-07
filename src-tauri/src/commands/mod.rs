@@ -131,13 +131,14 @@ pub async fn reorder_todos(
 // ── 浮窗控制 ──
 
 #[tauri::command]
-pub async fn show_floating_window(app: AppHandle) -> Result<(), String> {
-    // 标记非 quick-add 路径显示 —— 下次 hide 时不还原 level / activate prev app
-    crate::clear_quick_add_active();
-    if let Some(w) = app.get_webview_window("floating") {
-        w.show().map_err(|e| e.to_string())?;
-        w.set_focus().map_err(|e| e.to_string())?;
-    }
+pub async fn show_floating_window(
+    app: AppHandle,
+    store: State<'_, SharedStore>,
+) -> Result<(), String> {
+    // 走 quick_show_floating_window 路径（save prev app + raise + show + focus）——
+    // 不是裸的 show + focus。PinBottom 默认 mode 下裸 show 会停在 level=-1，
+    // 被任何 app 窗口盖住 → 用户"看不到浮窗"。dismiss 时按 pin mode 还原。
+    crate::quick_show_floating_window(&app, store.inner());
     Ok(())
 }
 
@@ -146,9 +147,8 @@ pub async fn hide_floating_window(
     app: AppHandle,
     store: State<'_, SharedStore>,
 ) -> Result<(), String> {
-    // 走统一的 dismiss 路径 —— 若处于 quick-add 临时置顶状态，要还原 level +
-    // 切回原 app。否则只 hide（tray toggle / 用户其他主动 hide 路径）。
-    crate::dismiss_floating_window(&app, store.inner());
+    // hide 路径：hide + restore level + activate prev app（仅当 QUICK_ADD_ACTIVE=true）
+    crate::hide_dismiss_floating_window(&app, store.inner());
     Ok(())
 }
 

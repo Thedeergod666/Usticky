@@ -37,13 +37,17 @@ pub type SharedStore = Arc<tokio::sync::RwLock<Store>>;
 
 /// 是否处于 "quick-add 临时置顶" 状态。
 ///
-/// true = 我们通过快捷键唤出了浮窗，需要 dismiss 时还原 level + 切回原 app。
-/// false = 浮窗隐藏 / 用户通过其他途径（tray toggle / 等）显示。
+/// true = 我们通过快捷键唤出了浮窗（已 raise 到 FLOATING + 焦点在输入框），
+///        dismiss 时需要还原 level。
+/// false = 浮窗处于其 pin mode 应有的 level（PinBottom/PinTop/Normal）。
 ///
-/// 切换语义（详见 lib.rs 顶部 doc）：
-///   - 快捷键 + !visible → save prev app + raise + show + focus + set true
-///   - 快捷键 + visible → hide + (若 true: 还原 level + activate prev app + set false)
-///   - hide_floating_window 命令 / tray toggle hide / Esc → 同"快捷键 + visible"分支
+/// 切换语义：
+///   - 快捷键 + !active → save prev app + raise + show + focus + set true
+///   - 快捷键 + active → toggle_dismiss（不隐藏，restore level + activate prev app + set false）
+///   - 窗口失焦（Focused(false)）+ active → blur_dismiss（不隐藏，仅 restore level + set false；
+///     不 activate prev app，因为用户已经点别处了，不该抢焦点回去）
+///   - hide_floating_window 命令 / tray toggle hide / Esc → hide_dismiss（隐藏 + restore level
+///     + activate prev app + set false）
 ///   - show_floating_window 命令 / tray toggle show → set false（清除残留状态）
 static QUICK_ADD_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -82,43 +86,83 @@ fn register_quick_add_shortcut(app: &tauri::AppHandle, store: &SharedStore) {
         if event.state() != ShortcutState::Pressed {
             return;
         }
-        // toggle 行为：
-        //   - 浮窗不可见 → 唤出（save prev app + raise + show + focus）
-        //   - 浮窗可见 → 隐藏 + 还原 level + 切回原 app
-        let Some(w) = app_handle.get_webview_window("floating") else { return };
-        let visible = w.is_visible().unwrap_or(false);
-        if !visible {
-            // ── show 分支 ──
-            // 顺序：save prev app → raise level → show → focus → emit
-            // raise 必须在 show 之前，否则 PinBottom 模式下浮窗先在 -1
-            // 显示一帧才升到 3，视觉上会闪一下被其他 app 盖住的画面
-            platform::save_previous_app_for_quick_add();
-            platform::raise_for_quick_add(&app_handle);
-            QUICK_ADD_ACTIVE.store(true, Ordering::SeqCst);
-            let _ = w.show();
-            let _ = w.set_focus();
-            let _ = app_handle.emit("usticky://quick-add", ());
-        } else {
-            // ── hide 分支 ──
-            dismiss_floating_window(&app_handle, &store_ref);
+        // toggle 行为（不隐藏浮窗）：
+        //   - !active → save prev app + raise + show + focus + set active
+        //   - active → restore level + activate prev app + clear active（窗口保持可见）
+        if QUICK_ADD_ACTIVE.load(Ordering::SeqCst) {
+            // ── toggle dismiss 分支 ──
+            // 不隐藏窗口，只还原 level + 切回原 app
+            toggle_dismiss_floating_window(&app_handle, &store_ref);
+            return;
         }
+        // ── show 分支 ──
+        quick_show_floating_window(&app_handle, &store_ref);
     }) {
         tracing::error!("on_shortcut failed: {}", e);
         let _ = app.emit("usticky://persist-failed", format!("register shortcut: {e}"));
     }
 }
 
-/// dismiss 浮窗：hide + 还原 level + 切回原 app（仅当 QUICK_ADD_ACTIVE=true）。
+/// 内部 helper：清 QUICK_ADD_ACTIVE 状态 + 还原 level（不隐藏、不 activate prev app）。
+/// 仅在 was_active=true 时做实际工作。
+fn clear_quick_add_state(app: &tauri::AppHandle, store: &SharedStore) {
+    let was_active = QUICK_ADD_ACTIVE.swap(false, Ordering::SeqCst);
+    if was_active {
+        let mode = store.blocking_read().pin_mode();
+        platform::restore_level_after_quick_add(app, mode);
+    }
+}
+
+/// "快速唤出"浮窗：save prev app + raise level + show + focus + 标记 active。
 ///
-/// 三个调用点：
-///   1. 快捷键 visible 分支
-///   2. `hide_floating_window` IPC 命令（前端 Esc 调它）
-///   3. tray toggle 的 hide 分支
+/// 被三个入口共用：
+///   - 全局快捷键 Cmd+Shift+Space（raise_for_quick_add 之前已配 setHidesOnDeactivate(false)）
+///   - tray 菜单 "Toggle floating window" 的 show 分支
+///   - `show_floating_window` IPC 命令（设置窗口"打开浮窗"按钮等场景）
 ///
-/// 顺序：hide → 还原 level（必须在 hide 之后，否则 PinBottom 模式下浮窗
+/// **为什么不是简单的 show() + set_focus()**：默认 PinBottom 模式 level=-1，
+/// 浮窗在 -1 显示但被任何 app 窗口盖住 → 用户"看不到浮窗"。先 raise 到 FLOATING
+/// 再 show，浮窗从 -1 升到 3 的过程不显示（hide 状态 → raise → show），视觉一致。
+///
+/// **跟 ESC / tray toggle hide 配合**：dismiss 时会读 QUICK_ADD_ACTIVE 决定是否
+/// 还原 level。tray 走 hide_dismiss（hide + restore + activate），其他走 blur_dismiss
+/// （仅 restore，不抢焦点）。
+pub fn quick_show_floating_window(app: &tauri::AppHandle, _store: &SharedStore) {
+    let Some(w) = app.get_webview_window("floating") else { return };
+    // save prev app 只在快捷键路径有意图（tray 主动唤起不需要切回原 app，
+    // activate_previous_app_after_quick_add 是 no-op 也不会报错 —— 但为了语义清晰，
+    // 这里仍然 save：tray hide 走 hide_dismiss 会 activate prev app，跟快捷键一致）
+    platform::save_previous_app_for_quick_add();
+    platform::raise_for_quick_add(app);
+    QUICK_ADD_ACTIVE.store(true, Ordering::SeqCst);
+    let _ = w.show();
+    let _ = w.set_focus();
+    let _ = app.emit("usticky://quick-add", ());
+}
+
+/// toggle dismiss（快捷键 2nd press 调）：不隐藏窗口，仅还原 level + 切回原 app。
+///
+/// 顺序：restore level → activate prev app。
+/// 注意：activate prev app 会让浮窗失焦 → 触发 Focused(false) 事件 →
+/// 但此时 QUICK_ADD_ACTIVE 已经是 false，blur_dismiss 是 no-op，不会重复处理。
+pub fn toggle_dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore) {
+    clear_quick_add_state(app, store);
+    platform::activate_previous_app_after_quick_add();
+}
+
+/// blur dismiss（窗口失焦事件调）：仅还原 level + 清状态。
+/// **不** activate prev app —— 用户已经点了别处，不该抢焦点回去。
+pub fn blur_dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore) {
+    clear_quick_add_state(app, store);
+}
+
+/// hide dismiss（hide_floating_window 命令 / tray toggle hide / Esc 调）：
+/// hide + 还原 level + 切回原 app。
+///
+/// 顺序：hide → restore level（必须在 hide 之后，否则 PinBottom 模式下浮窗
 /// 先从 FLOATING 降到 -1 还显示一帧才隐藏，视觉上会闪一下被其他 app 盖住的画面）
 /// → activate prev app。
-pub fn dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore) {
+pub fn hide_dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore) {
     let was_active = QUICK_ADD_ACTIVE.swap(false, Ordering::SeqCst);
     if let Some(w) = app.get_webview_window("floating") {
         let _ = w.hide();
@@ -135,6 +179,7 @@ pub fn dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore) {
 /// show 路径不主动激活 quick-add 模式 —— 只有快捷键才走 raise + save prev app。
 /// 但要清除残留的 QUICK_ADD_ACTIVE=true 状态，防止下次 hide 时误以为是我们
 /// raise 的、去做无意义的 restore + activate。
+#[allow(dead_code)]
 pub fn clear_quick_add_active() {
     QUICK_ADD_ACTIVE.store(false, Ordering::SeqCst);
 }
@@ -261,6 +306,15 @@ pub fn run() {
                         // 点 X 不退出 app，浮窗进 hide 状态（Musage 经验）
                         api.prevent_close();
                         let _ = window_for_close.hide();
+                    }
+                    tauri::WindowEvent::Focused(false) => {
+                        // 浮窗失焦 —— 若处于 quick-add 临时置顶状态，还原 level
+                        // （**不** activate prev app：用户已经点了别处，不该抢焦点回去）
+                        let app = app_handle_geom.clone();
+                        let store = store_for_geom.clone();
+                        tauri::async_runtime::spawn(async move {
+                            blur_dismiss_floating_window(&app, &store);
+                        });
                     }
                     _ => {}
                 });
