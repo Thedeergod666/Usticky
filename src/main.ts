@@ -895,6 +895,36 @@ async function init() {
     .then((fn) => (unlistenHoverPos = fn))
     .catch((e) => console.error("[usticky] listen floating-hover-pos failed", e));
 
+  // ── Backdrop refresh (L3 修复) ──
+  // Rust 端在 set_window_level（level 切换）后 emit `usticky://backdrop-reflow`，
+  // 前端给所有 .todo-card / .todo-input 加 .force-reflow class
+  // (filter: drop-shadow 微动 → paint invalidation → backdrop layer 重采样)，
+  // 击穿 macOS WKWebView ~2s 的 sample 失效窗口。
+  //
+  // 击穿机制：
+  //   - level 切换 → WKWebView 旧 backdrop sample 失效
+  //   - 通常 ~2s 后 WebKit 才重新计算 sample（用户看到"2 秒丢失"）
+  //   - 我们在切换后立刻强制 paint invalidation，WebKit 必须立即重采样
+  //   - .force-reflow class 持续 100ms 后移除（视觉几乎不可见）
+  //
+  // 注意：前端这个修复跟 Rust 的 hover emitter dispatch 抖动修复（4 层 那个）
+  // 是**正交的**——前者解决 sample 失效（物理层），后者解决 hover 状态机
+  // 误触发 CSS 切换（逻辑层）。两者一起叠，玻璃质感稳定。
+  let backdropRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let unlistenBackdropRefresh: UnlistenFn | null = null;
+  listen("usticky://backdrop-refresh", () => {
+    if (backdropRefreshTimer !== null) clearTimeout(backdropRefreshTimer);
+    const targets = app.querySelectorAll<HTMLElement>(".todo-card, .todo-input");
+    targets.forEach((el) => el.classList.add("force-reflow"));
+    backdropRefreshTimer = setTimeout(() => {
+      backdropRefreshTimer = null;
+      app.querySelectorAll<HTMLElement>(".todo-card.force-reflow, .todo-input.force-reflow")
+        .forEach((el) => el.classList.remove("force-reflow"));
+    }, 100);
+  })
+    .then((fn) => (unlistenBackdropRefresh = fn))
+    .catch((e) => console.error("[usticky] listen backdrop-refresh failed", e));
+
   // ── 渲染输入区（常驻） ──
   // 在拉 quick_add_shortcut 之前调，确保 hint 元素存在；拉到 shortcut 后再 updateInputHint 刷
   ensureInputBar();
@@ -1032,6 +1062,7 @@ async function init() {
     unlistenHoverPos?.();
     unlistenMoved?.();
     unlistenShortcut?.();
+    unlistenBackdropRefresh?.();
     cleanupSortables();
     // 摘掉 hover listener（setHoverAttr 路径，命名引用）
     document.body.removeEventListener("mouseenter", onBodyMouseEnter);

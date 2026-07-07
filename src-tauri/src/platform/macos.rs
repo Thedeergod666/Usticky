@@ -410,6 +410,13 @@ pub fn set_window_level<R: Runtime>(
             }
         }
     });
+    // **2026-07-03 fix（玻璃 2 秒丢失 — L3 修复）**：
+    // macOS WKWebView 对非 key / 透明 / backdrop-filter 窗口有合成层节流，
+    // level 切换时 sample 因 z-order 变化失效，约 2s 后才被重新计算。
+    // 这里 emit 事件让前端立刻 force reflow 击穿 2s 失效窗口。
+    // 前端会短时给 .todo-card / .todo-input 加 .force-reflow class（filter 微动
+    // → paint invalidation → backdrop layer 重采样），0.1s 后移除。
+    let _ = app.emit("usticky://backdrop-refresh", ());
 }
 
 /// 命中测试：鼠标在 `point` 处时，浮窗是否是**最上层**窗口。

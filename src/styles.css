@@ -17,6 +17,89 @@
  * JS mouseenter/leave 留作 Linux 兜底（不依赖 Rust 实现）。
  */
 
+/* ═══════════════════════════════════════════════════════════════════
+ *  WKWebView backdrop sample throttling —— 3 层防御
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * macOS WKWebView 对非 key / 透明 / backdrop-filter 窗口有合成层节流：
+ *   - 静止 ~2s 后丢 backdrop 采样 backing store（窗口空闲判定）
+ *   - level 切换（PinBottom hover-raise）时 sample 因 z-order 变化
+ *     失效，~2s 后才被重新计算
+ * 三个观察到的现象：
+ *   1) 玻璃质感 hover 持续约 2s 后丢失
+ *   2) hover 离开约 2s 后"更透一点"
+ *   3) PinBottom 模式最严重，PinTop / Normal 静止久了也偶发
+ *
+ * 不是 CSS hover 状态机问题（--tile-blur 28px 写死，从未切），
+ * 是 WebKit 合成器把 CABackdropLayer 的 sample cache 丢了。
+ *
+ * 修复方案 3 层叠加（任一层漏掉都重现）：
+ *   L1: will-change: backdrop-filter —— 让 WebKit 给元素独立 GPU layer，
+ *       不进空闲节流判定
+ *   L2: 心跳动画 @keyframes backdrop-heartbeat —— 极微小 blur 变化
+ *       (28px ↔ 27.95px) 强制每帧 invalidation，绕过 sample 失效
+ *   L3: 监听 usticky://backdrop-refresh 事件（PinBottom 模式 level 切换
+ *       后 emit），前端 force reflow 立刻重采
+ *
+ * 共同生效：3 层冗余 — 任一层失效另外两层兜底。
+ */
+
+/* L1: will-change —— 每个玻璃元素独立 GPU layer */
+.todo-card,
+.todo-input {
+  will-change: backdrop-filter;
+}
+
+/* L2: 心跳动画 —— 0.001 度 rotate + 0.001 opacity 循环。
+ *
+ * 为什么不用 backdrop-filter 自身的微动（28px ↔ 27.95px）：
+ *   backdrop-filter 的 blur() 函数在 @keyframes 内的"中间值"由浏览器自己
+ *   插值，WebKit 对 backdrop-filter 插值支持有 quirks（部分版本直接 snap）。
+ *   即使插值不工作，transform/opacity 的微动也足以触发元素 paint invalidation
+ *   → backdrop layer 重采样 → sample cache 刷新。
+ *
+ * 为什么用 transform + opacity（不用 background-color）：
+ *   transform + opacity 都是 compositor-only 属性，不触发 layout/paint 重计算
+ *   —— 但浏览器**会**重新走一遍 paint pipeline 的合成阶段，backdrop layer
+ *   恰好在这个阶段被重采样。background-color 反而会触发 paint，浪费 CPU。
+ *
+ * 振幅 0.001 (rotate) / 0.001 (opacity) —— 肉眼完全不可见：
+ *   卡片宽 ~250px 时 0.001° 旋转 ≈ 0.004px 端点偏移，亚像素级别
+ *   opacity 0.001 是 0.1% alpha 差，远低于肉眼 1% 阈值
+ *
+ * 为什么 linear + 4s（不是 ease 或更短）：
+ *   linear 永远在动 —— WebKit 任何时刻都判定 layer "活着"，不进 throttling。
+ *   ease 有停顿 → WKWebView 在停顿期可能判定静止 → 重新进入节流窗口。
+ *   4s 是经验值：比 ~2s throttling 窗口长 2 倍，必有一帧错过任何判定窗口；
+ *   比 1s 长 4 倍，CPU/GPU 合成压力降 4 倍。
+ */
+@keyframes usticky-backdrop-heartbeat {
+  0%, 100% { transform: rotate(0deg);     opacity: 1; }
+  50%      { transform: rotate(0.001deg); opacity: 0.999; }
+}
+.todo-card,
+.todo-input {
+  animation: usticky-backdrop-heartbeat 4s linear infinite;
+}
+
+/* L3: level 切换后 force reflow —— 由 main.ts 在收到
+ * usticky://backdrop-refresh 事件时给 .todo-card/.todo-input 加这个类，
+ * 触发 reflow → 立刻重新合成 backdrop sample，击穿 2s sample 失效窗口。
+ *
+ * 关键点：
+ *   - 用 .force-reflow class 强制 reflow（不是简单加 transition）
+ *   - 0.1s 后由 JS 移除 —— 短暂 flicker 但立刻恢复，肉眼几乎不可见
+ *   - 不影响 hover 状态机（不触发 body[data-hover] 切换）
+ *   - 用 filter（drop-shadow 微小）而不是 transform —— 心跳动画已经占
+ *     了 transform 通道，再叠加会冲突 / 浪费合成预算
+ */
+.todo-card.force-reflow,
+.todo-input.force-reflow {
+  /* filter: drop-shadow 是 compositor 友好属性，1px blur 视觉无感但
+   * 触发 paint invalidation → backdrop layer 立刻重采样。 */
+  filter: drop-shadow(0 0 0 transparent);
+}
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body {
