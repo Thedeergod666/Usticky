@@ -194,12 +194,15 @@ function cssEscape(s: string): string {
 /// `document.elementFromPoint`。
 ///
 /// 跨平台 Y 轴差异：
-///   - **macOS**：`NSEvent.mouseLocation()` 是 bottom-left origin，跟 CSS
-///     `elementFromPoint` 期待的 top-left 反着。要先 `screenH - y` 翻一次。
+///   - **macOS**：`NSEvent.mouseLocation()` 是 bottom-left origin，
+///     跟 CSS `elementFromPoint` 期待的 top-left 反着。要先 `screenH - y`
+///     翻一次。**用 `screen.height`（full screen）而不是 `availHeight`
+///     （work area）** —— mouseLocation 用 full screen 坐标系（含 menu bar），
+///     但 Tauri `innerPosition` 用 work area 坐标系（去掉 menu bar）。两个
+///     基准一起用 flip 才准确：full screen 翻一次 → work area，再减 work
+///     area 位置的 innerPosition = relativeY。
 ///   - **Win**：`GetCursorPos` 已是 top-left origin 且 Rust 已转 logical，
 ///     直接用。
-///
-/// `screenH` 用 `window.screen.availHeight`（CSS logical px）保持坐标系一致。
 function screenToViewportCoords(
   screenX: number,
   screenY: number,
@@ -208,8 +211,10 @@ function screenToViewportCoords(
 ): { x: number; y: number } {
   const isMac = /mac/i.test(navigator.platform);
   if (isMac) {
-    const screenH = window.screen?.availHeight ?? window.innerHeight;
-    return { x: screenX - winX, y: screenH - screenY - winY };
+    // screen.height（full screen，含 menu bar）= mouseLocation 的基准。
+    // 翻转后拿到 work area 坐标系的 top-left Y，再减 work area 的 innerPosition。
+    const fullScreenH = window.screen?.height ?? window.innerHeight;
+    return { x: screenX - winX, y: fullScreenH - screenY - winY };
   }
   return { x: screenX - winX, y: screenY - winY };
 }
@@ -744,6 +749,12 @@ async function init() {
   //     **不挡 payload=true**：un-focused 浮窗的合法 hover 由 Rust 路径触发。
   //     失焦时 `onFocusChanged` 主动 setHoverAttr(false) 已清状态；visibility
   //     hidden 时 pageVisible=false 守卫挡掉。focus check 已被证明是 bug。
+
+  // Rust 路径状态机：由 `usticky://floating-hover` 的 inside edge 驱动，
+  // **不**依赖 `windowFocused`（PinBottom 默认 mode 下 macOS 不派 focus
+  // change 事件，初值错了会让 Rust 路径永远短路）。
+  let rustPathActive = false;
+  let rustHoveredCardId: string | null = null;
   let unlistenHover: UnlistenFn | null = null;
   listen<boolean>("usticky://floating-hover", (e) => {
     if (e.payload && !pageVisible) return;
@@ -756,8 +767,8 @@ async function init() {
       hoverEnterTimer = null;
     }
     setHoverAttr(e.payload);
-    // hover=false edge：如果是 Rust 路径展开的卡（未聚焦时），收最后一张。
-    // 聚焦态下 mouseenter/leave 自己派，这里 no-op（lastHoveredCardId=null）。
+    // Rust 路径激活 / 收尾
+    rustPathActive = e.payload;
     if (!e.payload && rustHoveredCardId !== null) {
       const oldId = rustHoveredCardId;
       rustHoveredCardId = null;
@@ -782,49 +793,53 @@ async function init() {
   //
   // 频率 50ms × ~20Hz，每 tick 调一次 elementFromPoint。开销 ~微秒，
   // 不会触发任何 layout（elementFromPoint 走 hit test 不强制 reflow）。
+  //
+  // **激活判定**：由 `usticky://floating-hover` 的 inside edge 控制
+  // `rustPathActive`（声明在前面的 listener 块），**不再依赖 `windowFocused`**
+  // —— PinBottom 默认 mode 下浮窗被其他 app 盖住时 macOS 不派 focus change
+  // 事件，初值 `true` 会让 Rust 路径永远短路。Rust emitter 50ms tick 自己
+  // 判 topmost 是更准的"鼠标是否在浮窗未被遮挡区域"信号。
   let unlistenHoverPos: UnlistenFn | null = null;
-  let rustHoveredCardId: string | null = null;
-  let windowFocused = true;
-  // 跟踪 onFocusChanged（用现有的 wForFocus 实例）
-  wForFocus
-    .onFocusChanged(({ payload: f }) => {
-      windowFocused = f;
-    })
-    .catch(() => {});
-  listen<{ x: number; y: number }>("usticky://floating-hover-pos", async (e) => {
-    // 聚焦时浏览器自己派 mouseenter，Rust 路径是冗余的。短路掉，避免
-    // 在 Rust 信号跟浏览器信号之间出现抖动（用户快速点浮窗内/外时）。
-    if (windowFocused) return;
-    if (!pageVisible) return;
-    const appEl = document.getElementById("app");
-    if (!appEl) return;
-
-    // 屏幕 logical px → viewport logical px。Tauri 2 innerPosition() 返
-    // PhysicalPosition（top-left origin），需要除 scale 拿 logical，
-    // 跟 Rust 发的 logical px 在同一坐标系。
-    //
-    // **跨平台 Y 轴语义差**：
-    //   - macOS：`NSEvent::mouseLocation()` 是 **bottom-left origin**
-    //   - Win：`GetCursorPos` 是 top-left origin（Rust 已除 scale）
-    //   - CSS `elementFromPoint`：top-left origin
-    // `screenToViewportCoords` 统一在 macOS 上翻一次。
-    let winX = 0;
-    let winY = 0;
+  // 缓存浮窗位置 + scale。50ms × 20Hz 持续 hover-pos 时反复
+  // `await innerPosition()` 是浪费 IPC，只在 onMoved 时刷新。
+  let cachedWinX = 0;
+  let cachedWinY = 0;
+  let unlistenMoved: UnlistenFn | null = null;
+  (async () => {
     try {
       const [pos, scale] = await Promise.all([
         wForFocus.innerPosition(),
         wForFocus.scaleFactor(),
       ]);
-      winX = pos.x / scale;
-      winY = pos.y / scale;
+      cachedWinX = pos.x / scale;
+      cachedWinY = pos.y / scale;
     } catch {
-      return;
+      /* fallback to 0/0 */
     }
+  })();
+  wForFocus
+    .onMoved(() => {
+      Promise.all([wForFocus.innerPosition(), wForFocus.scaleFactor()])
+        .then(([pos, scale]) => {
+          cachedWinX = pos.x / scale;
+          cachedWinY = pos.y / scale;
+        })
+        .catch(() => {});
+    })
+    .then((fn) => (unlistenMoved = fn))
+    .catch(() => {});
+
+  listen<{ x: number; y: number }>("usticky://floating-hover-pos", (e) => {
+    if (!rustPathActive) return;
+    if (!pageVisible) return;
+    const appEl = document.getElementById("app");
+    if (!appEl) return;
+
     const { x: relX, y: relY } = screenToViewportCoords(
       e.payload.x,
       e.payload.y,
-      winX,
-      winY,
+      cachedWinX,
+      cachedWinY,
     );
     if (relX < 0 || relY < 0) {
       // Rust 报 inside=true 但坐标落在浮窗外（极少见，理论上 windowNumberAtPoint
@@ -841,7 +856,6 @@ async function init() {
     }
 
     // elementFromPoint 走 hit-test 不强制 layout；viewport 坐标 = viewport-relative。
-    // elementsFromScope 用 * 让穿透浮窗边界也能查（不要穿透）。
     const el = document.elementFromPoint(relX, relY);
     const card = el?.closest<HTMLElement>(".todo-card") ?? null;
     const newId = card?.dataset.todoId ?? null;
@@ -996,6 +1010,7 @@ async function init() {
     unlistenLocale?.();
     unlistenHover?.();
     unlistenHoverPos?.();
+    unlistenMoved?.();
     unlistenShortcut?.();
     cleanupSortables();
     // 摘掉 hover listener（setHoverAttr 路径，命名引用）
