@@ -82,11 +82,86 @@ function formatShortcutForDisplay(s: string): string {
   return out;
 }
 
+/// 最窄档（tier 2）专用的图标版快捷键：只保留 modifier，去掉 key letter。
+/// `Cmd+Shift+Space` → `⌘⇧`（省 ~14px 字符宽度，让 240px 浮窗能 fit）。
+/// 非 Mac 平台：直接去掉最后一截 key（保留修饰键文本），跟 macOS icon 版语义对齐。
+function formatShortcutIcon(s: string): string {
+  const isMac = /mac/i.test(navigator.platform);
+  if (!isMac) {
+    const parts = s.split("+").map((p) => p.trim());
+    // 保留所有 modifier，丢掉最后一截 key 字母
+    return parts.slice(0, -1).join("+");
+  }
+  // Mac：复用 full 版的格式器，但跳过最后一个 part（key 字母）
+  const parts = s.split("+").map((p) => p.trim());
+  let out = "";
+  for (let i = 0; i < parts.length - 1; i++) {
+    const p = parts[i];
+    switch (p.toLowerCase()) {
+      case "cmd": case "command": case "super": case "meta":
+      case "cmdorctrl": case "cmdorcontrol":
+      case "commandorctrl": case "commandorcontrol":
+        out += "⌘"; break;
+      case "ctrl": case "control":
+        out += "⌃"; break;
+      case "shift":
+        out += "⇧"; break;
+      case "alt": case "option": case "opt":
+        out += "⌥"; break;
+      default:
+        out += p;  // 非 modifier 也不该出现，防御性保留
+    }
+  }
+  return out;
+}
+
+/// 浮窗宽度的"窄窗档位"（CSS 据此调 hint 字号 / 文字 / 容器 padding）。
+type NarrowTier = 0 | 1 | 2;
+
+/// 浮窗宽度档位阈值（px）。
+///
+///  - tier 0（正常，≥ COMPACT_THRESHOLD）：hint = 10px + 背景框 + '⌘⇧Space'
+///  - tier 1（紧凑，ICON_THRESHOLD ≤ w < COMPACT_THRESHOLD）：
+///          hint = 9px + 无背景 + '⌘⇧Space'（省 ~14px）
+///  - tier 2（图标，w < ICON_THRESHOLD）：
+///          hint = 9px + 无背景 + '⌘⇧'（去掉 'Space' 文字，再省 ~20px）
+///
+/// ICON_THRESHOLD = minWidth 240：浮窗到最窄时 hint 必成图标版（否则必挤）。
+/// COMPACT_THRESHOLD = 280：minWidth 240 + 40px 余量，给紧凑档提供触发空间。
+const COMPACT_THRESHOLD = 280;
+const ICON_THRESHOLD = 240;
+
+/// 算当前宽度的档位。
+function computeNarrowTier(): NarrowTier {
+  const w = window.innerWidth;
+  if (w < ICON_THRESHOLD) return 2;
+  if (w < COMPACT_THRESHOLD) return 1;
+  return 0;
+}
+
 /// 把 input hint 刷成 currentShortcut 的展示形式。
-/// 在启动拉到 shortcut 后 + shortcut-changed 事件触发时调用。
-function updateInputHint() {
+/// tier=2 时用图标版（`⌘⇧` 去 'Space'）省最宽档的字符。
+/// tier=0/1 用完整版（`⌘⇧Space`）保信息密度。
+function updateInputHint(tier: NarrowTier = 0) {
   const hint = app.querySelector<HTMLElement>(".todo-input-hint");
-  if (hint) hint.textContent = formatShortcutForDisplay(currentShortcut);
+  if (hint) {
+    hint.textContent = tier === 2
+      ? formatShortcutIcon(currentShortcut)
+      : formatShortcutForDisplay(currentShortcut);
+  }
+}
+
+/// 根据 `window.innerWidth` 切档：设 `body[data-narrow]` 触发 CSS，
+/// 同时调 `updateInputHint(tier)` 切文字（tier 2 时 hint 变 `⌘⇧`）。
+///
+/// 三档策略：
+///   - 不用 display:none 隐藏 hint（用户期望"图标不被挤压"）
+///   - 不到最窄不用 '⌘⇧' 简写（'⌘⇧Space' 才是完整信息）
+///   - input 字号不变（用户已习惯 13px + 占位符宽度节奏）
+function syncNarrowMode() {
+  const tier = computeNarrowTier();
+  document.body.dataset.narrow = tier === 0 ? "" : String(tier);
+  updateInputHint(tier);
 }
 
 // ── mini flash（复用 Musage 模式） ──
@@ -537,6 +612,15 @@ async function init() {
       if (!f) setHoverAttr(false);
     })
     .catch(() => {});
+  // 窗口 resize → 重新评估 narrow 档位（hint 字号 / 文字 / 容器 padding 联动）。
+  // Tauri resize 事件在拖完边放手后派发一次（不是连发），不需要 debounce。
+  // 启动时也调一次确保正确初始态（用户启动时窗口可能 = minWidth 240px）。
+  wForFocus
+    .onResized(() => {
+      syncNarrowMode();
+    })
+    .catch(() => {});
+  syncNarrowMode();
   document.addEventListener("visibilitychange", () => {
     pageVisible = document.visibilityState === "visible";
     if (!pageVisible) setHoverAttr(false);
@@ -600,7 +684,8 @@ async function init() {
   // ── 启动时拉一次 quick-add 快捷键 —— input hint 用 ──
   try {
     currentShortcut = await invoke<string>("get_quick_add_shortcut");
-    updateInputHint();
+    // 用当前档位刷（窗口可能已经窄到 tier 2，hint 文字应是 '⌘⇧'）
+    updateInputHint(computeNarrowTier());
   } catch (e) {
     console.error("[usticky] get_quick_add_shortcut failed", e);
   }
@@ -642,7 +727,8 @@ async function init() {
   listen<string>("usticky://shortcut-changed", (e) => {
     if (e.payload !== currentShortcut) {
       currentShortcut = e.payload;
-      updateInputHint();
+      // 用当前档位刷（tier 2 时 hint 变 '⌘⇧'，不能用默认 0）
+      updateInputHint(computeNarrowTier());
     }
   })
     .then((fn) => (unlistenShortcut = fn))

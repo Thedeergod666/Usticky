@@ -335,7 +335,46 @@ body[data-hover] #app .todo-due.days     { color: var(--c-data-cyan);  backgroun
   border-radius: 4px;
   background: rgba(255, 255, 255, 0.08);
   letter-spacing: 0.2px;
+  white-space: nowrap;  /* 防止 hint 文字本身被换行（防御性，默认 inline 不会换） */
 }
+
+/* 窄窗模式（两档）：
+ *
+ *   正常（≥ 280）→ 10px 字号 + 背景框 + 2px/6px padding（iOS 26 胶囊质感）
+ *   紧凑（< 280）→ 9px 字号 + 无背景 + 1px/4px padding，省 ~14px
+ *   图标（< 240）→ 9px 字号 + 无背景 + 0 padding + gap 缩到 4px，
+ *                  hint 内容裁到 '⌘⇧'（去 Space 文字），最窄档。
+ *
+ * 阈值：
+ *   280 = minWidth 240 + 40px 余量，给紧凑档提供触发空间
+ *   240 = minWidth 边界，浮窗到最窄时 hint 必成图标版（否则必挤）
+ *
+ * 由 main.ts 的 syncNarrowMode() 根据 window.innerWidth 设
+ * body[data-narrow] = "" / "1" / "2" 触发。
+ *
+ * 三档取舍：
+ *   - 不用 display:none 隐藏 hint（用户期望"图标不被挤压"）
+ *   - 不到最窄不用 '⌘⇧' 简写（'⌘⇧Space' 才是完整信息）
+ *   - input 字号不变（用户已习惯 13px + 占位符宽度节奏） */
+body[data-narrow="1"] .todo-input-hint {
+  font-size: 9px;
+  font-weight: 500;
+  padding: 1px 4px;
+  background: transparent;
+  border-radius: 3px;
+  letter-spacing: 0;
+}
+body[data-narrow="1"] .todo-input { gap: 6px; }
+
+body[data-narrow="2"] .todo-input-hint {
+  font-size: 9px;
+  font-weight: 500;
+  padding: 1px 2px;
+  background: transparent;
+  border-radius: 2px;
+  letter-spacing: 0;
+}
+body[data-narrow="2"] .todo-input { gap: 4px; padding: 8px 8px; }
 
 /* ── Section header (Pending / Done) ── */
 .section-header {
