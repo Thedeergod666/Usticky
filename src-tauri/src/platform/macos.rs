@@ -17,8 +17,17 @@
 //! - 状态变化时：
 //!   - 永远 `app.emit("usticky://floating-hover", inside)` 给前端
 //!     （前端拿来切 `body[data-hover]` 属性，驱动 CSS）
+//!   - `inside=true` 时**额外** `app.emit("usticky://floating-hover-pos", {x, y})`
+//!     给前端拿鼠标坐标走 `elementFromPoint` 找命中哪张 todo-card ——
+//!     未聚焦时 WebKit 不派 mouseenter，title-expand 必须靠这条路径
 //!   - 当 [`LEVEL_SWITCHING_ACTIVE`] 为 true（PinBottom 模式）时**额外**切 NSWindow level
 //!     —— 这是 PinBottom 模式"hover 临时置顶"的实现路径
+//!
+//! ## 鼠标坐标语义
+//!
+//! 发的坐标是 macOS screen-space logical points（NSEvent.mouseLocation 原生返回，
+//! bottom-left origin）。前端要做 Y 翻转（macOS 是 bottom-left，CSS 是 top-left）
+//! 再喂 `elementFromPoint`。单位已经是 logical（CSS px），前端不需要再除 dpr。
 //!
 //! ## 三个 level 常量
 //!
@@ -171,6 +180,16 @@ pub fn restore_level_after_quick_add<R: Runtime>(app: &AppHandle<R>, mode: PinMo
     }
 }
 
+/// 浮窗内鼠标坐标 payload，发到前端驱动 `elementFromPoint`。
+///
+/// 坐标系 = macOS screen-space logical points（= CSS px，前端不再除 dpr）。
+/// macOS 是 bottom-left origin，前端收到要做 Y 翻转才能喂 elementFromPoint。
+#[derive(serde::Serialize, Clone, Copy)]
+struct HoverPos {
+    x: f64,
+    y: f64,
+}
+
 /// 启动 hover emitter 线程。idempotent —— 第二次调用立即返回。
 /// 由 lib.rs setup() 调一次即可。启动后整个 app 生命周期不停。20Hz 轮询。
 ///
@@ -230,6 +249,19 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 
                 if inside == last_inside {
                     pending_ticks = 0;
+                    // inside 没变（持续在浮窗内 or 持续在浮窗外），但若当前
+                    // 持续在浮窗内，鼠标坐标可能在卡 A→卡 B 之间移动 →
+                    // 每 tick 都发 hover-pos，让前端 elementFromPoint 跟踪命中
+                    // 的 todo-card。body[data-hover] 玻璃色只需要 edge trigger，
+                    // 不在每 tick emit 避免 CSS spring 反复重置起始点。
+                    if inside {
+                        if let Err(e) = app.emit(
+                            "usticky://floating-hover-pos",
+                            HoverPos { x: mouse.x, y: mouse.y },
+                        ) {
+                            tracing::trace!(error = %e, "emit hover-pos 失败");
+                        }
+                    }
                     continue;
                 }
 
@@ -258,7 +290,20 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                     tracing::trace!(error = %e, "emit hover 失败");
                 }
 
-                // (2) PinBottom 模式：同步切 NSWindow level
+                // (2) 进入浮窗时（edge-trigger）补一发 hover-pos，让前端在
+                // 未聚焦场景下第一帧就有坐标可喂 elementFromPoint。
+                // 持续在浮窗内的卡间切换走上面 if inside { ... continue } 的
+                // 每 tick emit。
+                if inside {
+                    if let Err(e) = app.emit(
+                        "usticky://floating-hover-pos",
+                        HoverPos { x: mouse.x, y: mouse.y },
+                    ) {
+                        tracing::trace!(error = %e, "emit hover-pos 失败");
+                    }
+                }
+
+                // (3) PinBottom 模式：同步切 NSWindow level
                 if LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst) {
                     let level = if inside {
                         LEVEL_FLOATING

@@ -190,6 +190,30 @@ function cssEscape(s: string): string {
   return s.replace(/([!"#$%&'()*+,./:;<=>?@[\]^`{|}~])/g, "\\$1");
 }
 
+/// 把 Rust 上报的屏幕 logical 坐标转成 viewport 相对坐标，再喂给
+/// `document.elementFromPoint`。
+///
+/// 跨平台 Y 轴差异：
+///   - **macOS**：`NSEvent.mouseLocation()` 是 bottom-left origin，跟 CSS
+///     `elementFromPoint` 期待的 top-left 反着。要先 `screenH - y` 翻一次。
+///   - **Win**：`GetCursorPos` 已是 top-left origin 且 Rust 已转 logical，
+///     直接用。
+///
+/// `screenH` 用 `window.screen.availHeight`（CSS logical px）保持坐标系一致。
+function screenToViewportCoords(
+  screenX: number,
+  screenY: number,
+  winX: number,
+  winY: number,
+): { x: number; y: number } {
+  const isMac = /mac/i.test(navigator.platform);
+  if (isMac) {
+    const screenH = window.screen?.availHeight ?? window.innerHeight;
+    return { x: screenX - winX, y: screenH - screenY - winY };
+  }
+  return { x: screenX - winX, y: screenY - winY };
+}
+
 /// 内容指纹 —— 只看结构维度（todo 数 / 状态 / due），不看 title 文本。
 /// title 改了 → 不触发 autoResize（保持用户手动尺寸）
 function contentFingerprint(snap: TodoSnapshot): string {
@@ -732,9 +756,110 @@ async function init() {
       hoverEnterTimer = null;
     }
     setHoverAttr(e.payload);
+    // hover=false edge：如果是 Rust 路径展开的卡（未聚焦时），收最后一张。
+    // 聚焦态下 mouseenter/leave 自己派，这里 no-op（lastHoveredCardId=null）。
+    if (!e.payload && rustHoveredCardId !== null) {
+      const oldId = rustHoveredCardId;
+      rustHoveredCardId = null;
+      const old = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(oldId)}"]`);
+      if (old) scheduleHoverResize(old, false);
+    }
   })
     .then((fn) => (unlistenHover = fn))
     .catch((e) => console.error("[usticky] listen floating-hover failed", e));
+
+  // ── 未聚焦时 per-card hover：Rust 50ms tick emit 鼠标屏幕坐标 ──
+  //
+  // 聚焦时 WebView 自己派 mouseenter/leave，已经驱动 scheduleHoverResize。
+  // 未聚焦时 WKWebView 不派 mouseenter，必须靠这条路径：拿到屏幕 logical
+  // 坐标 → 转 viewport logical 坐标 → document.elementFromPoint → 命中
+  // 哪张 .todo-card → scheduleHoverResize(true)。
+  //
+  // 跟 body[data-hover] 玻璃色的关系：
+  //   - body[data-hover] 用 usticky://floating-hover（edge-trigger，每 tick 不发）
+  //   - per-card title-expand 用 usticky://floating-hover-pos（inside=true 每 tick 发）
+  //   两条独立 —— 玻璃色只看 in/out boundary，title-expand 要跟踪卡间切换。
+  //
+  // 频率 50ms × ~20Hz，每 tick 调一次 elementFromPoint。开销 ~微秒，
+  // 不会触发任何 layout（elementFromPoint 走 hit test 不强制 reflow）。
+  let unlistenHoverPos: UnlistenFn | null = null;
+  let rustHoveredCardId: string | null = null;
+  let windowFocused = true;
+  // 跟踪 onFocusChanged（用现有的 wForFocus 实例）
+  wForFocus
+    .onFocusChanged(({ payload: f }) => {
+      windowFocused = f;
+    })
+    .catch(() => {});
+  listen<{ x: number; y: number }>("usticky://floating-hover-pos", async (e) => {
+    // 聚焦时浏览器自己派 mouseenter，Rust 路径是冗余的。短路掉，避免
+    // 在 Rust 信号跟浏览器信号之间出现抖动（用户快速点浮窗内/外时）。
+    if (windowFocused) return;
+    if (!pageVisible) return;
+    const appEl = document.getElementById("app");
+    if (!appEl) return;
+
+    // 屏幕 logical px → viewport logical px。Tauri 2 innerPosition() 返
+    // PhysicalPosition（top-left origin），需要除 scale 拿 logical，
+    // 跟 Rust 发的 logical px 在同一坐标系。
+    //
+    // **跨平台 Y 轴语义差**：
+    //   - macOS：`NSEvent::mouseLocation()` 是 **bottom-left origin**
+    //   - Win：`GetCursorPos` 是 top-left origin（Rust 已除 scale）
+    //   - CSS `elementFromPoint`：top-left origin
+    // `screenToViewportCoords` 统一在 macOS 上翻一次。
+    let winX = 0;
+    let winY = 0;
+    try {
+      const [pos, scale] = await Promise.all([
+        wForFocus.innerPosition(),
+        wForFocus.scaleFactor(),
+      ]);
+      winX = pos.x / scale;
+      winY = pos.y / scale;
+    } catch {
+      return;
+    }
+    const { x: relX, y: relY } = screenToViewportCoords(
+      e.payload.x,
+      e.payload.y,
+      winX,
+      winY,
+    );
+    if (relX < 0 || relY < 0) {
+      // Rust 报 inside=true 但坐标落在浮窗外（极少见，理论上 windowNumberAtPoint
+      // 命中浮窗就一定在 frame 内），保守视为"没命中卡"。
+      if (rustHoveredCardId !== null) {
+        const oldId = rustHoveredCardId;
+        rustHoveredCardId = null;
+        const old = appEl.querySelector<HTMLElement>(
+          `.todo-card[data-todo-id="${cssEscape(oldId)}"]`,
+        );
+        if (old) scheduleHoverResize(old, false);
+      }
+      return;
+    }
+
+    // elementFromPoint 走 hit-test 不强制 layout；viewport 坐标 = viewport-relative。
+    // elementsFromScope 用 * 让穿透浮窗边界也能查（不要穿透）。
+    const el = document.elementFromPoint(relX, relY);
+    const card = el?.closest<HTMLElement>(".todo-card") ?? null;
+    const newId = card?.dataset.todoId ?? null;
+    if (newId === rustHoveredCardId) return; // 还在同一张卡上
+
+    // 卡切换 / 卡→空白：收起上一张，展开新一张（如果有）
+    if (rustHoveredCardId !== null) {
+      const oldId = rustHoveredCardId;
+      const old = appEl.querySelector<HTMLElement>(
+        `.todo-card[data-todo-id="${cssEscape(oldId)}"]`,
+      );
+      if (old) scheduleHoverResize(old, false);
+    }
+    rustHoveredCardId = newId;
+    if (card && newId) scheduleHoverResize(card, true);
+  })
+    .then((fn) => (unlistenHoverPos = fn))
+    .catch((e) => console.error("[usticky] listen floating-hover-pos failed", e));
 
   // ── 渲染输入区（常驻） ──
   // 在拉 quick_add_shortcut 之前调，确保 hint 元素存在；拉到 shortcut 后再 updateInputHint 刷
@@ -870,6 +995,7 @@ async function init() {
     unlistenPinMode?.();
     unlistenLocale?.();
     unlistenHover?.();
+    unlistenHoverPos?.();
     unlistenShortcut?.();
     cleanupSortables();
     // 摘掉 hover listener（setHoverAttr 路径，命名引用）

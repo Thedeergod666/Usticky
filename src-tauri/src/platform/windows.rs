@@ -257,6 +257,18 @@ pub fn restore_level_after_quick_add<R: Runtime>(app: &AppHandle<R>, mode: PinMo
     }
 }
 
+/// 浮窗内鼠标坐标 payload，发到前端驱动 `elementFromPoint`。
+///
+/// 坐标系 = 屏幕 logical pixels（前端拿到直接喂 elementFromPoint）。
+/// Win 上 `GetCursorPos` 是 physical px，要在 emit 前除 scale 转 logical，
+/// 否则 Retina 上 elementFromPoint 命中错位（前端的 clientWidth/scrollHeight
+/// 都是 logical px）。
+#[derive(serde::Serialize, Clone, Copy)]
+struct HoverPos {
+    x: f64,
+    y: f64,
+}
+
 /// 启动 hover emitter 线程。idempotent —— 第二次调用立即返回。
 pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
     if TRACKER_RUNNING.swap(true, Ordering::SeqCst) {
@@ -275,7 +287,7 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
             loop {
                 thread::sleep(Duration::from_millis(50));
 
-                let Some(raw_inside) = is_cursor_inside_floating(&app) else {
+                let Some((raw_inside, pt)) = is_cursor_inside_floating(&app) else {
                     continue;
                 };
 
@@ -297,13 +309,29 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                     }
                 };
 
-                // (1) 永远 emit hover 事件（驱动 CSS 玻璃效果）
+                // (1) hover edge 变化时 emit（驱动 CSS 玻璃效果）
                 if inside != last_emitted {
                     last_emitted = inside;
                     let _ = app.emit("usticky://floating-hover", inside);
                 }
 
-                // (2) PinBottom 模式：切 z-order
+                // (2) inside=true 时**每 tick**发 hover-pos，让前端跟踪
+                // 鼠标在卡 A→卡 B 之间的切换。未聚焦时 WKWebView 不派
+                // mouseenter，title-expand 必须靠这条路径。
+                if inside {
+                    let scale = app
+                        .get_webview_window("floating")
+                        .and_then(|w| w.scale_factor().ok())
+                        .unwrap_or(1.0);
+                    let logical_x = pt.x as f64 / scale;
+                    let logical_y = pt.y as f64 / scale;
+                    let _ = app.emit(
+                        "usticky://floating-hover-pos",
+                        HoverPos { x: logical_x, y: logical_y },
+                    );
+                }
+
+                // (3) PinBottom 模式：切 z-order
                 if LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst) {
                     if inside {
                         // inside: 每 tick re-assert TopMost（best-effort）
@@ -333,7 +361,7 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 
 // ── 内部 ──
 
-/// Hit test：鼠标位置是否在浮窗**未遮挡**区域内。
+/// Hit test：鼠标位置是否在浮窗**未遮挡**区域内，返回 (inside, 物理屏幕坐标)。
 ///
 /// 严格判定两步（macOS-parity，对应 `windowNumberAtPoint`）：
 /// 1. 鼠标在浮窗 rect 内（`GetWindowRect` → `point_in_rect`）
@@ -341,8 +369,8 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 ///    后必须等于浮窗自己 —— 防止"被另一个 app 窗口盖住时误触发 raise"
 ///
 /// 返回 `None` 表示本轮无法判定（窗口未上屏 / Win API 失败），caller
-/// continue 即可。
-fn is_cursor_inside_floating<R: Runtime>(app: &AppHandle<R>) -> Option<bool> {
+/// continue 即可。坐标永远是物理像素，emit 到前端时 caller 转 logical。
+fn is_cursor_inside_floating<R: Runtime>(app: &AppHandle<R>) -> Option<(bool, POINT)> {
     let win = app.get_webview_window("floating")?;
     let hwnd_t = win.hwnd().ok()?;
     if hwnd_t.0.is_null() {
@@ -372,19 +400,19 @@ fn is_cursor_inside_floating<R: Runtime>(app: &AppHandle<R>) -> Option<bool> {
             return None;
         }
         if !point_in_rect(pt, &rect) {
-            return Some(false);
+            return Some((false, pt));
         }
         // WindowFromPoint 成功 → topmost non-null = 真实命中窗口。
         // 失败 → null = 当作"未被浮窗遮挡",返 false (保守不 raise)。
         let topmost: WIN_HWND = WindowFromPoint(pt);
         if topmost.is_null() {
-            return Some(false);
+            return Some((false, pt));
         }
         let root = GetAncestor(topmost, GA_ROOT);
         if root.is_null() {
-            return Some(topmost == our_hwnd);
+            return Some((topmost == our_hwnd, pt));
         }
-        Some(root == our_hwnd)
+        Some((root == our_hwnd, pt))
     }
 }
 
