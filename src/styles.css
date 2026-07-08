@@ -134,48 +134,71 @@ html, body {
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
   cursor: grab;
-  /* 玻璃材质 —— 始终强开（v2 调整：不再 idle 半透 / hover 强开）
-     原因：hover emitter 在 PinBottom / Normal 模式下被其他 app 抢焦点时
-     容易丢 inside 状态，玻璃忽强忽弱视觉抖动。idle 直接用强玻璃值。 */
-  --tile-bg: rgba(28, 30, 38, 0.82);
+  /* idle（未 hover）：浮窗和字体都淡化一点 —— "fold away" 视觉意图：
+   * 浮窗静止不动鼠标时退到背景里，hover 才全强度介入。
+   * 注意：这里只动 alpha，**不动 --tile-blur / --tile-shadow**（blur 28px
+   * 写死是 WKWebView backdrop throttling 修复的关键，别再跟历史
+   * glass-fading 根因搞混）。色彩靠 CSS variable swap 切换，触发的是
+   * background-color / color 的纯 paint —— 不重新合成 backdrop layer。
+   * transition 列表（line 219-223）已含 background-color / color，过渡
+   * 走 cubic-bezier(0.22, 1, 0.36, 1)，不会出现"折叠"突变。 */
+  --tile-bg: rgba(28, 30, 38, 0.62);
   --tile-blur: 28px;
   --tile-saturate: 180%;
+  --tile-border: rgba(255, 255, 255, 0.08);
+  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.35),
+                 0 0 0 0.5px rgba(255, 255, 255, 0.03) inset;
+
+  /* 文字层级（idle：偏弱，让浮窗"折叠"到背景里） */
+  --text-bright: rgba(255, 255, 255, 0.74);
+  --text-mute:   rgba(255, 255, 255, 0.52);
+  --text-faint:  rgba(255, 255, 255, 0.34);
+  --text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+
+  /* 语义色（idle：全部统一为弱化的白，避免在折叠态下抢视觉） */
+  --c-data-ok:    rgba(255, 255, 255, 0.74);
+  --c-data-cyan:  rgba(255, 255, 255, 0.74);
+  --c-data-warn:  rgba(255, 255, 255, 0.74);
+  --c-data-alert: rgba(255, 255, 255, 0.74);
+  --c-data-info:  rgba(255, 255, 255, 0.74);
+
+  --c-bg-ok:    rgba(255, 255, 255, 0.06);
+  --c-bg-alert: rgba(255, 255, 255, 0.06);
+}
+#app:active { cursor: grabbing; }
+
+/* ── 鼠标进入窗口 → 唤醒浮窗全强度（iOS 26 玻璃效果） ──
+ *
+ * v3 调整（2026-07-08）：回归"fold away" 设计意图。
+ *
+ * 历史背景：
+ *   - v1（首次）：idle 用 opacity 0.72 切 → 跟 hover emitter 抖动耦合，
+ *     出现"丢""更深"两种症状。
+ *   - v2（2026-07-03 commit 6196f71/c9d2297）：彻底删除 idle 淡化，靠
+ *     hover emitter 抖动修复 + WKWebView backdrop throttling 3 层防御
+ *     （will-change + heartbeat + force-reflow）稳住玻璃。
+ *   - v3（本轮）：重新引入 idle 淡化 —— 根因已修（hover emitter dispatch
+ *     抖动已用 last_inside + 800ms dedup TTL 兜住；CABackdropLayer
+ *     throttling 已被 L1+L2+L3 三层防御击穿），idle 视觉淡化现在安全。
+ *
+ * 设计抉择：
+ *   - 只动 alpha（背景 + 文字），**不动 --tile-blur**（blur 28px 写死是
+ *     backdrop throttling 修复的关键，跟 memory usticky-glass-fading-fix
+ *     中的教训一致）。
+ *   - CSS variable swap 触发的是 background-color / color 的纯 paint，
+ *     不重新合成 backdrop layer → 心跳动画 (L2) 仍正常工作。
+ *   - 复用既有的 transition 列表（.todo-card 上的 background-color /
+ *     border-color / opacity 0.22s cubic-bezier），不会出现"突变"。
+ *
+ * ⚠️ 这里**故意不写 transition**给 backdrop-filter / box-shadow。
+ * 它们是非常昂贵的合成操作，每次 hover 状态翻转都会触发一次整窗重合成。
+ * 视觉换性能 + 不闪烁 —— 透明浮窗场景下值得（理由同 v2）。 */
+body[data-hover] #app {
+  --tile-bg: rgba(28, 30, 38, 0.82);
   --tile-border: rgba(255, 255, 255, 0.10);
   --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.45),
                  0 0 0 0.5px rgba(255, 255, 255, 0.04) inset;
 
-  /* 文字层级（idle：偏白，靠 alpha 拉开主次） */
-  --text-bright: rgba(255, 255, 255, 0.96);
-  --text-mute:   rgba(255, 255, 255, 0.68);
-  --text-faint:  rgba(255, 255, 255, 0.44);
-  --text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
-
-  /* 语义色（idle：全部统一为白，hover 才上 iOS 语义色） */
-  --c-data-ok:    rgba(255, 255, 255, 0.96);
-  --c-data-cyan:  rgba(255, 255, 255, 0.96);
-  --c-data-warn:  rgba(255, 255, 255, 0.96);
-  --c-data-alert: rgba(255, 255, 255, 0.96);
-  --c-data-info:  rgba(255, 255, 255, 0.96);
-
-  --c-bg-ok:    rgba(255, 255, 255, 0.10);
-  --c-bg-alert: rgba(255, 255, 255, 0.10);
-}
-#app:active { cursor: grabbing; }
-
-/* ── 鼠标进入窗口 → 唤醒 iOS 语义色（不动玻璃材质）──
- *
- * v2 调整（2026-07-03）：玻璃材质已移到 #app 默认值，hover 不再切换
- * tile-bg / tile-blur / tile-shadow —— 避免 hover emitter 抖动时玻璃
- * 忽强忽弱。hover 只换语义色（数字从白变 ok/warn/alert 等）+ 文字 alpha。
- *
- * ⚠️ 这里**故意不写 transition**给 backdrop-filter / box-shadow。
- * 它们是非常昂贵的合成操作，每次 hover 状态翻转都会触发一次整窗重合成。
- * 如果加 0.28s spring 过渡，Rust hover emitter 50ms tick 在浮窗边缘抖动时
- * 会反复 emit hover → CSS variable 反复重计算 → 重合成 → 视觉上
- * "光标闪烁"。代价：hover 进入没有 280ms 的 iOS 弹簧过渡，是离散切。
- * 视觉换性能 + 不闪烁 —— 透明浮窗场景下值得。
- */
-body[data-hover] #app {
   --text-bright: #f4f5f7;
   --text-mute:   rgba(255, 255, 255, 0.72);
   --text-faint:  rgba(255, 255, 255, 0.52);
@@ -226,42 +249,49 @@ body[data-hover] #app {
 .todo-card:active { cursor: grabbing; }
 .todo-card.dragging { opacity: 0.5; transform: scale(0.98); }
 
-/* 已完成的 todo：fade out + 删除线 */
+/* 已完成的 todo：fade out + 删除线
+ * v3 调整：idle 状态下 done 卡**比 pending 还要弱** ——
+ * 用户需求"已完成的任务更明显淡化"。实现方式：
+ *   1. done 卡 idle 下覆盖 --tile-bg 让背景更透；
+ *   2. 用 --c-data-ok-done 单独控制勾圈颜色，idle 下用 --text-faint
+ *      风格弱化（不再用 --c-data-ok 的纯白 0.74，因为那会让"已完成"
+ *      在 idle 下完全看不到勾）；
+ *   3. checkbox 自身 opacity 0.7，让 fill 的颜色再降一档。 */
 .todo-card.done .todo-title {
   text-decoration: line-through;
   color: var(--text-faint);
+  /* idle 下 done 标题比 pending 的 --text-bright 更弱（已用 --text-faint
+   * 是 0.34，pending --text-bright 0.74），无需再加额外弱化。 */
 }
-
-/* Pending 卡**不再** idle 淡化：
- * 之前用 opacity 0.72 / 1.0 切 idle/hover —— 但 hover 状态机（Rust 50ms tick
- * dispatch main thread）偶发返 false 时 body[data-hover] 被清掉 →
- * opacity 0.72 触发 → 视觉上"丢失"+ "更深"（用户反馈 2 秒后丢失现象）。
- *
- * 即使 L1 后端已修（dispatch 失败保留 last_inside），opacity 这一维度的
- * 任何残余抖动仍然会被肉眼感知为"褪色"。直接去掉它 —— 玻璃材质
- * + 数字语义色已经提供 idle/hover 区分，opacity 是冗余的"第二维度"。
- * 保留这条注释以便后续改回时知道为什么删。 */
-/* body:not([data-hover]) .todo-card:not(.done):not(.vanishing) {
+body:not([data-hover]):not([data-low-power]) .todo-card.done {
+  --tile-bg: rgba(28, 30, 38, 0.38);
+  --tile-border: rgba(255, 255, 255, 0.04);
+  /* 勾圈颜色覆盖：idle 下不沿用 --c-data-ok（= 0.74 白），用更弱色
+   * 保持"已完成"识别但明显比 pending 卡更"折叠" —— 见
+   * .todo-card.done .todo-check 的背景填充（用 var(--c-data-ok)）。 */
+  --c-data-ok: rgba(255, 255, 255, 0.55);
+}
+body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
   opacity: 0.72;
 }
-body[data-hover] .todo-card:not(.done):not(.vanishing) {
-  opacity: 1;
-} */
 
-/* PinBottom 模式 done 卡**不再**淡化：
- * 同上面 pending 卡的"褪色问题"—— hover 抖动会触发 opacity 切换 → 视觉上
- * done 卡忽隐忽现。done 卡的状态指示靠 .todo-title 的 line-through +
- * --text-faint 的弱化，已经足够区分；不再叠一层 opacity。
- * 保留这条注释以便后续改回时知道为什么删。 */
-/* body[data-pin-mode="pin_bottom"]:not([data-hover]) .todo-card.done {
-  opacity: 0.5;
-}
-body[data-pin-mode="pin_bottom"][data-hover] .todo-card.done {
-  opacity: 1;
-}
-body[data-pin-mode="pin_bottom"][data-hover] .todo-card.done .todo-title {
-  color: var(--text-bright);
-} */
+/* v3 idle 淡化的实现在下方 —— 已替代历史 v1 的 opacity 方案（"褪色" +
+ * "更深"症状，根因是 hover emitter 抖动 + WKWebView backdrop throttling，
+ * 已在 c9d2297 用 will-change + heartbeat + force-reflow 三层防御彻底修好）。
+ *
+ * 为什么现在重新引入 idle 淡化不会触发旧症状：
+ *   - hover emitter dispatch 抖动：dispatch 失败已用 last_inside 兜住
+ *     （usticky-floating-window-rules 第 5 节），加 800ms dedup TTL 防永久
+ *     短路（glass-fading-fix L4）。
+ *   - WKWebView backdrop sample throttling：L1 will-change + L2 heartbeat
+ *     + L3 force-refresh 三层独立路径分别击穿"静止判定"、"sample cache
+ *     失效"、"z-order 变化延迟"三个不同失败模式。
+ *   - v3 只动 CSS variable（alpha），触动的是 background-color / color 的
+ *     纯 paint 通道，不走 backdrop-filter 合成层，v3 跟 L1/L2/L3 完全
+ *     正交 —— 玻璃稳定性不受影响。 */
+
+/* idle 状态下 done 卡**额外**淡化（line 230 注释）—— 由 .todo-card.done
+ * + body:not([data-hover]) 的 CSS variable 重写实现（见下方 ~234 行）。 */
 /* vanishing 两阶段动画：先变成一条线，再继续缩窄到 0
  * 0%   → 50%  高度从原值缩到 2px，padding 清零，文字被 overflow:hidden
  *             裁掉，只剩 background + border 作为一条横线（opacity 半透）
@@ -575,11 +605,31 @@ body[data-narrow="1"] .todo-input-hint {
  *
  * v2 调整（2026-07-03）：省电模式保留强 alpha（视觉一致），但关掉 blur/saturate
  * 合成层（这是真正的耗电大户）。alpha 不变保证不"褪色"，blur 关掉省电。
- */
+ *
+ * v3 调整（2026-07-08）：低电量模式下 v3 idle 淡化的规则**不**应用 —
+ * 用 body:not([data-low-power]) 限定 idle / hover 切换。低电量模式用户
+ * 已经主动放弃合成预算换取续航，idle ↔ hover 的视觉变化是无意义的开关
+ * 抖动，直接锁在全强度上。 */
 body[data-low-power] #app {
-  --tile-bg: rgba(28, 30, 38, 0.92);
+  --tile-bg: rgba(28, 30, 38, 0.82);
+  --tile-border: rgba(255, 255, 255, 0.10);
+  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.45),
+                 0 0 0 0.5px rgba(255, 255, 255, 0.04) inset;
+  --text-bright: #f4f5f7;
+  --text-mute:   rgba(255, 255, 255, 0.72);
+  --text-faint:  rgba(255, 255, 255, 0.52);
+  --text-shadow: 0 1px 2px rgba(0, 0, 0, 0);
   --tile-blur: 0;
   --tile-saturate: 100%;
+  /* 强制语义色为"hover 全强度"状态 —— 否则 idle 下 --c-data-ok 都是 0.74
+   * 白，会让"已完成"勾圈变成纯白。 */
+  --c-data-ok:    #30d158;
+  --c-data-cyan:  #5ac8fa;
+  --c-data-warn:  #ff9f0a;
+  --c-data-alert: #ff453a;
+  --c-data-info:  #0a84ff;
+  --c-bg-ok:    rgba(48, 209, 88, 0.16);
+  --c-bg-alert: rgba(255, 69, 58, 0.16);
 }
 body[data-low-power] *,
 body[data-low-power] *::before,
