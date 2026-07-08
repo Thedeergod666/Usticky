@@ -709,9 +709,48 @@ async function init() {
     })
     .catch(() => {});
   syncNarrowMode();
+  // ── 全局快捷键 → 激活视觉（等价于 hover）+ 输入聚焦 ──
+  //
+  // 状态机（data-active）：
+  //   启动：usticky://quick-add 事件触发（来自 Cmd+Shift+Space / tray 唤起）
+  //   撤销：(1) 鼠标进入浮窗 → hover 接管（clearActive）
+  //          (2) input.blur（Esc 或主动点别处）
+  //          (3) visibility hidden（切到别 app）
+  //          (4) 90s 自动 timeout（防"用户忘了浮窗在 active"长期占用资源）
+  //
+  // setActive/clearActive 提到此处，因为 visibilitychange listener
+  // （见下方 line 712）在文件流中更早执行，需要 hoisting 兼容 —— 用
+  // 函数声明而非 const arrow，避免 TDZ。
+  let activeTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  const ACTIVE_TIMEOUT_MS = 90_000;
+  function clearActive(): void {
+    if (activeTimeoutHandle !== null) {
+      clearTimeout(activeTimeoutHandle);
+      activeTimeoutHandle = null;
+    }
+    if (!("active" in document.body.dataset)) return;
+    delete document.body.dataset.active;
+  }
+  function setActive(): void {
+    // 已经有 hover 在 → 视觉已经被接管，data-active 没必要叠
+    if (document.body.dataset.hover === "1") return;
+    if (document.body.dataset.active === "1") {
+      // 重复触发 → 只重置 timeout，不重复触发视觉切换
+      if (activeTimeoutHandle !== null) clearTimeout(activeTimeoutHandle);
+      activeTimeoutHandle = setTimeout(clearActive, ACTIVE_TIMEOUT_MS);
+      return;
+    }
+    document.body.dataset.active = "1";
+    activeTimeoutHandle = setTimeout(clearActive, ACTIVE_TIMEOUT_MS);
+  }
+
   document.addEventListener("visibilitychange", () => {
     pageVisible = document.visibilityState === "visible";
-    if (!pageVisible) setHoverAttr(false);
+    if (!pageVisible) {
+      setHoverAttr(false);
+      // 隐藏时清 active —— 切别 app 后不该留"假激活"
+      clearActive();
+    }
   });
   // (b) 显形 debounce：enter→leave < 40ms 视为抖动，不切 data-hover。
   //     显形方向 debounce（enter 后等 40ms 才设 hover），撤销方向照常立即。
@@ -1023,7 +1062,16 @@ async function init() {
     document.addEventListener("mouseup", onUp);
   });
 
-  // ── 全局快捷键：监听后端 emit 的 quick-add 事件 → 聚焦 input ──
+  // ── 全局快捷键：监听后端 emit 的 quick-add 事件 → 激活视觉 + 聚焦 input ──
+  //
+  // 激活 vs hover：用户按 Cmd+Shift+Space 后浮窗是 macOS key window，
+  // 但**鼠标不在浮窗上**，所以 hover emitter 不发浮窗内 → body[data-hover]
+  // 不会被设、浮窗仍处于 idle 弱化态 → 视觉上"没看到自己刚刚唤起"的反馈。
+  // 解决：quick-add 触发时设 body[data-active]=1（CSS 上跟 [data-hover]
+  // 等价共享同一组 CSS variable），input.blur / 鼠标进入接管 / 90s 兜底
+  // 时撤销。CSS 合并见 src/styles.css 的 body[data-hover], body[data-active]
+  // 组合选择器。setActive/clearActive 在文件流中早就定义（见 line ~712
+  // 之前的"激活视觉状态机"块）。
   let unlistenQuickAdd: UnlistenFn | null = null;
   listen("usticky://quick-add", () => {
     const input = app.querySelector<HTMLInputElement>(".todo-input input");
@@ -1031,9 +1079,40 @@ async function init() {
       input.focus();
       input.select();
     }
+    // 即便 input 不在（极端情况下空 todo-list 渲染前 emit），仍激活视觉，
+    // 让浮窗先用全强度显示
+    setActive();
   })
     .then((fn) => (unlistenQuickAdd = fn))
     .catch((e) => console.error("[usticky] listen quick-add failed", e));
+
+  // input.blur 撤销 active —— 用户按 Esc / 主动点别处后浮窗退回 idle
+  // 弱化态。注意：input.blur 也会在 window 失焦时触发（macOS 上切到别 app
+  // 浮窗失焦 → input 自动 blur），这是我们要的：用户离开后 active 自动清。
+  // 但 mouseenter 设的 data-hover 已经先发生，blur 撤销 active 后视觉
+  // 仍由 data-hover 守住 —— 不冲突。
+  const todoInputEl = app.querySelector<HTMLInputElement>(".todo-input input");
+  if (todoInputEl) {
+    todoInputEl.addEventListener("blur", () => {
+      // 只在没 hover 时清 active —— 有 hover 的话视觉强度靠 data-hover
+      if (document.body.dataset.hover !== "1") clearActive();
+    });
+  }
+  // 鼠标进入 → 在原 onBodyMouseEnter 的 setHoverAttr(true) 后跟一行
+  // clearActive()，避免双触发 + timeout 残留。onBodyMouseEnter 在文件流
+  // 中更早定义（见 ~720 行），把它替换为新的活跃感知版（同样的 HOVER_DEBOUNCE
+  // debounce 逻辑）。
+  document.body.removeEventListener("mouseenter", onBodyMouseEnter);
+  document.body.addEventListener("mouseenter", () => {
+    if (!pageVisible) return;
+    if (hoverEnterTimer !== null) clearTimeout(hoverEnterTimer);
+    hoverEnterTimer = setTimeout(() => {
+      hoverEnterTimer = null;
+      setHoverAttr(true);
+      // hover 接管后清 active —— 视觉由 hover 维持，避免双触发 + 防 timeout 残留
+      clearActive();
+    }, HOVER_DEBOUNCE_MS);
+  });
 
   // ── 全局 Cmd+Z 撤销：v0.2 实现，先占位 ──
   document.addEventListener("keydown", (e) => {

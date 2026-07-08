@@ -192,8 +192,14 @@ html, body {
  *
  * ⚠️ 这里**故意不写 transition**给 backdrop-filter / box-shadow。
  * 它们是非常昂贵的合成操作，每次 hover 状态翻转都会触发一次整窗重合成。
- * 视觉换性能 + 不闪烁 —— 透明浮窗场景下值得（理由同 v2）。 */
-body[data-hover] #app {
+ * 视觉换性能 + 不闪烁 —— 透明浮窗场景下值得（理由同 v2）。
+ *
+ * data-active 跟 data-hover 视觉等价 —— 用,组合选择器共享同一组 CSS
+ * variable，由 main.ts 的 setActive() 在 quick-add 全局快捷键触发
+ * 时设 data-active=1（让用户视觉上立刻看到浮窗被"激活"，等价于
+ * mouseenter），hover 接管或 input.blur 时撤销。 */
+body[data-hover] #app,
+body[data-active] #app {
   --tile-bg: rgba(28, 30, 38, 0.82);
   --tile-border: rgba(255, 255, 255, 0.10);
   --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.45),
@@ -411,10 +417,14 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
   transition: color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
               background-color 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
-body[data-hover] #app .todo-due.today    { color: var(--c-data-warn);  background: rgba(255, 159, 10, 0.18); }
-body[data-hover] #app .todo-due.tomorrow { color: var(--c-data-info);  background: rgba(10, 132, 255, 0.18); }
-body[data-hover] #app .todo-due.overdue  { color: var(--c-data-alert); background: rgba(255, 69, 58, 0.18); }
-body[data-hover] #app .todo-due.days     { color: var(--c-data-cyan);  background: rgba(90, 200, 250, 0.18); }
+body[data-hover] #app .todo-due.today,
+body[data-active] #app .todo-due.today    { color: var(--c-data-warn);  background: rgba(255, 159, 10, 0.18); }
+body[data-hover] #app .todo-due.tomorrow,
+body[data-active] #app .todo-due.tomorrow { color: var(--c-data-info);  background: rgba(10, 132, 255, 0.18); }
+body[data-hover] #app .todo-due.overdue,
+body[data-active] #app .todo-due.overdue  { color: var(--c-data-alert); background: rgba(255, 69, 58, 0.18); }
+body[data-hover] #app .todo-due.days,
+body[data-active] #app .todo-due.days     { color: var(--c-data-cyan);  background: rgba(90, 200, 250, 0.18); }
 
 /* delete 按钮（hover 才显示） */
 .todo-delete {
