@@ -752,17 +752,28 @@ async function init() {
       clearActive();
     }
   });
-  // (b) 显形 debounce：enter→leave < 40ms 视为抖动，不切 data-hover。
-  //     显形方向 debounce（enter 后等 40ms 才设 hover），撤销方向照常立即。
+  // (b) 显形**不再** debounce —— 2026-07-08 fix：
+  //     旧设计 enter→leave 40ms 阈值用于吞 WKWebView spurious enter。
+  //     但 Rust 端 dwell-time hysteresis（enter 1 tick = 50ms 单 tick 验证，
+  //     macos.rs ENTER_THRESHOLD=1）已经做了真正的边缘抖动去抖。
+  //     JS 这层 40ms debounce 是**冗余的**，且把"WKWebView 派 mouseenter
+  //     到 setHoverAttr 触发"的延迟拉高到 40ms+，是用户感知"hover 响应
+  //     慢"的主因之一。Musage 用 40ms 是历史包袱，Usticky 不背。
+  //
+  //     副作用：WKWebView 偶发的 spurious mouseenter（macOS 上极少见）
+  //     现在会被立即响应。但 spurious enter 通常伴随 spurious leave，hover
+  //     状态机会在 1 帧内回到 false，CSS 220ms 过渡看不出来。实测无闪烁。
   let hoverEnterTimer: ReturnType<typeof setTimeout> | null = null;
-  const HOVER_DEBOUNCE_MS = 40;
   const onBodyMouseEnter = () => {
     if (!pageVisible) return; // 隐藏态 → spurious 忽略
-    if (hoverEnterTimer !== null) clearTimeout(hoverEnterTimer);
-    hoverEnterTimer = setTimeout(() => {
+    // hoverEnterTimer 现在基本是 null（debounce 已去除），保留 cancel 是
+    // 防御性写法 —— 未来若 WKWebView 重新派 spurious mouseenter 触发回归，
+    // 不用改这里。
+    if (hoverEnterTimer !== null) {
+      clearTimeout(hoverEnterTimer);
       hoverEnterTimer = null;
-      setHoverAttr(true);
-    }, HOVER_DEBOUNCE_MS);
+    }
+    setHoverAttr(true);
   };
   const onBodyMouseLeave = () => {
     if (hoverEnterTimer !== null) {
@@ -819,8 +830,10 @@ async function init() {
     }
     lastHoverPayload = e.payload;
     lastHoverEmitAt = now;
-    // Rust 路径直接同步切（已经过 50ms tick 去抖）；cancel pending enter
-    // timer（如果用户从 enter 进入但 40ms 内 Rust 也 emit true，按 Rust 为准）
+    // Rust 路径直接同步切（已经过 50ms tick 去抖）。
+    // hoverEnterTimer 现在基本是 null（debounce 已去除），保留 cancel 是
+    // 防御性写法 —— 未来若 WKWebView 重新派 spurious mouseenter 触发回归，
+    // 这里能立即切到 hover 状态不被 debounce 延迟。
     if (hoverEnterTimer !== null) {
       clearTimeout(hoverEnterTimer);
       hoverEnterTimer = null;
@@ -1100,18 +1113,18 @@ async function init() {
   }
   // 鼠标进入 → 在原 onBodyMouseEnter 的 setHoverAttr(true) 后跟一行
   // clearActive()，避免双触发 + timeout 残留。onBodyMouseEnter 在文件流
-  // 中更早定义（见 ~720 行），把它替换为新的活跃感知版（同样的 HOVER_DEBOUNCE
-  // debounce 逻辑）。
+  // 中更早定义（见 ~720 行），把它替换为新的活跃感知版（同样的 0ms debounce
+  // 逻辑 —— 沿用 2026-07-08 fix 决策，去掉 40ms debounce 让响应即时）。
   document.body.removeEventListener("mouseenter", onBodyMouseEnter);
   document.body.addEventListener("mouseenter", () => {
     if (!pageVisible) return;
-    if (hoverEnterTimer !== null) clearTimeout(hoverEnterTimer);
-    hoverEnterTimer = setTimeout(() => {
+    if (hoverEnterTimer !== null) {
+      clearTimeout(hoverEnterTimer);
       hoverEnterTimer = null;
-      setHoverAttr(true);
-      // hover 接管后清 active —— 视觉由 hover 维持，避免双触发 + 防 timeout 残留
-      clearActive();
-    }, HOVER_DEBOUNCE_MS);
+    }
+    setHoverAttr(true);
+    // hover 接管后清 active —— 视觉由 hover 维持，避免双触发 + 防 timeout 残留
+    clearActive();
   });
 
   // ── 全局 Cmd+Z 撤销：v0.2 实现，先占位 ──

@@ -141,29 +141,39 @@ html, body {
    * glass-fading 根因搞混）。色彩靠 CSS variable swap 切换，触发的是
    * background-color / color 的纯 paint —— 不重新合成 backdrop layer。
    * transition 列表（line 219-223）已含 background-color / color，过渡
-   * 走 cubic-bezier(0.22, 1, 0.36, 1)，不会出现"折叠"突变。 */
-  --tile-bg: rgba(28, 30, 38, 0.62);
+   * 走 cubic-bezier(0.22, 1, 0.36, 1)，不会出现"折叠"突变。
+   *
+   * **2026-07-08 fix**：加深 idle alpha 0.62 → 0.55 拉开跟 hover 0.88
+   * 的差距（0.33 alpha）。Musage 对比组 idle 是 0.30 alpha + blur 10px，
+   * hover 0.82 + blur 28px（差 0.52 alpha + 18px blur）。Usticky v3 之前
+   * idle 0.62 / hover 0.82 差 0.20，hover 时视觉变化太微弱，用户感知到
+   * "瞬间切完但什么都没变"。加深 idle 让 hover 强调有明显"硬起来"。
+   * 同时文字层级 idle → hover 阶梯从 0.74/0.52/0.34 → #f4f5f7/0.72/0.52
+   * 加大到 0.58/0.36/0.18 → 0.98/0.78/0.58（更暗 → 更亮，对比度更强）。
+   * 不动 --tile-blur (28px 写死) —— 不踩 WKWebView backdrop throttling
+   * 2 秒丢失根因。 */
+  --tile-bg: rgba(28, 30, 38, 0.55);
   --tile-blur: 28px;
   --tile-saturate: 180%;
-  --tile-border: rgba(255, 255, 255, 0.08);
-  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.35),
-                 0 0 0 0.5px rgba(255, 255, 255, 0.03) inset;
+  --tile-border: rgba(255, 255, 255, 0.06);
+  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.30),
+                 0 0 0 0.5px rgba(255, 255, 255, 0.02) inset;
 
   /* 文字层级（idle：偏弱，让浮窗"折叠"到背景里） */
-  --text-bright: rgba(255, 255, 255, 0.74);
-  --text-mute:   rgba(255, 255, 255, 0.52);
-  --text-faint:  rgba(255, 255, 255, 0.34);
-  --text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --text-bright: rgba(255, 255, 255, 0.58);
+  --text-mute:   rgba(255, 255, 255, 0.36);
+  --text-faint:  rgba(255, 255, 255, 0.18);
+  --text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
 
   /* 语义色（idle：全部统一为弱化的白，避免在折叠态下抢视觉） */
-  --c-data-ok:    rgba(255, 255, 255, 0.74);
-  --c-data-cyan:  rgba(255, 255, 255, 0.74);
-  --c-data-warn:  rgba(255, 255, 255, 0.74);
-  --c-data-alert: rgba(255, 255, 255, 0.74);
-  --c-data-info:  rgba(255, 255, 255, 0.74);
+  --c-data-ok:    rgba(255, 255, 255, 0.58);
+  --c-data-cyan:  rgba(255, 255, 255, 0.58);
+  --c-data-warn:  rgba(255, 255, 255, 0.58);
+  --c-data-alert: rgba(255, 255, 255, 0.58);
+  --c-data-info:  rgba(255, 255, 255, 0.58);
 
-  --c-bg-ok:    rgba(255, 255, 255, 0.06);
-  --c-bg-alert: rgba(255, 255, 255, 0.06);
+  --c-bg-ok:    rgba(255, 255, 255, 0.04);
+  --c-bg-alert: rgba(255, 255, 255, 0.04);
 }
 #app:active { cursor: grabbing; }
 
@@ -200,14 +210,21 @@ html, body {
  * mouseenter），hover 接管或 input.blur 时撤销。 */
 body[data-hover] #app,
 body[data-active] #app {
-  --tile-bg: rgba(28, 30, 38, 0.82);
-  --tile-border: rgba(255, 255, 255, 0.10);
-  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.45),
-                 0 0 0 0.5px rgba(255, 255, 255, 0.04) inset;
+  /* **2026-07-08 fix**：hover tile-bg 0.82 → 0.92 加强 hover 强调。
+   * idle 0.55 → hover 0.92 = 0.37 alpha 差，比 Musage idle/hover 差 0.52
+   * 略小（Musage 还叠了 blur 10→28），但 idle 浮窗比 Musage 暗得多（idle 0.55
+   * vs Musage 0.30 —— Musage 更暗），净效果是"idle 时 Usticky 比 Musage 更
+   * 可见但还是'折叠'，hover 时两者都'硬起来'"。差距足够产生可感知的'fold/unfold'。
+   * 不动 --tile-blur (28px 写死) —— 不踩 WKWebView backdrop throttling
+   * 2 秒丢失根因。 */
+  --tile-bg: rgba(28, 30, 38, 0.92);
+  --tile-border: rgba(255, 255, 255, 0.12);
+  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.50),
+                 0 0 0 0.5px rgba(255, 255, 255, 0.05) inset;
 
-  --text-bright: #f4f5f7;
-  --text-mute:   rgba(255, 255, 255, 0.72);
-  --text-faint:  rgba(255, 255, 255, 0.52);
+  --text-bright: rgba(255, 255, 255, 0.98);
+  --text-mute:   rgba(255, 255, 255, 0.78);
+  --text-faint:  rgba(255, 255, 255, 0.58);
   --text-shadow: 0 1px 2px rgba(0, 0, 0, 0);
 
   --c-data-ok:    #30d158;
