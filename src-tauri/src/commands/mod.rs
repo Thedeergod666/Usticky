@@ -190,9 +190,37 @@ pub async fn resize_floating_window(app: AppHandle, height: f64) -> Result<(), S
         // 视觉上就是"自适应不工作"。
         let scale = w.scale_factor().unwrap_or(1.0);
         let new_h_physical = (height * scale).round() as u32;
+
+        // 浮窗**底部锚定**：保证"自适应高度不能超过所在屏幕底部"。
+        // 取所在屏幕（用户可能拖到副屏，不能用 primary）的工作区，按
+        // new_h_physical 反算 max_h_in_mon —— 然后 clamp final_h 到这个上限。
+        // 同时检查：resize 后窗口底边是否越界，是则把浮窗**钉**到屏幕底
+        // （y = monitor_bottom - final_h - margin），向上增长，**不**改 x。
+        let mon = w
+            .current_monitor()
+            .map_err(|e| e.to_string())?
+            .or_else(|| app.primary_monitor().ok().flatten())
+            .ok_or_else(|| "no monitor for floating window".to_string())?;
+        let mon_pos = mon.position();
+        let mon_size = mon.size();
+        let mon_bottom = mon_pos.y + mon_size.height as i32;
+        const BOTTOM_MARGIN_PX: i32 = 12; // 屏幕底部留 12px 喘息
+        let max_h_in_mon = (mon_bottom - BOTTOM_MARGIN_PX - mon_pos.y).max(160) as u32;
+        let final_h = new_h_physical.min(max_h_in_mon);
         // width 沿用 outer_size 返回的物理像素，不改动用户拖拽的宽度
-        w.set_size(tauri::PhysicalSize::new(cur.width, new_h_physical))
+        w.set_size(tauri::PhysicalSize::new(cur.width, final_h))
             .map_err(|e| e.to_string())?;
+        // resize 后窗口底边超过所在屏幕底（+1 容差） → 重新对齐底边。
+        // 浮窗原 y 可能被用户拖到中间 —— 增长后底部越界，必须拉回到
+        // "贴屏幕底、向上增长"的形态才符合用户预期。
+        let cur_pos = w.outer_position().map_err(|e| e.to_string())?;
+        let cur_bottom = cur_pos.y + final_h as i32;
+        if cur_bottom > mon_bottom - BOTTOM_MARGIN_PX {
+            let new_y = (mon_bottom - final_h as i32 - BOTTOM_MARGIN_PX)
+                .max(mon_pos.y);
+            w.set_position(tauri::PhysicalPosition::new(cur_pos.x, new_y))
+                .map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
