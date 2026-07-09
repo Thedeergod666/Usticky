@@ -249,7 +249,7 @@ body[data-active] #app {
    * 居中位置 9.5px），肉眼不可察觉。比"hover 时跳一下"好得多。 */
   align-items: flex-start;
   gap: 10px;
-  padding: 9px 13px 10px;
+  padding: 9px 13px 8px;
   background: var(--tile-bg);
   backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
@@ -273,29 +273,44 @@ body[data-active] #app {
 .todo-card.dragging { opacity: 0.5; transform: scale(0.98); }
 
 /* 已完成的 todo：fade out + 删除线
+ *
  * v3 调整：idle 状态下 done 卡**比 pending 还要弱** ——
  * 用户需求"已完成的任务更明显淡化"。实现方式：
  *   1. done 卡 idle 下覆盖 --tile-bg 让背景更透；
- *   2. 用 --c-data-ok-done 单独控制勾圈颜色，idle 下用 --text-faint
- *      风格弱化（不再用 --c-data-ok 的纯白 0.74，因为那会让"已完成"
- *      在 idle 下完全看不到勾）；
- *   3. checkbox 自身 opacity 0.7，让 fill 的颜色再降一档。 */
+ *   2. 用 --c-data-ok 单独控制勾圈颜色，idle 下用弱白 0.40（不再用
+ *      --c-data-ok 默认值 0.58，因为那样会让"已完成"在 idle 下跟 pending
+ *      勾圈太接近，失去"完成态"识别）；
+ *   3. checkbox 自身 opacity 0.55，让 fill 的颜色再降一档；
+ *   4. 标题文字 idle 下用更弱的 --text-bright 0.22（已被 done card selector
+ *      覆盖），让划掉文字几乎不可读。 */
 .todo-card.done .todo-title {
   text-decoration: line-through;
   color: var(--text-faint);
-  /* idle 下 done 标题比 pending 的 --text-bright 更弱（已用 --text-faint
-   * 是 0.34，pending --text-bright 0.74），无需再加额外弱化。 */
+  /* idle 下 done 标题比 pending 的 --text-bright 更弱 ——
+   * 2026-07-09 增强：done 卡 idle 下另外覆盖 --text-bright → 0.22
+   * （更弱于 --text-faint 0.18 的 fallback，pending --text-bright 0.58），
+   * 让划掉的标题在浮窗静止时几乎看不见。 */
 }
 body:not([data-hover]):not([data-low-power]) .todo-card.done {
-  --tile-bg: rgba(28, 30, 38, 0.38);
-  --tile-border: rgba(255, 255, 255, 0.04);
-  /* 勾圈颜色覆盖：idle 下不沿用 --c-data-ok（= 0.74 白），用更弱色
-   * 保持"已完成"识别但明显比 pending 卡更"折叠" —— 见
-   * .todo-card.done .todo-check 的背景填充（用 var(--c-data-ok)）。 */
-  --c-data-ok: rgba(255, 255, 255, 0.55);
+  /* **2026-07-09 加深 idle 透明**：done 卡比 pending 更"折叠"到背景里。
+   * pending idle = 0.55 alpha → done idle 推到 0.24（差 0.31 alpha），
+   * 让已完成任务在浮窗静止时几乎看不见，达到"折叠到背景"的目的。
+   * border 也压到 0.02（几乎不可见），让 done 卡视觉上完全"退场"。
+   * 只动 alpha（背景 + 边框），不动 --tile-blur，跟 v3 设计原则一致。 */
+  --tile-bg: rgba(28, 30, 38, 0.24);
+  --tile-border: rgba(255, 255, 255, 0.02);
+  /* 勾圈颜色覆盖：idle 下不沿用 --c-data-ok（= 0.58 白），用更弱色 0.40
+   * 保持"已完成"识别但明显比 pending 卡更"折叠"。
+   * 文本：done 标题文字降到 --text-mute 之下，让"已划掉"标题几乎不可读，
+   * 对应"可以看见勾圈即可，标题不再吸引眼球"的意图。 */
+  --c-data-ok: rgba(255, 255, 255, 0.40);
+  --text-bright: rgba(255, 255, 255, 0.22);
+  --text-mute:   rgba(255, 255, 255, 0.14);
 }
 body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
-  opacity: 0.72;
+  /* checkbox opacity 0.72 → 0.55：让"已完成"勾圈视觉上更隐退，但
+   * 仍保留识别（没有降到 0%，用户能看见哪条已做完）。 */
+  opacity: 0.55;
 }
 
 /* v3 idle 淡化的实现在下方 —— 已替代历史 v1 的 opacity 方案（"褪色" +
@@ -326,7 +341,7 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
   0% {
     opacity: 1;
     max-height: 200px;
-    padding: 9px 13px 10px;
+    padding: 9px 13px 8px;
     margin: 0;
     border-width: 1px;
   }

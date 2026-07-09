@@ -1330,6 +1330,52 @@ async function init() {
     }
   });
 
+  // ── Wheel 滚动：手动转发 #app 的 overflow 滚动 ──
+  //
+  // 业务背景：当 todo 数过多 → #app.scrollHeight > 浮窗最大高度时，
+  // resizeWindowToContent 把窗口 clamp 到 screenH - 80px，**但 #app 自己
+  // 还保持自然高度**（max-height: 100%） → #app 内部 overflow-y: auto
+  // 出现滚动条。理论上 WebView 应该把 wheel 事件自动转给 overflow:auto
+  // 元素，但 macOS NSPanel（Tauri transparent borderless 用的）在非 key
+  // 状态下不一定把 wheel 派给 WKWebView —— 用户实测 wheel 没反应。
+  //
+  // 这里手动拦 wheel：只有当 #app 真的可滚（scrollHeight > clientHeight）
+  // 时才 preventDefault + 推 scrollTop，否则放过（让外层 / 浏览器 / 其它
+  // 元素响应）。passive: false 是 preventDefault 强制要求。
+  //
+  // 节流：deltaY 累加到 RAF 上，避免高频 wheel 事件把 scrollTop 推得过快。
+  // 体验上等价于原生滚动（也是 RAF-driven），但确保 JS 拦截生效。
+  let pendingDeltaY = 0;
+  let wheelRafHandle: number | null = null;
+  const flushWheel = () => {
+    wheelRafHandle = null;
+    const appEl = document.getElementById("app");
+    if (!appEl || pendingDeltaY === 0) {
+      pendingDeltaY = 0;
+      return;
+    }
+    const before = appEl.scrollTop;
+    const maxScroll = appEl.scrollHeight - appEl.clientHeight;
+    // clamp 到 [0, maxScroll]：超过停止位时把剩余 delta 丢进"被吸收"路径
+    // （不传给外层，因为我们已经 preventDefault 了 —— 体感上等同于
+    // "滚到顶/底后边滚动边阻力"）。
+    appEl.scrollTop = Math.max(0, Math.min(maxScroll, before + pendingDeltaY));
+    pendingDeltaY = 0;
+  };
+  app.addEventListener("wheel", (e) => {
+    const appEl = document.getElementById("app");
+    if (!appEl) return;
+    const scrollable = appEl.scrollHeight - appEl.clientHeight;
+    if (scrollable <= 0) return;  // 没溢出 → 不拦，放过 wheel
+    // 横滚也放过 —— #app 不能横滚，浮窗本身能横滚更不该
+    if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+    e.preventDefault();
+    pendingDeltaY += e.deltaY;
+    if (wheelRafHandle === null) {
+      wheelRafHandle = requestAnimationFrame(flushWheel);
+    }
+  }, { passive: false });
+
   // ── beforeunload 清理 ──
   window.addEventListener("beforeunload", () => {
     unlistenTodos?.();
