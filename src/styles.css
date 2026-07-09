@@ -420,6 +420,57 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
   overflow: hidden;
 }
 
+/* ── 编辑态 input（替换 .todo-title，in-place 编辑） ──
+ *
+ * 跟 .todo-title 同尺寸 / 同字体（flex 1 1 auto + min-width: 0），保证
+ * input 替换 title 时卡内其他元素（checkbox / due / delete）位置 0 抖动。
+ *
+ * 视觉策略：透明背景 + 1px 弱边框 + focus 时蓝色描边，沿用 .todo-input
+ * 的 focus-within 视觉语义，让用户一眼看出"现在处于编辑态"。不写
+ * box-shadow（避免跟 .todo-card 已有的 backdrop-filter 合成预算打架）。
+ *
+ * 跟 .todo-title 的 font 完全一致 —— 字体跳变会让用户体感"被切走"，编辑
+ * 文字字号 / 字重 / letter-spacing 必须 1:1 对齐。
+ *
+ * 已完成态（.todo-card.done）的 input：去掉 line-through（用户正在编辑，
+ * 删除线是给"完成态显示"的标记，不应该污染输入体验）。 */
+.todo-edit-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 6px;
+  padding: 2px 7px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.1px;
+  color: var(--text-bright);
+  text-shadow: var(--text-shadow);
+  caret-color: var(--c-data-info);
+  outline: none;
+  /* input 默认可输入文字，覆写外层 body 上的 user-select: none —— 不写
+   * 反而没事（input 默认不被 user-select:none 继承），但显式写更稳。 */
+  user-select: text;
+  -webkit-user-select: text;
+  transition: border-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+              background-color 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.todo-edit-input:focus {
+  border-color: rgba(10, 132, 255, 0.55);
+  background: rgba(255, 255, 255, 0.06);
+}
+.todo-edit-input::placeholder {
+  color: var(--text-faint);
+  font-weight: 400;
+}
+/* 已完成态的 input：去掉删除线视觉 —— 编辑态用户输入文字不应被 line-through
+ * 污染（line-through 是 .todo-title 的"已完成"语义标识，不是 input 的）。 */
+.todo-card.done .todo-edit-input {
+  text-decoration: none;
+  color: var(--text-bright);
+}
+
 /* due 时间标签 */
 .todo-due {
   flex: 0 0 auto;

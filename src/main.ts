@@ -375,6 +375,13 @@ function buildTodoRow(todo: Todo): HTMLElement {
   title.className = "todo-title";
   title.textContent = todo.title;
   title.title = todo.title;  // hover tooltip for truncated
+  // 点击 title 区域进入编辑态（不要影响 .todo-check / .todo-delete 上的
+  // 完成/删除按钮 —— 它们各自 stopPropagation 已在上面挂好）。
+  // 单击即触发；不用 dblclick，避免"先点没反应"的体感。
+  title.addEventListener("click", (e) => {
+    e.stopPropagation();
+    enterEditMode(row, todo);
+  });
   row.appendChild(title);
 
   if (todo.due_at) {
@@ -620,6 +627,185 @@ async function handleDragEnd(evt: Sortable.SortableEvent) {
 function cleanupSortables() {
   for (const s of sortableInstances) s.destroy();
   sortableInstances = [];
+}
+
+// ── 编辑 todo ──
+//
+// 设计要点：
+//   1. 触发：点击 .todo-title（非 checkbox / delete 按钮）。
+//   2. UI：原 .todo-title 替换为 <input>，in-place 编辑（不重建整卡，
+//      不打断 SortableJS 实例 / hover-expand 状态）。
+//   3. SortableJS：编辑期间禁用所在 section 的 Sortable，
+//      否则 mousedown 到 input 上 SortableJS 会启动一个无效的拖拽。
+//   4. 提交：Enter / blur；空内容 / 未改动 → 视为取消。
+//   5. 取消：Escape 键。
+//   6. 错误处理：保存失败回滚 input value（保留用户已输入文字），不闪退。
+//   7. 与 hover-expand 协作：编辑态期间关闭该卡的 title-expanded，避免
+//      input 框被外层 .title-expanded 的 white-space: normal 干扰。
+//
+// 不需要的数据模型改动：后端 update_todo 早就有 title: Option<String>
+// 参数，commands/mod.rs line 81-100 直接复用。
+function enterEditMode(card: HTMLElement, todo: Todo) {
+  // 已有 input 在编辑（防御性 —— 多次快速点击）
+  if (card.querySelector("input.todo-edit-input")) return;
+
+  const titleEl = card.querySelector<HTMLElement>(".todo-title");
+  if (!titleEl) return;
+
+  // 关闭 hover-expand 态（如果正展开中）—— input 编辑不应该被外层换行影响
+  card.classList.remove("title-expanded");
+
+  // 禁用所在 section 的 SortableJS —— 否则 mousedown 到 input 上
+  // Sortable 会启动一个无效拖拽（input 没有 draggable 元素 + 拖动会被
+  // input 的 focus 行为打断）。
+  const section = card.closest<HTMLElement>(".todo-section");
+  if (section) {
+    const sortInstance = sortableInstances.find((s) => (s as any).el === section);
+    if (sortInstance) sortInstance.option("disabled", true);
+  }
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "todo-edit-input";
+  input.maxLength = 280;
+  input.value = todo.title;
+  input.spellcheck = false;
+  input.autocomplete = "off";
+  // 显式 user-select：input 默认可输入文字，与外层 user-select: none 区分
+  // 视觉上 input 边框 + focus ring 已经够标识编辑态。
+
+  // 把 title 节点换成 input，保留原引用以便 cancel 时换回。
+  titleEl.replaceWith(input);
+
+  // focus + select：用户能直接覆盖或追加
+  // 用 rAF 让 select 在 macOS Safari 行为一致（focus 后立刻 select 不被
+  // Safari 当成"二次 focus"吞掉）。
+  requestAnimationFrame(() => {
+    input.focus();
+    input.select();
+  });
+
+  // 提交（Enter 或 blur）—— 共享一个 handler
+  let settled = false;
+  const commit = async () => {
+    if (settled) return;
+    settled = true;
+    const next = input.value.trim();
+    // 空内容 / 未改动 → 视为取消，不发 IPC 也不闪退
+    if (!next || next === todo.title) {
+      cancelEdit(card, todo);
+      return;
+    }
+    // 字符上限校验（跟 addTodo 一致）
+    if (next.length > 280) {
+      showMiniFlash(t("app.error.too_long", { max: 280 }));
+      settled = false;  // 允许重新提交
+      input.focus();
+      return;
+    }
+    // 保留用户输入：commit 失败时不替换 input，继续让用户修改
+    try {
+      // 先 exit 再 invoke —— 后端 persist_and_emit 同步触发
+      // usticky://todos-changed 走 render 整张重建。如果先 invoke 再 exit，
+      // 重建会把 input 干掉，然后我们的 exit 跑在 detached card 上。
+      exitEditMode(card, next);
+      await invoke("update_todo", { id: todo.id, title: next });
+      // 成功：后端 emit 会重建整张列表，next 已落盘
+    } catch (e) {
+      console.error("[usticky] update_todo (edit) failed", e);
+      // 失败：重新进入编辑态恢复 input（exit 已经把 input 摘了）
+      showMiniFlash(t("app.error.save_failed"));
+      settled = false;
+      // 找当前 card（render 还没跑的话还是原来的；跑了的话是新卡），
+      // 用原 id 重新进入编辑 —— 但原 todo 对象还是同一份，title 没变
+      reenterEditOnFailure(card, todo, next);
+    }
+  };
+
+  const cancel = () => {
+    if (settled) return;
+    settled = true;
+    cancelEdit(card, todo);
+  };
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      e.stopPropagation();
+      void commit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      cancel();
+    }
+  });
+  // blur 提交 —— 注意：commit 内部 settled 检查避免重复触发
+  // （cancel 后元素被移走，blur 仍可能在异步队列里派发）
+  input.addEventListener("blur", () => {
+    void commit();
+  });
+}
+
+/// 失败后恢复编辑态 —— 重新把 title 换成 input 并 focus。
+/// card 可能是 detached（render 已重建），querySelector 找不到时跳过
+/// （用户已经看不到这张卡了，强行恢复会让界面更乱）。
+function reenterEditOnFailure(card: HTMLElement, todo: Todo, value: string) {
+  if (!card.isConnected) return;
+  // 找到当前还在 DOM 的同 id card
+  const live = card.dataset.todoId
+    ? document.querySelector<HTMLElement>(
+        `.todo-card[data-todo-id="${cssEscape(card.dataset.todoId)}"]`,
+      )
+    : null;
+  const target = live ?? card;
+  enterEditMode(target, todo);
+  const input = target.querySelector<HTMLInputElement>("input.todo-edit-input");
+  if (input) {
+    input.value = value;
+    input.focus();
+  }
+}
+
+/// 退出编辑态（恢复成显示态），不调 IPC。用于 commit 成功后本地先 revert
+/// 然后等待后端 emit 的 todos-changed 走完整重建。
+function exitEditMode(card: HTMLElement, newTitle: string) {
+  const input = card.querySelector<HTMLInputElement>("input.todo-edit-input");
+  if (!input) {
+    restoreSortableForCard(card);
+    return;
+  }
+  const titleEl = document.createElement("div");
+  titleEl.className = "todo-title";
+  titleEl.textContent = newTitle;
+  titleEl.title = newTitle;
+  // 重建 title 上的点击监听 —— 跟 buildTodoRow 行为一致
+  // 重新 query 拿 todo（从 card.dataset.todoId 反查 lastRenderedSnap）
+  const id = card.dataset.todoId;
+  const todo = id ? lastRenderedSnap?.todos.find((t) => t.id === id) : null;
+  if (todo) {
+    titleEl.addEventListener("click", (e) => {
+      e.stopPropagation();
+      enterEditMode(card, todo);
+    });
+  }
+  input.replaceWith(titleEl);
+  restoreSortableForCard(card);
+}
+
+/// 取消编辑 —— 把 input 换回原 title 显示
+function cancelEdit(card: HTMLElement, todo: Todo) {
+  exitEditMode(card, todo.title);
+}
+
+/// 恢复 Sortable —— 所有 section 的 Sortable 重新启用。
+///
+/// 用 find 而非 section 局部匹配：编辑期间如果用户切了排序（不应该发生，
+/// 但防御性），需要在退出编辑时找当前 section 的实例。
+function restoreSortableForCard(card: HTMLElement) {
+  const section = card.closest<HTMLElement>(".todo-section");
+  if (!section) return;
+  const inst = sortableInstances.find((s) => (s as any).el === section);
+  if (inst) inst.option("disabled", false);
 }
 
 // ── 启动 ──
