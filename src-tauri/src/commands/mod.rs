@@ -191,11 +191,14 @@ pub async fn resize_floating_window(app: AppHandle, height: f64) -> Result<(), S
         let scale = w.scale_factor().unwrap_or(1.0);
         let new_h_physical = (height * scale).round() as u32;
 
-        // 浮窗**底部锚定**：保证"自适应高度不能超过所在屏幕底部"。
-        // 取所在屏幕（用户可能拖到副屏，不能用 primary）的工作区，按
-        // new_h_physical 反算 max_h_in_mon —— 然后 clamp final_h 到这个上限。
-        // 同时检查：resize 后窗口底边是否越界，是则把浮窗**钉**到屏幕底
-        // （y = monitor_bottom - final_h - margin），向上增长，**不**改 x。
+        // 浮窗**顶部钉死**：用户把浮窗拖到哪，顶部 y 就锁哪 → height 自适应
+        // 内容，但底部不能超过所在屏幕底部（+12px 喘息）。超出部分靠 #app
+        // 内部 overflow-y + wheel 滚动（macOS NSPanel wheel 派发问题由
+        // main.ts wheel handler 兜底，见 commit 5b16641）。
+        //
+        // 取所在屏幕（用户可能拖到副屏，不能用 primary）的 monitor.size()
+        // 反算 mon_bottom。max_h = mon_bottom - 12 - cur_top —— 顶部不动，
+        // 底部能到哪就到哪。final_h = min(contentH, max_h)，**不**触碰 y。
         let mon = w
             .current_monitor()
             .map_err(|e| e.to_string())?
@@ -205,22 +208,19 @@ pub async fn resize_floating_window(app: AppHandle, height: f64) -> Result<(), S
         let mon_size = mon.size();
         let mon_bottom = mon_pos.y + mon_size.height as i32;
         const BOTTOM_MARGIN_PX: i32 = 12; // 屏幕底部留 12px 喘息
-        let max_h_in_mon = (mon_bottom - BOTTOM_MARGIN_PX - mon_pos.y).max(160) as u32;
+        let cur_y = w.outer_position().map_err(|e| e.to_string())?.y;
+        // 顶部不动：可用 height = 屏幕底 - 顶部位置 - 喘息。浮窗若曾被
+        // 拖到屏幕中段，可用 height 较小 —— 但**不**挪 y，让用户拖的位置
+        // 永远锁住。同时夹到 mon_size.height 上限（防御 cur_y 被拖到屏幕
+        // 上方时 max 越界的情况）。
+        let max_h_in_mon = ((mon_bottom - BOTTOM_MARGIN_PX - cur_y)
+            .min(mon_size.height as i32))
+            .max(160) as u32;
         let final_h = new_h_physical.min(max_h_in_mon);
         // width 沿用 outer_size 返回的物理像素，不改动用户拖拽的宽度
+        // **不**调 set_position —— 顶部不动是用户的预期，resize 不能改 y。
         w.set_size(tauri::PhysicalSize::new(cur.width, final_h))
             .map_err(|e| e.to_string())?;
-        // resize 后窗口底边超过所在屏幕底（+1 容差） → 重新对齐底边。
-        // 浮窗原 y 可能被用户拖到中间 —— 增长后底部越界，必须拉回到
-        // "贴屏幕底、向上增长"的形态才符合用户预期。
-        let cur_pos = w.outer_position().map_err(|e| e.to_string())?;
-        let cur_bottom = cur_pos.y + final_h as i32;
-        if cur_bottom > mon_bottom - BOTTOM_MARGIN_PX {
-            let new_y = (mon_bottom - final_h as i32 - BOTTOM_MARGIN_PX)
-                .max(mon_pos.y);
-            w.set_position(tauri::PhysicalPosition::new(cur_pos.x, new_y))
-                .map_err(|e| e.to_string())?;
-        }
     }
     Ok(())
 }
