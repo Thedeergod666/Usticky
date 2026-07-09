@@ -13,6 +13,10 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { t, initLocale, onLocaleChange, setLocale, getLocale } from "./i18n";
+// settings "关于" 区域要显示应用 logo —— Vite 把 src-tauri/icons/icon.png 的 hash 化 URL 注入，
+// 单⼀来源 = scripts/generate_icons.py（重跑后 settings 资源自动同步）。
+// 不能用 <img src="/icon.png"> —— 项目没有 public/，frontendDist 里就没这个文件，裂成 [?]
+import appIconPng from "../src-tauri/icons/icon.png";
 import "./settings.css";
 
 type PinMode = "pin_top" | "pin_bottom" | "normal";
@@ -191,7 +195,7 @@ function render(): void {
       </div>
       <div class="section-body">
         <div class="about-logo">
-          <img src="/icon.png" alt="Usticky" />
+          <img src="${appIconPng}" alt="Usticky" />
           <div>
             <div class="about-name">Usticky</div>
             <div class="about-version">v${escapeHtml(appVersion)}</div>
