@@ -177,6 +177,29 @@ html, body {
 }
 #app:active { cursor: grabbing; }
 
+/* ── 触底：浮窗高度被 clamp 到屏幕底部（dock 之上）时 ──
+ *
+ * 业务背景：当浮窗 bottom 已贴到所在屏幕底部（再加 content 也只能
+ * wheel 滚），wheel 滚到尽头后最后一行 todo 卡**仍然可能被 macOS
+ * dock 栏遮挡**（dock 默认 80px，auto-hide 时不占但浮窗仍然到底）——
+ * 用户的视觉锚点是"最后完整可见的那一行"，dock 把它切断。
+ *
+ * 修复：body[data-bottomed]=1 时 #app padding-bottom 加到 32px（保守
+ * 覆盖标准 dock 80px 高的 40%，加上 12px BOTTOM_MARGIN_PX 后正好把
+ * 最后一行垫到 dock 上方可见区）。CSS variable 用 --bottomed-pad
+ * 控制，方便 hover / idle 调。
+ *
+ * 顶部 padding 不变 —— 只垫底，不打乱现有视觉布局。
+ *
+ * Rust 端在 resize_floating_window 检测到 enter/exit bottomed 状态时
+ * emit usticky://floating-bottomed { value: bool }，前端 toggle 这
+ * 个属性。**不**在每次 resize 都 emit —— 高频小幅 resize 会让
+ * 数据属性抖动引发 CSS 闪烁。只在 enter/exit edge 上发。
+ */
+body[data-bottomed] #app {
+  padding-bottom: 32px;
+}
+
 /* ── 鼠标进入窗口 → 唤醒浮窗全强度（iOS 26 玻璃效果） ──
  *
  * v3 调整（2026-07-08）：回归"fold away" 设计意图。

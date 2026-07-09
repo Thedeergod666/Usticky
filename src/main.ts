@@ -1163,6 +1163,27 @@ async function init() {
     .then((fn) => (unlistenBackdropRefresh = fn))
     .catch((e) => console.error("[usticky] listen backdrop-refresh failed", e));
 
+  // ── 浮窗触底：resize_floating_window 检测到窗口高度被 clamp 到屏幕底部 ──
+  //
+  // 业务：当 todo 内容超过顶部 y 不动时的可用 height（commit 340605c 顶部钉死），
+  // 浮窗 bottom 贴到屏幕底 + dock 上方 —— wheel 滚到底时最后一行 todo 卡常被
+  // dock 栏盖住。Rust 端在 enter/exit bottomed 状态时 emit
+  // `usticky://floating-bottomed { value: bool }`，前端设 body[data-bottomed]
+  // 让 CSS 加 padding-bottom: 32px（styles.css line ~179），让最后一行滚到
+  // dock 上方仍有 32px 喘息。
+  //
+  // enter/exit edge 触发：**不**每次 resize 都发，避免高频小幅 resize 让
+  // 数据属性抖动引发 CSS 闪烁。前端单 listener 处理。
+  let unlistenBottomed: UnlistenFn | null = null;
+  listen<boolean>("usticky://floating-bottomed", (e) => {
+    const next = e.payload ? "1" : "";
+    if (document.body.dataset.bottomed === next) return;
+    if (next) document.body.dataset.bottomed = next;
+    else delete document.body.dataset.bottomed;
+  })
+    .then((fn) => (unlistenBottomed = fn))
+    .catch((e) => console.error("[usticky] listen floating-bottomed failed", e));
+
   // ── 渲染输入区（常驻） ──
   // 在拉 quick_add_shortcut 之前调，确保 hint 元素存在；拉到 shortcut 后再 updateInputHint 刷
   ensureInputBar();
@@ -1387,6 +1408,7 @@ async function init() {
     unlistenMoved?.();
     unlistenShortcut?.();
     unlistenBackdropRefresh?.();
+    unlistenBottomed?.();
     cleanupSortables();
     // 摘掉 hover listener（setHoverAttr 路径，命名引用）
     document.body.removeEventListener("mouseenter", onBodyMouseEnter);

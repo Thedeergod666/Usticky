@@ -221,6 +221,18 @@ pub async fn resize_floating_window(app: AppHandle, height: f64) -> Result<(), S
         // **不**调 set_position —— 顶部不动是用户的预期，resize 不能改 y。
         w.set_size(tauri::PhysicalSize::new(cur.width, final_h))
             .map_err(|e| e.to_string())?;
+        // 是否触底：前后高度都被 clamp 到 max（之前 height 也已贴到 max，
+        // 这次想涨但被压回 max）。这告诉前端："最后一行可能被 macOS
+        // dock 栏遮挡，加一段底部 padding 让 wheel 滚到底时还有喘息"。
+        //
+        // 不要 emit 之前未 bottomed 但本次仍然没 bottomed 的情况 —— 那
+        // 是一次无效事件，前端 toggle 没意义还可能动画闪烁。所以只在
+        // **进入 / 离开** bottomed 状态时 emit。
+        let was_bounded = cur.height >= max_h_in_mon;
+        let is_bounded = final_h >= max_h_in_mon;
+        if was_bounded != is_bounded {
+            let _ = app.emit("usticky://floating-bottomed", is_bounded);
+        }
     }
     Ok(())
 }
