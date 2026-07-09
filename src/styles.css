@@ -239,17 +239,15 @@ body[data-active] #app {
 /* ── Todo 卡片 ── */
 .todo-card {
   display: flex;
-  /* flex-start（不是 center）—— checkbox / due / delete 都贴顶对齐。
-   * 原因：title 在 hover-expand 时会从单行折成 2-4 行（见
-   * .todo-card.title-expanded .todo-title），align-items: center 会让
-   * checkbox 在 title 变长时跟着垂直居中 → 视觉"跳一下"。贴顶对齐
-   * 的话 hover-expand 前后 checkbox 位置完全不变，只 title 自己往下长。
-   *
-   * 单行时跟原来居中相比 checkbox 视觉差 ~0.5px（padding 9px vs
-   * 居中位置 9.5px），肉眼不可察觉。比"hover 时跳一下"好得多。 */
-  align-items: flex-start;
+  /* center —— 卡片整体垂直居中，让单行 title 视觉居中（解决"偏上"）。
+   * checkbox 用 align-self: flex-start 单独钉顶，不受 center 影响（见
+   * .todo-check 注释）。这样默认态：checkbox 钉顶 + title 居中 = 文字
+   * 视觉中心贴近卡片中心；hover-expand 多行：checkbox 仍钉顶，title
+   * 在自身 text box 内自然向下展开（.todo-title flex: 1 1 auto 占满
+   * 剩余高度）—— 0 跳。 */
+  align-items: center;
   gap: 10px;
-  padding: 9px 13px 8px;
+  padding: 9px 13px 9px;
   background: var(--tile-bg);
   backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
@@ -341,7 +339,7 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
   0% {
     opacity: 1;
     max-height: 200px;
-    padding: 9px 13px 8px;
+    padding: 9px 13px 9px;
     margin: 0;
     border-width: 1px;
   }
@@ -381,6 +379,12 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
   display: flex;
   align-items: center;
   justify-content: center;
+  /* align-self: flex-start —— 钉顶，**不**跟 .todo-card 的 align-items:
+   * center 走。配合 .todo-card 的 center 化：单行卡片里 checkbox 钉顶
+   * + title 居中 = 文字视觉中心贴近卡片中心；hover-expand 多行时
+   * checkbox 仍钉顶，title 在自身 flex 区域自然向下展开 —— 0 跳。
+   * 这是用户期望的"checkbox 钉原位，文字居中"的关键一行。 */
+  align-self: flex-start;
   transition: border-color 0.2s, background-color 0.2s;
 }
 .todo-check:hover { border-color: var(--c-data-ok); }
@@ -404,6 +408,11 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
   color: var(--text-bright);
   letter-spacing: -0.1px;
   text-shadow: var(--text-shadow);
+  /* line-height: 1 —— 默认 1.4 (~18px text box) 让 flex-start 下文字顶部
+   * 跟 18px checkbox 顶部对齐 → 文字基线明显高于 checkbox 中心 → 视觉
+   * "偏上"。压到 1 (13px text box) 后文字视觉中心贴近 checkbox 中心，
+   * 单行卡片里"checkbox + 文字"整体更居中。 */
+  line-height: 1;
   /* ease-out-quint：开头快结尾稳 —— hover 进入时颜色"马上出现然后平滑过渡" */
   transition: color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
               text-shadow 0.22s cubic-bezier(0.22, 1, 0.36, 1);
@@ -420,12 +429,17 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
  *     保留 .todo-title 上的原生 title= tooltip 给"真要看全文"的用户。
  *   - 不加 height / max-height transition —— 跟 styles.css:88-94 一致，
  *     layout 属性不做 spring；展开瞬时即可。
- *   - .todo-card 已用 align-items: flex-start（见 line 113 注释），
- *     checkbox 在 hover-expand 前后位置不变，只 title 往下长。
+ *   - .todo-card 默认 align-items: center（2026-07-09 改）+ .todo-title
+ *     line-height: 1（text box 13px）—— 单行卡片里 title 视觉居中，
+ *     checkbox 用 align-self: flex-start 钉顶（不受 card center 影响），
+ *     解决"偏上"且 hover-expand 多行时 checkbox 0 跳。
  *   - word-break: break-word + overflow-wrap: anywhere —— CJK 长串字符
  *     和超长英文 token 都能在边界断行，不会撑出 flex 容器。 */
 .todo-card.title-expanded .todo-title {
   white-space: normal;
+  /* 多行展开时 line-height 拉回 1.4 —— 默认值附近，避免 line-height: 1
+   * 让 4 行文字挤成 52px 太紧，行间无呼吸。 */
+  line-height: 1.4;
   word-break: break-word;
   overflow-wrap: anywhere;
   display: -webkit-box;
