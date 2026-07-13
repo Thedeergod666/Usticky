@@ -197,7 +197,7 @@ html, body {
  * 数据属性抖动引发 CSS 闪烁。只在 enter/exit edge 上发。
  */
 body[data-bottomed] #app {
-  padding-bottom: 32px;
+  padding-bottom: 100px;
 }
 
 /* ── 鼠标进入窗口 → 唤醒浮窗全强度（iOS 26 玻璃效果） ──
