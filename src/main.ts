@@ -309,7 +309,11 @@ function render(snap: TodoSnapshot) {
 
   if (done.length > 0) {
     const header = document.createElement("div");
-    header.className = "section-header";
+    // 多加 .section-header-done —— idle（未 hover）下 CSS 把这条 header
+    // 完全透明（包括 "DONE · N" 文字），让 done 区块在浮窗静止时彻底
+    // "折叠"到背景里（标题文字也已划掉且弱化，header 自身再隐藏
+    // = 完成区几乎只剩几道勾圈痕迹）。hover 时回归可见。
+    header.className = "section-header section-header-done";
     header.textContent = `${t("app.section.done")} · ${done.length}`;
     list.appendChild(header);
     const ul = document.createElement("div");

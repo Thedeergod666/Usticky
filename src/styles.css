@@ -666,6 +666,46 @@ body[data-narrow="1"] .todo-input-hint {
   transition: color 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
+/* ── todo-section-done：idle → hover 的透明度过渡 ──
+ * idle 下整个 done section 渐变到 opacity: 0（见下方规则），
+ * hover 回到 1。复用全局 cubic-bezier(0.22, 1, 0.36, 1) iOS spring，
+ * 跟 .todo-card / .section-header 的色彩过渡节奏一致。 */
+.todo-section-done {
+  transition: opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ── Done section header —— idle（未 hover）下完全透明 ──
+ *
+ * 用户诉求："让 done 的指令在鼠标未 hover 浮窗时完全透明，包括
+ * 'done' 这行文字" —— 进一步澄清："完全透明是直接看到背景而不是
+ * 毛玻璃"。意图：浮窗静止时整个 done section（header + 所有 done
+ * card）彻底从视野里消失，桌面背景直接露出来 —— 没毛玻璃、没卡片、
+ * 没勾圈、没划线标题。hover 时整段 opacity 渐变回 1，"浮现"。
+ *
+ * 实现：
+ *   - section header 文字：color: transparent + text-shadow: none
+ *   - 整个 done section（header + 所有 card）：opacity: 0 + pointer-
+ *     events: none —— 让背后的桌面背景直接可见，且不挡 hover 状态机
+ *     （悬停事件能穿透到 done section 上方的 pending section，
+ *     避免 idle 下浮窗局部仍响应事件误触发）。
+ *   - DOM / 占位 / 浮窗高度全部不变 —— 间隙（gap 6px + header 高度
+ *     + cards）仍占位，hover 时不需要重新布局，0 跳位。
+ *
+ * 只动 alpha（color + text-shadow + opacity），**不动 backdrop-filter
+ * / --tile-blur**（v3 idle fadeaway 的设计原则）—— 不踩 WKWebView
+ * backdrop throttling 2s 丢失根因。
+ *
+ * 低电量模式 (data-low-power) 不应用 —— 已锁全强度，done section
+ * 始终可见。 */
+body:not([data-hover]):not([data-low-power]) .section-header-done {
+  color: transparent;
+  text-shadow: none;
+}
+body:not([data-hover]):not([data-low-power]) .todo-section-done {
+  opacity: 0;
+  pointer-events: none;
+}
+
 /* ── 空态 ── */
 .empty-state {
   display: flex;
