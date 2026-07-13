@@ -278,41 +278,65 @@ body[data-active] #app {
 }
 .todo-card:active { cursor: grabbing; }
 .todo-card.dragging { opacity: 0.5; transform: scale(0.98); }
-
-/* SortableJS forceFallback 模式下会克隆一张 .todo-card 出来当"跟手"
- * 的 ghost（带 .sortable-drag + .sortable-fallback 两个 class）。因为
- * Sortable 默认 clone 走 `document.body`（fallbackOnBody: true），克隆
- * 元素脱离了 #app 的 CSS 变量作用域（--text-bright 等都定义在 #app 上），
- * 标题文字会回落到浏览器默认色（黑色）—— 视觉上一拖卡片文字就变黑。
- * 显式 hard-code 颜色到这两个 class 上，跟原卡片保持一致。
- *
- * cursor: grabbing：拖动中显示抓手代替默认箭头，避免 drag clone 上的
- * 鼠标 cursor 跟原生 cursor 抢视觉焦点。 */
-.sortable-drag,
-.sortable-fallback {
-  cursor: grabbing;
-  /* 强制继承原卡片的颜色变量（即便 clone 已经在 body 上，Cascade 不允许
-   * 跨 #app 边界读 var，所以这里写死 fallback 路径的颜色值）。idle/hover
-   * 两个 layer 都得给，因为 clone 出现时卡片可能正处在任何一态。 */
-  color: rgba(255, 255, 255, 0.78);
-}
-.todo-card.sortable-drag .todo-title,
-.todo-card.sortable-fallback .todo-title {
-  /* 标题用更亮的 --text-bright（hover 态 0.98）—— 拖动期间 hover 已经
-   * 触发（用户在拖 = 在卡片上），clone 应渲染 hover 视觉。 */
-  color: rgba(255, 255, 255, 0.98);
-  text-shadow: none;
-}
-.todo-card.sortable-drag .todo-check,
-.todo-card.sortable-fallback .todo-check,
-.todo-card.sortable-drag .todo-delete,
-.todo-card.sortable-fallback .todo-delete {
-  color: rgba(255, 255, 255, 0.78);
-}
 .todo-card.sortable-chosen {
   /* chosen 是被选中但还没开始动的卡片（mousedown 后、mousemove 前），
    * 视觉上轻微淡化提示"在动"但不抢戏。drag 真正开始后 ghost 占主导。 */
   opacity: 0.7;
+}
+.todo-card.dragging,
+.todo-card.sortable-chosen,
+.todo-card.sortable-drag,
+.todo-card.sortable-fallback {
+  cursor: grabbing;
+}
+
+/* 拖拽中三态共用的"只显示标题"规则。
+ *
+ * SortableJS 一次拖拽里 .todo-card 可能带的 class：
+ *   - sortable-chosen：mousedown 后被选中的 source 卡（留在原位）
+ *   - dragging：ghostClass 命名的占位卡（出现在目标 slot）
+ *   - sortable-drag + sortable-fallback：forceFallback 模式下跟随光标的浮动克隆
+ *
+ * 三种状态都"不该看到 checkbox / 删除按钮 / due 标签"：
+ *   - chosen 在原位透明显示完整控件是冗余（用户知道自己选了这张）
+ *   - ghost 占位是个高亮提示，不该完整携带图标信息
+ *   - drag 浮动克隆盖在 source 上，画完整控件视觉太重
+ *
+ * Hide 规则归一：所有四态都隐藏三个控件，加窄 padding 让标题贴左、
+ * 卡片视觉重心回到标题文字本身。 */
+.todo-card.dragging .todo-check,
+.todo-card.dragging .todo-delete,
+.todo-card.dragging .todo-due,
+.todo-card.sortable-chosen .todo-check,
+.todo-card.sortable-chosen .todo-delete,
+.todo-card.sortable-chosen .todo-due,
+.todo-card.sortable-drag .todo-check,
+.todo-card.sortable-drag .todo-delete,
+.todo-card.sortable-drag .todo-due,
+.todo-card.sortable-fallback .todo-check,
+.todo-card.sortable-fallback .todo-delete,
+.todo-card.sortable-fallback .todo-due {
+  display: none;
+}
+.todo-card.dragging,
+.todo-card.sortable-chosen,
+.todo-card.sortable-drag,
+.todo-card.sortable-fallback {
+  padding-left: 11px;
+}
+
+/* SortableJS forceFallback 模式下，浮动克隆被 append 到 document.body
+ * 上（fallbackOnBody: true），脱离 #app 的 CSS 变量作用域。标题用的
+ * `color: var(--text-bright)` 没变量可解析，回落到浏览器默认黑色 →
+ * "拖卡片文字变黑"。在两个 clone class 上显式 hard-code 颜色。 */
+.sortable-drag,
+.sortable-fallback {
+  color: rgba(255, 255, 255, 0.78);
+}
+.todo-card.sortable-drag .todo-title,
+.todo-card.sortable-fallback .todo-title {
+  color: rgba(255, 255, 255, 0.98);
+  text-shadow: none;
 }
 
 /* 已完成的 todo：fade out + 删除线
