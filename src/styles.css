@@ -125,7 +125,10 @@ html, body {
    * 缩小 → 浮窗"只长不缩"。max-height:100% 保留：内容超过窗口（屏幕高度
    * clamp 后）时由 overflow-y 滚动兜底。 */
   max-height: 100%;
-  padding: 5px;
+  /* padding-bottom 固定 100px —— 任何时候都给最后一行 todo 卡留出"wheel
+   * 滚到底不被 macOS dock 切断"的喘息带（覆盖 dock 80px + 12px
+   * BOTTOM_MARGIN_PX + 余量）。顶部和左右 5px 不变。 */
+  padding: 5px 5px 100px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -177,28 +180,11 @@ html, body {
 }
 #app:active { cursor: grabbing; }
 
-/* ── 触底：浮窗高度被 clamp 到屏幕底部（dock 之上）时 ──
- *
- * 业务背景：当浮窗 bottom 已贴到所在屏幕底部（再加 content 也只能
- * wheel 滚），wheel 滚到尽头后最后一行 todo 卡**仍然可能被 macOS
- * dock 栏遮挡**（dock 默认 80px，auto-hide 时不占但浮窗仍然到底）——
- * 用户的视觉锚点是"最后完整可见的那一行"，dock 把它切断。
- *
- * 修复：body[data-bottomed]=1 时 #app padding-bottom 加到 32px（保守
- * 覆盖标准 dock 80px 高的 40%，加上 12px BOTTOM_MARGIN_PX 后正好把
- * 最后一行垫到 dock 上方可见区）。CSS variable 用 --bottomed-pad
- * 控制，方便 hover / idle 调。
- *
- * 顶部 padding 不变 —— 只垫底，不打乱现有视觉布局。
- *
- * Rust 端在 resize_floating_window 检测到 enter/exit bottomed 状态时
- * emit usticky://floating-bottomed { value: bool }，前端 toggle 这
- * 个属性。**不**在每次 resize 都 emit —— 高频小幅 resize 会让
- * 数据属性抖动引发 CSS 闪烁。只在 enter/exit edge 上发。
+/* 触底：浮窗高度被 clamp 到屏幕底部（dock 之上）时 —— 历史注释已废，
+ * padding-bottom 现在是 #app 默认值（见上方 padding: 5px 5px 100px），
+ * 不再依赖 body[data-bottomed] data 属性。Rust 端 usticky://floating-bottomed
+ * 事件仍在 emit（edge trigger），前端 listener 保留，但 CSS 不再消费它。
  */
-body[data-bottomed] #app {
-  padding-bottom: 100px;
-}
 
 /* ── 鼠标进入窗口 → 唤醒浮窗全强度（iOS 26 玻璃效果） ──
  *
@@ -292,6 +278,42 @@ body[data-active] #app {
 }
 .todo-card:active { cursor: grabbing; }
 .todo-card.dragging { opacity: 0.5; transform: scale(0.98); }
+
+/* SortableJS forceFallback 模式下会克隆一张 .todo-card 出来当"跟手"
+ * 的 ghost（带 .sortable-drag + .sortable-fallback 两个 class）。因为
+ * Sortable 默认 clone 走 `document.body`（fallbackOnBody: true），克隆
+ * 元素脱离了 #app 的 CSS 变量作用域（--text-bright 等都定义在 #app 上），
+ * 标题文字会回落到浏览器默认色（黑色）—— 视觉上一拖卡片文字就变黑。
+ * 显式 hard-code 颜色到这两个 class 上，跟原卡片保持一致。
+ *
+ * cursor: grabbing：拖动中显示抓手代替默认箭头，避免 drag clone 上的
+ * 鼠标 cursor 跟原生 cursor 抢视觉焦点。 */
+.sortable-drag,
+.sortable-fallback {
+  cursor: grabbing;
+  /* 强制继承原卡片的颜色变量（即便 clone 已经在 body 上，Cascade 不允许
+   * 跨 #app 边界读 var，所以这里写死 fallback 路径的颜色值）。idle/hover
+   * 两个 layer 都得给，因为 clone 出现时卡片可能正处在任何一态。 */
+  color: rgba(255, 255, 255, 0.78);
+}
+.todo-card.sortable-drag .todo-title,
+.todo-card.sortable-fallback .todo-title {
+  /* 标题用更亮的 --text-bright（hover 态 0.98）—— 拖动期间 hover 已经
+   * 触发（用户在拖 = 在卡片上），clone 应渲染 hover 视觉。 */
+  color: rgba(255, 255, 255, 0.98);
+  text-shadow: none;
+}
+.todo-card.sortable-drag .todo-check,
+.todo-card.sortable-fallback .todo-check,
+.todo-card.sortable-drag .todo-delete,
+.todo-card.sortable-fallback .todo-delete {
+  color: rgba(255, 255, 255, 0.78);
+}
+.todo-card.sortable-chosen {
+  /* chosen 是被选中但还没开始动的卡片（mousedown 后、mousemove 前），
+   * 视觉上轻微淡化提示"在动"但不抢戏。drag 真正开始后 ghost 占主导。 */
+  opacity: 0.7;
+}
 
 /* 已完成的 todo：fade out + 删除线
  *

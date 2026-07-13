@@ -198,21 +198,86 @@ impl Store {
         Some(self.data.todos.remove(idx))
     }
 
-    /// 拖拽后批量更新 order。
-    /// `ids` 是新顺序（按 status 内顺序传入，由 IPC caller 保证）。
+    /// 拖拽后批量重排（按 status 内顺序）。
     ///
-    /// 只在 `t.order != i as i32` 时才刷新 updated_at —— 拖一下整 section
-    /// 都不改 order 时（例如前端重排但 ids 没变），不应产生"更新时间"噪声。
+    /// `ids` 是 section 局部的新顺序（IPC caller 即前端 SortableJS
+    /// `onEnd` 给的 DOM 顺序），仅包含被拖拽 section 的 todos。
+    ///
+    /// 实现要点（修复 v0.1.x 拖了无反应的 bug）：
+    ///   1. **物理重排** `self.data.todos` —— 按 `ids` 的新顺序替换原 section
+    ///      在 Vec 里的位置（其他 status 的 todo 完全保留原位置）。
+    ///      只改 `t.order` 而不挪 Vec 是不行的，前端 `render` 用 `.filter()`
+    ///      取的是 Vec 的数组顺序而不是按 order 排序，拖了看不到效果。
+    ///   2. 顺带把 `t.order` 写成 section 局部索引（0,1,2,...，仅在被拖
+    ///      section 内），跟 `add()` 的 `max_order + 1` 保持一致 —— 不被
+    ///      改动的 todo `order` 保持原值，跨重启仍能正确还原。
+    ///   3. 只在 `t.order` 变化时刷新 updated_at —— 拖了但 ids 顺序没变
+    ///      时不应产生"更新时间"噪声（前版注释意图）。
     pub fn reorder(&mut self, ids: &[String]) {
-        for (i, id) in ids.iter().enumerate() {
-            if let Some(t) = self.data.todos.iter_mut().find(|t| &t.id == id) {
-                let new_order = i as i32;
-                if t.order != new_order {
-                    t.order = new_order;
-                    t.updated_at = chrono::Utc::now().timestamp_millis();
-                }
+        if ids.is_empty() {
+            return;
+        }
+
+        // 1. 找被拖 section 在 Vec 里的最早位置 —— 作为新顺序的锚点。
+        //    不依赖"section 在 Vec 里连续"的假设：防御 add/update 之后
+        //    pending/done 在数组里穿插（虽然 add() 总 append，但 v0.2
+        //    之后可能改）。
+        let id_set: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let base_idx = match self.data.todos.iter().position(|t| id_set.contains(t.id.as_str())) {
+            Some(i) => i,
+            None => return,  // ids 全部找不到 —— 防御，不动 store
+        };
+
+        // 2. 把"被拖集合"按 ids 新顺序抽出来。若某 id 在 ids 里但
+        //    self.data.todos 找不到（防御），整批跳过 —— 不让 store
+        //    进入不一致状态。
+        let mut moved: Vec<Todo> = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.data.todos.iter().find(|t| &t.id == id) {
+                Some(t) => moved.push(t.clone()),
+                None => return,
             }
         }
+
+        // 3. 重建 Vec：base_idx 之前的不动 todo 原样搬过去，到 base_idx
+        //    位置把整段 moved 写进去（同时刷 section-local order），再
+        //    续接剩余不动 todo。moved 在循环里 consume 一次。
+        let mut new_todos: Vec<Todo> = Vec::with_capacity(self.data.todos.len());
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut moved_drained = false;
+        let mut moved_iter = moved.into_iter();
+        for (i, todo) in self.data.todos.drain(..).enumerate() {
+            if id_set.contains(todo.id.as_str()) {
+                // 原位置属于"被拖集合" —— 不写回，等会儿由 moved_iter 占据
+                continue;
+            }
+            if !moved_drained && i >= base_idx {
+                // 这是 base_idx 位置或之后的第一个不动 todo —— 在它前面
+                // 灌入整段 moved，每条写一个 section-local order。
+                for (j, mut m) in (&mut moved_iter).enumerate() {
+                    let new_order = j as i32;
+                    if m.order != new_order {
+                        m.order = new_order;
+                        m.updated_at = now;
+                    }
+                    new_todos.push(m);
+                }
+                moved_drained = true;
+            }
+            new_todos.push(todo);
+        }
+        // 防御：万一 moved_drained 没触发（base_idx 之后所有 todo 都
+        // 是 moved，整个拖拽后没有"空位锚"），把剩余 moved 接到尾巴。
+        for (j, mut m) in moved_iter.enumerate() {
+            let new_order = j as i32;
+            if m.order != new_order {
+                m.order = new_order;
+                m.updated_at = now;
+            }
+            new_todos.push(m);
+        }
+
+        self.data.todos = new_todos;
     }
 
     pub fn last_window_geom(&self) -> &WindowGeom {
@@ -355,4 +420,195 @@ fn backup_corrupt_file(path: &Path) -> Result<()> {
     let backup = path.with_extension(format!("json.bak.{}", ts));
     fs::rename(path, backup).context("backup corrupt file")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod reorder_tests {
+    use super::*;
+
+    /// Build a minimal StoreData + Store bypassing `load_or_init` (which
+    /// needs AppHandle for data dir). Tests run on the in-memory methods
+    /// that reorder / add / etc. actually mutate.
+    fn fresh_store(todos: Vec<Todo>) -> Store {
+        Store {
+            data: StoreData {
+                todos,
+                ..StoreData::default()
+            },
+            data_path: Mutex::new(None),
+            persist_lock: Mutex::new(()),
+        }
+    }
+
+    fn mk(id: &str, status: TodoStatus, order: i32) -> Todo {
+        Todo {
+            id: id.to_string(),
+            title: id.to_string(),
+            status,
+            priority: TodoPriority::P2,
+            created_at: 0,
+            updated_at: 0,
+            due_at: None,
+            tags: vec![],
+            order,
+        }
+    }
+
+    fn ids(store: &Store) -> Vec<String> {
+        store.data.todos.iter().map(|t| t.id.clone()).collect()
+    }
+
+    /// 修复的回归测试：拖拽后 store 的 Vec 顺序必须**物理**改变 —— 仅
+    /// 改 `t.order` 字段但 Vec 仍是插入顺序时，前端 `.filter()` 渲染
+    /// 看不出区别。
+    #[test]
+    fn reorder_physically_reorders_vec() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+            mk("c", TodoStatus::Pending, 2),
+        ]);
+        s.reorder(&["c".into(), "a".into(), "b".into()]);
+        assert_eq!(ids(&s), vec!["c", "a", "b"]);
+        // section-local order 也在 0..N-1 重写
+        assert_eq!(s.data.todos[0].order, 0);
+        assert_eq!(s.data.todos[1].order, 1);
+        assert_eq!(s.data.todos[2].order, 2);
+    }
+
+    /// 跨 status 拖拽：done 段重排不影响 pending 段的 Vec 位置。
+    #[test]
+    fn reorder_preserves_other_status_positions() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+            mk("c", TodoStatus::Done, 2),
+            mk("d", TodoStatus::Done, 3),
+        ]);
+        // done 段从 [c, d] 重排为 [d, c]
+        s.reorder(&["d".into(), "c".into()]);
+        assert_eq!(ids(&s), vec!["a", "b", "d", "c"]);
+        // pending 段 order 保持原值（没被拖到）
+        assert_eq!(s.data.todos[0].order, 0);
+        assert_eq!(s.data.todos[1].order, 1);
+        // done 段被刷成 section-local 0, 1
+        assert_eq!(s.data.todos[2].order, 0);
+        assert_eq!(s.data.todos[3].order, 1);
+    }
+
+    /// 拖中间：拖的新顺序里既有 pending 也有不是本段的（API 防御）。
+    /// 现在 pending 段只有 a,b,c —— 模拟 input 传了 done id 的坏情况，
+    /// 这种 ids 找不到 → store 不动。
+    #[test]
+    fn reorder_no_op_when_ids_missing() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+        ]);
+        s.reorder(&["z".into(), "x".into()]);  // 全是找不到的 id
+        assert_eq!(ids(&s), vec!["a", "b"]);
+        assert_eq!(s.data.todos[0].order, 0);
+        assert_eq!(s.data.todos[1].order, 1);
+    }
+
+    /// 防御：`ids` 在 self.data.todos 里只找得到一部分 —— 整批拒绝，
+    /// 不让 store 进入不一致。
+    #[test]
+    fn reorder_partial_match_aborts() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+        ]);
+        s.reorder(&["a".into(), "ghost".into()]);
+        // ghost 找不到 → 整批不动
+        assert_eq!(ids(&s), vec!["a", "b"]);
+    }
+
+    /// 空 ids → no-op，不 crash。
+    #[test]
+    fn reorder_empty_is_noop() {
+        let mut s = fresh_store(vec![mk("a", TodoStatus::Pending, 0)]);
+        s.reorder(&[]);
+        assert_eq!(ids(&s), vec!["a"]);
+    }
+
+    /// 拖"看似相同"：ids 顺序与现状相同 → 不应刷 updated_at（避免噪点）。
+    /// 实现：用 mutate_count 代 updated_at 不好测，改用比较 updated_at 是否动过。
+    #[test]
+    fn reorder_no_updated_at_bump_when_position_unchanged() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+        ]);
+        // 设 known updated_at：选一个远未来值，避免跟 now() 时间戳巧合
+        let pinned = 1_700_000_000_000i64;
+        for t in s.data.todos.iter_mut() {
+            t.updated_at = pinned;
+        }
+        s.reorder(&["a".into(), "b".into()]);  // 同顺序
+        // ids 没动 → updated_at 也不动
+        for t in &s.data.todos {
+            assert_eq!(t.updated_at, pinned, "no-op reorder bumped updated_at");
+        }
+    }
+
+    /// 跨 status 边界（pending 段在 done 段之后）也能正确锚定。
+    #[test]
+    fn reorder_when_section_at_array_end() {
+        // done 段在 Vec 末尾，拖它时 base_idx 指到尾段第一个 done
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Done, 1),
+            mk("c", TodoStatus::Done, 2),
+        ]);
+        s.reorder(&["c".into(), "b".into()]);
+        assert_eq!(ids(&s), vec!["a", "c", "b"]);
+        assert_eq!(s.data.todos[1].order, 0);
+        assert_eq!(s.data.todos[2].order, 1);
+    }
+
+    /// 回归测试：用真实 todos.json（用户在 macOS 上的当前数据）模拟
+    /// 一次 pending 段拖拽，确认 reorder 后 `data.todos` 的 Vec 顺序
+    /// 真的变了 —— 之前 order 字段被写但 Vec 没动，前端 `.filter()`
+    /// 取的还是旧顺序，所以拖了"无效果"。
+    #[test]
+    fn reorder_real_data_pending_changes_array_order() {
+        let mut s = fresh_store(vec![
+            mk("26", TodoStatus::Pending, 0),       // 26年百度智能云考试能力提升
+            mk("123", TodoStatus::Pending, 1),      // 123123...
+            mk("5", TodoStatus::Pending, 3),
+            mk("6", TodoStatus::Pending, 4),
+            mk("9", TodoStatus::Done, 2),
+            mk("10", TodoStatus::Done, 3),
+            mk("2", TodoStatus::Done, 5),
+            mk("3", TodoStatus::Done, 6),
+            mk("4", TodoStatus::Done, 7),
+            mk("1", TodoStatus::Pending, 5),
+        ]);
+        // 模拟把 pending 段中"26"(index 0) 拖到"5"之后 —— section 内新顺序
+        s.reorder(&[
+            "123".into(),
+            "5".into(),
+            "26".into(),
+            "6".into(),
+            "1".into(),
+        ]);
+        // 验证 Vec 顺序变化（done 段位置不动）
+        assert_eq!(ids(&s), vec![
+            "123", "5", "26", "6", "1",
+            "9", "10", "2", "3", "4",
+        ]);
+        // pending 段的 Vec 切片顺序 = 新顺序
+        let pending: Vec<&str> = s.data.todos.iter()
+            .filter(|t| t.status == TodoStatus::Pending)
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(pending, vec!["123", "5", "26", "6", "1"]);
+        // done 段的 Vec 切片顺序 = 原序（未动）
+        let done: Vec<&str> = s.data.todos.iter()
+            .filter(|t| t.status == TodoStatus::Done)
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(done, vec!["9", "10", "2", "3", "4"]);
+    }
 }

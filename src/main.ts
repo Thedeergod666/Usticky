@@ -45,6 +45,9 @@ const app = document.getElementById("app")!;
 let lastRenderedSnap: TodoSnapshot | null = null;
 let lastFitFingerprint: string | null = null;
 let sortableInstances: Sortable[] = [];  // 保存实例，cleanup 用
+let isDragging = false;  // 自己跟踪 SortableJS 拖拽状态（比 sortableInstances[i].dragEl 可靠，
+                          // SortableJS 偶尔会在某些边界场景里遗留 dragEl 不清，导致后续
+                          // render 永远被 blocking）。进入 onStart 时置 true，onEnd 置 false。
 
 // 浮窗层级模式（pin_top / pin_bottom / normal）
 // 启动时从后端 get_pin_mode 拉，跟 usticky://pin-mode-changed 事件同步
@@ -267,10 +270,12 @@ function render(snap: TodoSnapshot) {
     return;
   }
 
-  // 检测当前是否在拖拽 —— 若在拖，destroy Sortable 会让 drag 中断。
-  // 拖拽期间跳过一次重建，待 onEnd 后下一次 render 再统一刷新。
-  const dragging = sortableInstances.some((s) => (s as any).dragEl != null);
-  if (dragging) return;
+  // 拖拽期间跳过一次重建，待 onEnd 后由 emit("todos-changed") 走下
+  // 一次 render 统一刷新。自己跟踪 `isDragging` 而不是读 SortableJS
+  // 的 `dragEl` —— forceFallback 下 dragEl 时序跟 DOM 事件不同步，
+  // 上一版用 `sortableInstances[i].dragEl` 偶尔会被 SortableJS 留在
+  // 旧状态卡住，导致后续 render 全部被挡。
+  if (isDragging) return;
 
   // 清掉旧内容（保留 input / foot）
   cleanupSortables();
@@ -327,26 +332,36 @@ function render(snap: TodoSnapshot) {
 
   app.appendChild(list);
 
-  // 挂 SortableJS
+  // 挂 SortableJS。
+  //
+  // 关键选项：
+  //   - `forceFallback: true`：用 SortableJS 自己的 mousedown/move/up
+  //     实现，不用 HTML5 drag-and-drop。原因：Tauri WKWebView + macOS
+  //     上 HTML5 dragstart 在拖出卡片边缘时被 `-webkit-user-drag` /
+  //     `cursor: grab` 等样式吃掉，导致 `onEnd` 不触发 / 延迟触发；
+  //     fallback 路径走纯鼠标事件 + ghost 元素，跨平台一致。
+  //   - `ghostClass: "dragging"`：拖拽时占位元素加 `.dragging` class，
+  //     styles.css 把它设成半透明 + 微缩，提醒用户"这张是 ghost"。
+  //   - `animation: 150`：松手后归位动画（CSS transform）。
+  //   - `onEnd: handleDragEnd`：发 reorder_todos IPC。
+  const sortableOpts: Sortable.Options = {
+    animation: 150,
+    ghostClass: "dragging",
+    forceFallback: true,
+    fallbackOnBody: true,
+    onStart: () => { isDragging = true; },
+    onEnd: (evt) => {
+      isDragging = false;
+      void handleDragEnd(evt);
+    },
+  };
   const pendingSection = list.querySelector<HTMLElement>(".todo-section-pending");
   if (pendingSection) {
-    sortableInstances.push(
-      new Sortable(pendingSection, {
-        animation: 150,
-        ghostClass: "dragging",
-        onEnd: handleDragEnd,
-      }),
-    );
+    sortableInstances.push(new Sortable(pendingSection, sortableOpts));
   }
   const doneSection = list.querySelector<HTMLElement>(".todo-section-done");
   if (doneSection) {
-    sortableInstances.push(
-      new Sortable(doneSection, {
-        animation: 150,
-        ghostClass: "dragging",
-        onEnd: handleDragEnd,
-      }),
-    );
+    sortableInstances.push(new Sortable(doneSection, sortableOpts));
   }
 
   // 输入中禁止 autoResize —— scrollHeight 跳变会打断输入（AGENTS.md #18）
@@ -615,14 +630,24 @@ async function deleteTodo(todo: Todo) {
 }
 
 async function handleDragEnd(evt: Sortable.SortableEvent) {
-  // 收集新顺序，批量提交
-  const section = evt.to as HTMLElement;
+  // SortableJS `evt.to` 在 onEnd 触发时已经是被移动后的 DOM，所以直接
+  // querySelectorAll 拿到的是最终位置（前段原始 → 落入新位置 → onEnd），
+  // 跟视觉顺序一致。
+  const section = (evt.to as HTMLElement).closest<HTMLElement>(".todo-section")
+    ?? (evt.to as HTMLElement);
   const ids: string[] = [];
   section.querySelectorAll<HTMLElement>(".todo-card").forEach((el) => {
     if (el.dataset.todoId) ids.push(el.dataset.todoId);
   });
+  // 防御：不到 2 条的拖拽（理论上极少发生：用户拖了 = 至少 2 条在 section）
+  // 不浪费一次 IPC；单条 reorder 也是 no-op 但无害，省一次往返。
+  if (ids.length < 2) return;
   try {
     await invoke("reorder_todos", { ids });
+    // 成功后不强推 render —— 后端 emit("usticky://todos-changed") 会
+    // 走到 frontend listener 触发 render。重复 render 在某些路径下会
+    // 跟 SortableJS 的内部 DOM 状态机打架（dragEl 判断会出现"刚
+    // onEnd 完 dragEl 可能还没被清除"的窗口期）。
   } catch (e) {
     console.error("[usticky] reorder_todos failed", e);
   }
@@ -631,6 +656,10 @@ async function handleDragEnd(evt: Sortable.SortableEvent) {
 function cleanupSortables() {
   for (const s of sortableInstances) s.destroy();
   sortableInstances = [];
+  // 防御：cleanup 时如果还有遗留的 dragging 状态（理论上 should clear
+  // onEnd 已经处理，但跨 webview 某些边界 / 异常路径可能遗漏），重置，
+  // 不让后续 render 永久被挡。
+  isDragging = false;
 }
 
 // ── 编辑 todo ──
