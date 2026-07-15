@@ -49,6 +49,14 @@ let isDragging = false;  // 自己跟踪 SortableJS 拖拽状态（比 sortableI
                           // SortableJS 偶尔会在某些边界场景里遗留 dragEl 不清，导致后续
                           // render 永远被 blocking）。进入 onStart 时置 true，onEnd 置 false。
 
+/// SortableJS filter 用的"不可拖拽"子元素选择器 —— 命中即跳过拖拽判定，
+/// 让原生 click 事件正常派发到这些按钮上。这是修复"完成/取消完成/删除
+/// 被拖拽吞掉"的关键配置（详见 sortableOpts 注释）。
+///
+/// 未来新增"不应被 SortableJS 当作拖拽起点"的卡内控件（如优先级 chip、
+/// 标签按钮），只需把选择器追加到这条常量里。
+const NON_DRAGGABLE_SELECTORS = ".todo-check, .todo-delete, .todo-edit-input";
+
 // 浮窗层级模式（pin_top / pin_bottom / normal）
 // 启动时从后端 get_pin_mode 拉，跟 usticky://pin-mode-changed 事件同步
 type PinMode = "pin_top" | "pin_bottom" | "normal";
@@ -344,11 +352,21 @@ function render(snap: TodoSnapshot) {
   //     styles.css 把它设成半透明 + 微缩，提醒用户"这张是 ghost"。
   //   - `animation: 150`：松手后归位动画（CSS transform）。
   //   - `onEnd: handleDragEnd`：发 reorder_todos IPC。
+  //   - `filter: NON_DRAGGABLE_SELECTORS`：在 mousedown 阶段如果 target 命中这些
+  //     选择器，SortableJS 立即终止当前拖拽候选，**不**进入 `.sortable-chosen`
+  //     态。这是修复"完成/取消完成/删除被吞"的关键：原版 SortableJS 在
+  //     mousedown 阶段会 preventDefault 后续 click 事件，且把整个 .todo-card
+  //     切到 chosen 态（即便用户其实是想点 check/delete 按钮）。filter 让
+  //     SortableJS 在按钮 mousedown 时直接放手，click 正常派发到按钮。
+  //   - `preventOnFilter: true`：命中 filter 时让原生事件继续走（click 仍能
+  //     派发到 checkbox / delete），而不是被 SortableJS 拦死。
   const sortableOpts: Sortable.Options = {
     animation: 150,
     ghostClass: "dragging",
     forceFallback: true,
     fallbackOnBody: true,
+    filter: NON_DRAGGABLE_SELECTORS,
+    preventOnFilter: true,
     onStart: () => { isDragging = true; },
     onEnd: (evt) => {
       isDragging = false;
