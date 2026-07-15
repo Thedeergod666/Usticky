@@ -205,15 +205,22 @@ function cssEscape(s: string): string {
 /// `document.elementFromPoint`。
 ///
 /// 跨平台 Y 轴差异：
-///   - **macOS**：`NSEvent.mouseLocation()` 是 bottom-left origin，
-///     跟 CSS `elementFromPoint` 期待的 top-left 反着。要先 `screenH - y`
-///     翻一次。**用 `screen.height`（full screen）而不是 `availHeight`
-///     （work area）** —— mouseLocation 用 full screen 坐标系（含 menu bar），
-///     但 Tauri `innerPosition` 用 work area 坐标系（去掉 menu bar）。两个
-///     基准一起用 flip 才准确：full screen 翻一次 → work area，再减 work
-///     area 位置的 innerPosition = relativeY。
+///   - **macOS**：`NSEvent.mouseLocation()` 是 bottom-left origin
+///     of **main display**（global screen coords，logical points），
+///     跟 CSS `elementFromPoint` 期待的 top-left 反着。要先
+///     `screenH - y` 翻一次到 top-origin。
 ///   - **Win**：`GetCursorPos` 已是 top-left origin 且 Rust 已转 logical，
 ///     直接用。
+///
+/// `winY` 来自 Tauri `innerPosition()`（tao 0.35.3
+/// `bottom_left_to_top_left`），该函数用 `pixels_high()`（物理像素）
+/// 减 `origin.y + height`（logical points）→ mixed-unit。对 Retina
+/// scale=2，返回值比正确的 frame top Y (in main top-origin logical)
+/// 多了 `fullScreenH`。所以这里不传修正后的 winY，而是直接在公式里
+/// 用 `fullScreenH*2 - screenY - winY` 把 two-fold 误差消掉：
+/// 正确的 `fullScreenH - screenY - (winY - fullScreenH)`
+/// = `fullScreenH*2 - screenY - winY`。
+/// 多屏场景同样适用（无论在主屏/副屏，tao 的误差都 = 主屏 fullScreenH）。
 function screenToViewportCoords(
   screenX: number,
   screenY: number,
@@ -222,10 +229,16 @@ function screenToViewportCoords(
 ): { x: number; y: number } {
   const isMac = /mac/i.test(navigator.platform);
   if (isMac) {
-    // screen.height（full screen，含 menu bar）= mouseLocation 的基准。
-    // 翻转后拿到 work area 坐标系的 top-left Y，再减 work area 的 innerPosition。
+    // screenH = 主屏 logical height（full screen，含 menu bar）。
+    // mouseLocation 是 main bottom-origin → `screenH - screenY` 翻到
+    // main top-origin → 再减 winY（已经是修过的 frame top Y in main top-origin
+    // logical）→ viewport-relative Y。
     const fullScreenH = window.screen?.height ?? window.innerHeight;
-    return { x: screenX - winX, y: fullScreenH - screenY - winY };
+    // tao 0.35.3 `bottom_left_to_top_left` 用 `pixels_high()`（物理像素）
+    // 减 `origin.y + height`（logical points）→ mixed-unit → 对 Retina
+    // scale=2 多 fullScreenH。`cachedWinY` 比正确值多了 fullScreenH，
+    // 所以这里要补一个 fullScreenH：2*H - sy - cy。
+    return { x: screenX - winX, y: fullScreenH * 2 - screenY - winY };
   }
   return { x: screenX - winX, y: screenY - winY };
 }
