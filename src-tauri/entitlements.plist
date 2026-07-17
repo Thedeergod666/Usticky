@@ -26,8 +26,15 @@
     <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
 
-    <!-- Tauri 自动更新需要从 GitHub release 下载 new bundle (HTTPS) -->
-    <key>com.apple.security.network.server</key>
+    <!-- Tauri 自动更新需要从 GitHub release 下载 new bundle (HTTPS 出站)。
+         这是出站连接 (client)，不是入站监听 (server)。
+         **P3-2 fix**：原版写 network.server 是误用 —— Hardened Runtime 下
+         network.server 是允许"开本地 HTTP server"，但 updater 要从远端 fetch，
+         需要的是 network.client（允许出站 HTTPS）。
+         Usticky v0.1 暂未启用 updater，但这里提前配对，免得 v0.2 上 updater
+         时 Hardened Runtime 静默阻断出站连接（只在第一次 fetch 时才报错，
+         调试时容易踩坑）。 -->
+    <key>com.apple.security.network.client</key>
     <true/>
 </dict>
 </plist>

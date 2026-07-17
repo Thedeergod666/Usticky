@@ -174,15 +174,9 @@ pub fn hide_dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore)
     }
 }
 
-/// 标记 quick-add 状态已清除（用于 `show_floating_window` / tray toggle show 分支）。
-///
-/// show 路径不主动激活 quick-add 模式 —— 只有快捷键才走 raise + save prev app。
-/// 但要清除残留的 QUICK_ADD_ACTIVE=true 状态，防止下次 hide 时误以为是我们
-/// raise 的、去做无意义的 restore + activate。
-#[allow(dead_code)]
-pub fn clear_quick_add_active() {
-    QUICK_ADD_ACTIVE.store(false, Ordering::SeqCst);
-}
+// **P3-7 fix**：clear_quick_add_active helper 在 P1-5 之后没人调用。
+// show_floating_window_normal 直接 QUICK_ADD_ACTIVE.store(false, ...)
+// 反而更明确（helper 多一层间接），删除 helper。
 
 /// **P1-5 fix**："普通 show"浮窗——只 raise + show + focus，**不**激活
 /// QUICK_ADD_ACTIVE，不 save prev app。
@@ -225,11 +219,9 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_autostart::Builder::new()
-            .args(vec!["--autostart"])
-            .build())
+        // **P3-5 fix**：autostart + notification 插件 v0.1 未使用，移除依赖
+        // 减少二进制体积 + 启动时间。v0.2 真要做再添加。
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // 1. 加载或初始化 todo store
@@ -304,13 +296,19 @@ pub fn run() {
                         let app = app_handle_geom.clone();
                         let (x, y) = (pos.x, pos.y);
                         tauri::async_runtime::spawn(async move {
+                            // **P3-4 fix**：update_window_pos 用短暂的 write guard，
+                            // 之后立刻 drop；persist 走 path clone + 短暂 read guard，
+                            // 调完立刻 drop —— 不跨 I/O 持锁。
                             {
                                 let mut s = store.write().await;
                                 s.update_window_pos(Some(x), Some(y));
-                            } // drop guard 在 await 之间，避免与 add_todo 排队
-                            if let Err(e) = store.read().await.persist(&app) {
-                                tracing::error!("persist window pos failed: {}", e);
-                                let _ = app.emit("usticky://persist-failed", e.to_string());
+                            } // drop write guard 在 await 之间
+                            let path = store.read().await.data_path_clone();
+                            if let Some(p) = path {
+                                if let Err(e) = store.read().await.persist_to_path(&p) {
+                                    tracing::error!("persist window pos failed: {}", e);
+                                    let _ = app.emit("usticky://persist-failed", e.to_string());
+                                }
                             }
                         });
                     }
@@ -325,9 +323,12 @@ pub fn run() {
                                 let mut s = store.write().await;
                                 s.update_window_size(Some(w), Some(h));
                             }
-                            if let Err(e) = store.read().await.persist(&app) {
-                                tracing::error!("persist window size failed: {}", e);
-                                let _ = app.emit("usticky://persist-failed", e.to_string());
+                            let path = store.read().await.data_path_clone();
+                            if let Some(p) = path {
+                                if let Err(e) = store.read().await.persist_to_path(&p) {
+                                    tracing::error!("persist window size failed: {}", e);
+                                    let _ = app.emit("usticky://persist-failed", e.to_string());
+                                }
                             }
                         });
                     }

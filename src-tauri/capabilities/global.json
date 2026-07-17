@@ -1,11 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "global",
-  "description": "global permissions not tied to any window — global shortcut + autostart + notification",
+  "description": "global permissions not tied to any window — global shortcut + opener",
   "windows": ["**"],
   "permissions": [
     "global-shortcut:default",
-    "autostart:default",
-    "notification:default"
+    "opener:default"
   ]
 }

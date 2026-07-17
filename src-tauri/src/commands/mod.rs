@@ -28,14 +28,37 @@ fn emit_todos_changed(app: &AppHandle, snap: &TodoSnapshot) {
 /// persist 失败时（磁盘满 / 权限被剥 / 临时目录异常）不再静默吞掉，而是
 /// emit `usticky://persist-failed` 让前端 mini-flash 提示用户 —— 否则前端
 /// invoke 拿到 Ok 后以为写成功了，下次启动数据全没。
+///
+/// **P3-4 fix**：提前 clone snapshot 然后 drop read guard，再调 persist。
+/// 旧实现全程持有 RwLockReadGuard 跨整个 persist_to_disk（fs write +
+/// sync_all + rename，几十 ms），期间所有 IPC 写命令排队等 write guard
+/// —— 拖窗时 ~60Hz spawn Moved/Resized 任务 + 用户同时 add_todo 会卡顿。
+/// 现在分两段锁：拿 snapshot → drop guard → 重新短暂拿 read guard 调 persist。
+/// 第二次 read guard 也立刻在 persist 返回后 drop（persist 内部用
+/// persist_lock 串行化 I/O，不需要 RwLock 跨 I/O）。
 async fn persist_and_emit(app: &AppHandle, store: &SharedStore) -> TodoSnapshot {
+    // (1) 拿 snapshot + 立刻 drop read guard
     let snap = {
         let s = store.read().await;
         s.snapshot()
     };
-    if let Err(e) = store.read().await.persist(app) {
-        tracing::error!("persist failed: {}", e);
-        let _ = app.emit("usticky://persist-failed", e.to_string());
+    // (2) 拿 data_path clone 也提前 drop guard，persist 内部用 persist_lock
+    let path = {
+        let s = store.read().await;
+        s.data_path_clone()
+    };
+    // (3) 真正调 persist（短暂拿 read guard，调完立刻 drop）
+    match path {
+        Some(p) => {
+            if let Err(e) = store.read().await.persist_to_path(&p) {
+                tracing::error!("persist failed: {}", e);
+                let _ = app.emit("usticky://persist-failed", e.to_string());
+            }
+        }
+        None => {
+            tracing::error!("persist failed: data_path 未初始化");
+            let _ = app.emit("usticky://persist-failed", "data path not initialized");
+        }
     }
     emit_todos_changed(app, &snap);
     snap
@@ -190,9 +213,13 @@ pub async fn reset_floating_window(
         }
         // 落盘（窗口几何 + todos 一起）但不 emit todos-changed —— 复位位置
         // 跟 todo 列表无关，前端不要白白 render 一遍。
-        if let Err(e) = store.read().await.persist(&app) {
-            tracing::error!("persist failed: {}", e);
-            let _ = app.emit("usticky://persist-failed", e.to_string());
+        // **P3-4 fix**：用 data_path_clone + persist_to_path，提前 drop read guard。
+        let path = store.read().await.data_path_clone();
+        if let Some(p) = path {
+            if let Err(e) = store.read().await.persist_to_path(&p) {
+                tracing::error!("persist failed: {}", e);
+                let _ = app.emit("usticky://persist-failed", e.to_string());
+            }
         }
     }
     Ok(())
@@ -277,9 +304,13 @@ pub async fn set_app_locale(
         let mut s = store.write().await;
         s.set_locale(locale.clone());
     }
-    if let Err(e) = store.read().await.persist(&app) {
-        tracing::error!("set_app_locale persist failed: {}", e);
-        let _ = app.emit("usticky://persist-failed", e.to_string());
+    // **P3-4 fix**：path_clone + persist_to_path 提前 drop read guard
+    let path = store.read().await.data_path_clone();
+    if let Some(p) = path {
+        if let Err(e) = store.read().await.persist_to_path(&p) {
+            tracing::error!("set_app_locale persist failed: {}", e);
+            let _ = app.emit("usticky://persist-failed", e.to_string());
+        }
     }
     let _ = app.emit("usticky://locale-changed", locale);
     Ok(())
@@ -316,15 +347,19 @@ pub async fn set_pin_mode_core(
     mode: &str,
 ) -> Result<(), String> {
     let parsed = PinMode::from_str_opt(mode)
-        .ok_or_else(|| format!("invalid pin mode: {}", mode))?;
+                .ok_or_else(|| format!("invalid pin mode: {}", mode))?;
     apply_pin_mode_to_window(app, parsed);
     {
         let mut s = store.write().await;
         s.set_pin_mode(parsed);
     }
-    if let Err(e) = store.read().await.persist(app) {
-        tracing::error!("persist failed: {}", e);
-        let _ = app.emit("usticky://persist-failed", e.to_string());
+    // **P3-4 fix**：path_clone + persist_to_path
+    let path = store.read().await.data_path_clone();
+    if let Some(p) = path {
+        if let Err(e) = store.read().await.persist_to_path(&p) {
+            tracing::error!("persist failed: {}", e);
+            let _ = app.emit("usticky://persist-failed", e.to_string());
+        }
     }
     let _ = app.emit("usticky://pin-mode-changed", mode);
     Ok(())
@@ -377,9 +412,13 @@ pub async fn set_quick_add_shortcut(
         let mut s = store.write().await;
         s.set_quick_add_shortcut(accelerator.clone());
     }
-    if let Err(e) = store.read().await.persist(&app) {
-        tracing::error!("persist failed: {}", e);
-        let _ = app.emit("usticky://persist-failed", e.to_string());
+    // **P3-4 fix**：path_clone + persist_to_path
+    let path = store.read().await.data_path_clone();
+    if let Some(p) = path {
+        if let Err(e) = store.read().await.persist_to_path(&p) {
+            tracing::error!("persist failed: {}", e);
+            let _ = app.emit("usticky://persist-failed", e.to_string());
+        }
     }
     // 3. 重新注册（unregister_all + on_shortcut）
     crate::register_quick_add_shortcut(&app, store.inner());

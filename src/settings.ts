@@ -34,6 +34,7 @@ const root = document.getElementById("settings-app")!;
 //   - Esc 取消，回到 idle
 //   - 点击按钮外区域不取消（用户可能要去按某个键）—— 由 Esc 主动退出
 let recording = false;
+let recordingTimer: ReturnType<typeof setTimeout> | null = null;
 let currentShortcut: string = "Cmd+Shift+Space";  // 启动时被 get_quick_add_shortcut 覆盖
 
 // ── mini flash ──
@@ -90,8 +91,11 @@ function keyEventToAccelerator(e: KeyboardEvent): string | null {
   if (e.key === "Meta" || e.key === "Control" || e.key === "Shift" || e.key === "Alt") {
     return null;
   }
-  // 必须有至少一个 modifier —— 单字母 / 单数字不允许（容易跟系统单键冲突）
-  if (!e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
+  // 必须有至少一个 **强** modifier（Cmd/Ctrl/Meta）。**P3-9 fix**：
+  // 原版接受 Shift+letter → 但 Shift+letter 是大写字母输入，注册为全局
+  // 快捷键会跟正常打字冲突（例如 Shift+A 是输入大写 A 的常规操作）。
+  // 现在要求至少含 Cmd / Ctrl / Meta 之一。
+  if (!e.metaKey && !e.ctrlKey) {
     return null;
   }
   const parts: string[] = [];
@@ -298,6 +302,11 @@ root.addEventListener("click", async (e) => {
 //   - 不带 modifier → 忽略（单键会跟系统快捷键冲突）
 //   - 有效组合 → 调 set_quick_add_shortcut，成功后退 idle + 刷新 label
 function setRecording(on: boolean): void {
+  // **P3-9 fix**：清理旧 timer，避免快速 toggle 时 timer 累加。
+  if (recordingTimer !== null) {
+    clearTimeout(recordingTimer);
+    recordingTimer = null;
+  }
   recording = on;
   const btn = root.querySelector<HTMLElement>(".shortcut-btn");
   const hint = root.querySelector<HTMLElement>("[data-shortcut-hint]");
@@ -305,6 +314,9 @@ function setRecording(on: boolean): void {
     if (on) {
       btn.classList.add("recording");
       btn.textContent = t("settings.shortcut.recording");
+      // 10s 超时自动退出 recording —— 防"用户点了录入后走开"
+      // 把整页键盘 capture 一直拦截，10s 内没操作就当放弃。
+      recordingTimer = setTimeout(() => setRecording(false), 10_000);
     } else {
       btn.classList.remove("recording");
       btn.textContent = formatShortcutForDisplay(currentShortcut);

@@ -415,24 +415,12 @@ pub fn default_quick_add_shortcut() -> String {
     { "Ctrl+Shift+Space".to_string() }
 }
 
-/// AppConfig —— 跨重启保留的少量配置（目前只有 locale）。
+/// AppConfig —— 已废弃。locale 字段在 v0.1.2 已并入 [`StoreData::locale`]，
+/// 走统一的 `Store::persist_to_path` 持久化路径，删除独立结构体避免
+/// "两个地方都可能存 locale"的不一致状态。
 ///
-/// 不并入 StoreData 是因为 locale 变更极频繁且不影响业务逻辑，独立出来
-/// 减少 todos.json 的写放大。Musage 范式：cfg 存单独字段，必要时也走
-/// AppConfig 单独持久化（v0.1 暂未 manage 到 Tauri state，因为 locale
-/// 仅内存态够用；v0.2 加设置面板时再 app.manage(AppConfig::default())）
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppConfig {
-    pub locale: String,
-}
-
-#[allow(dead_code)]
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self { locale: "zh-CN".to_string() }
-    }
-}
+/// **P3-7 fix**：v0.1.0 骨架阶段留的占位结构体，allow(dead_code) 一直没去。
+/// P0-1 locale 持久化落地后 AppConfig 完全没人引用，删除即可。
 
 /// 轻量 snapshot —— emit 用，避免 IPC 传整个 Store。
 #[derive(Debug, Clone, Serialize)]
@@ -459,11 +447,36 @@ impl Store {
     /// poison 恢复（`unwrap_or_else(|e| e.into_inner())`）跟其他 Mutex 同款：
     /// 一旦 task panic 不让后续 persist 全部卡死。
     pub fn persist(&self, _app: &AppHandle) -> Result<()> {
+        self.persist_to_path(&self.data_path()?)
+    }
+
+    /// 拿 data_path clone —— 给调用方在 drop RwLock guard 后自己调 persist_to_path。
+    /// 跟 `persist()` 的区别：persist_to_path 是 **裸函数**，不需要 &self，
+    /// 调用方可以彻底不持任何锁地完成 I/O。
+    ///
+    /// **P3-4 fix**：拆分 persist 是为了避免 RwLockReadGuard 跨 I/O。
+    /// 见 [commands::persist_and_emit] 注释。
+    pub fn data_path_clone(&self) -> Option<PathBuf> {
+        self.data_path.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 拿 data_path（不可变引用版本）。给 [persist] 内部用。
+    fn data_path(&self) -> Result<PathBuf> {
+        self.data_path.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .context("data_path not initialized")
+    }
+
+    /// 拿当前 data + 用给定 path 持久化。**不持任何锁**（只有 persist_lock）。
+    /// 调用方应已 clone 出 path 后才调本方法，否则 data 跟磁盘上的数据可能
+    /// 跨并发写不一致（但 persist_lock 串行化了实际 I/O，所以这是 OK 的）。
+    pub fn persist_to_path(&self, path: &Path) -> Result<()> {
         let _guard: MutexGuard<()> = self.persist_lock.lock()
             .unwrap_or_else(|e| e.into_inner());
-        let path = self.data_path.lock().unwrap().clone()
-            .context("data_path not initialized")?;
-        persist_to_disk(&path, &self.data)
+        persist_to_disk(path, &self.data)
     }
 }
 

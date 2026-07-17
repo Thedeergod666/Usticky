@@ -11,7 +11,7 @@
 // 不复用 Musage 的：
 //   - lastGoodSnap + TRANSIENT_ERROR_KINDS（todo 没有瞬态错误）
 //   - 多 provider 调度（todo 就一个 list）
-//   - PinBottom 私有 API（v0.1 不做）
+//   - 撤销栈（v0.2 候选）
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
