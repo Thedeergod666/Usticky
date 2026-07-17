@@ -197,7 +197,22 @@ pub async fn reset_floating_window(
     app: AppHandle,
     store: State<'_, SharedStore>,
 ) -> Result<(), String> {
+    // **fix 2026-07-17**：用 OS 主显示器（菜单栏所在 / Windows 标记为
+    // "Main display" 的屏），**不**用 current_monitor。无论用户把浮窗
+    // 拖到哪个副屏，点重置都回主屏中央——这是用户的产品预期（"重置"
+    // = 回到默认位置 = 主屏正中央）。
+    //
+    // 选用 AppHandle::primary_monitor()（tao 在 macOS 上走
+    // CGMainDisplayID()，Windows 上走 MONITORINFOF_PRIMARY 标志的屏，
+    // 跟窗口当前位置无关）。
+    //
+    // Wayland 上 primary_monitor() 可能返 None（tao 历史 panic 改 None），
+    // fallback 到 available_monitors().first()（= 当前拿到的第一个 monitor，
+    // 不一定是 OS 主屏，但比崩溃好）。
     let monitor = app.primary_monitor().map_err(|e| e.to_string())?
+        .or_else(|| {
+            app.available_monitors().ok().and_then(|m| m.into_iter().next())
+        })
         .ok_or_else(|| rust_i18n::t!("commands.error.no_primary_monitor").to_string())?;
     let mon_size = monitor.size();
     let mon_pos = monitor.position();
@@ -205,6 +220,10 @@ pub async fn reset_floating_window(
         let win_size = w.outer_size().map_err(|e| e.to_string())?;
         let x = mon_pos.x + ((mon_size.width as i32 - win_size.width as i32) / 2);
         let y = mon_pos.y + ((mon_size.height as i32 - win_size.height as i32) / 2);
+        tracing::debug!(
+            "reset_floating_window: 目标显示器 pos=({}, {}) size={}x{} → 窗口新位置 ({}, {})",
+            mon_pos.x, mon_pos.y, mon_size.width, mon_size.height, x, y
+        );
         w.set_position(tauri::PhysicalPosition::new(x, y))
             .map_err(|e| e.to_string())?;
         {
