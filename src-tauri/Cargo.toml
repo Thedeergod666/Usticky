@@ -1,6 +1,6 @@
 [package]
 name = "usticky"
-version = "0.1.0"
+version = "0.1.2"
 description = "Always-on-top floating sticky note for desktop"
 authors = ["Thedeergod666"]
 edition = "2021"

@@ -93,15 +93,35 @@ pub struct WindowGeom {
 /// `window_geom` 单独存（避免 todos 的 update 触发不必要的窗口几何 persist）。
 /// `pin_mode` 跨重启保留 —— PinBottom 用户一般不会反复切，存盘一次保终身。
 /// `quick_add_shortcut` 跨重启保留 —— 用户改完后希望下次启动仍是自己设的键。
+/// `locale` 跨重启保留 —— i18n 切换链路（AGENTS.md #15）要求后端持久化。
 /// 默认值见 [`Store::quick_add_shortcut`]（macOS = `Cmd+Shift+Space`，
 /// 其他平台 = `Ctrl+Shift+Space`），用 global-hotkey 的 `CmdOrCtrl` 关键字
 /// 也可以让平台分支在 parse 时自动处理。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreData {
+    #[serde(default)]
     pub todos: Vec<Todo>,
+    #[serde(default)]
     pub window_geom: WindowGeom,
+    #[serde(default)]
     pub pin_mode: Option<PinMode>,
+    #[serde(default)]
     pub quick_add_shortcut: Option<String>,
+    /// None = 用 rust-i18n 默认（首次启动），Some("en") / Some("zh-CN") = 用户选择
+    #[serde(default)]
+    pub locale: Option<String>,
+}
+
+impl Default for StoreData {
+    fn default() -> Self {
+        Self {
+            todos: Vec::new(),
+            window_geom: WindowGeom::default(),
+            pin_mode: None,
+            quick_add_shortcut: None,
+            locale: None,
+        }
+    }
 }
 
 /// Store —— 内存态 + 文件路径。
@@ -142,6 +162,12 @@ impl Store {
             }
             StoreData::default()
         };
+        // 恢复持久化的 locale —— 让 rust-i18n 跟 store 同步，
+        // get_app_locale / t! 都拿正确值。否则首次启动用户切了语言，
+        // 重启后 rust-i18n 默认 locale 会跟 store 里不一致。
+        if let Some(loc) = data.locale.as_deref() {
+            rust_i18n::set_locale(loc);
+        }
         Ok(Self {
             data,
             data_path: Mutex::new(Some(data_path)),
@@ -311,6 +337,15 @@ impl Store {
 
     pub fn set_quick_add_shortcut(&mut self, accelerator: String) {
         self.data.quick_add_shortcut = Some(accelerator);
+    }
+
+    /// 当前持久化的 locale（None = 用 rust-i18n 默认）。
+    pub fn locale(&self) -> Option<&str> {
+        self.data.locale.as_deref()
+    }
+
+    pub fn set_locale(&mut self, locale: String) {
+        self.data.locale = Some(locale);
     }
 }
 

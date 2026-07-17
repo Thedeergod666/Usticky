@@ -234,13 +234,36 @@ pub async fn resize_floating_window(app: AppHandle, height: f64) -> Result<(), S
 // ── i18n ──
 
 #[tauri::command]
-pub fn get_app_locale() -> String {
-    rust_i18n::locale().to_string()
+pub async fn get_app_locale(store: State<'_, SharedStore>) -> Result<String, String> {
+    // store 持久化的 locale 是单一来源；rust-i18n 状态在 load_or_init 时
+    // 已经同步过 set_locale，这里直接读 store（即便中途有别处改了
+    // rust_i18n 状态，重启就同步回来）。
+    Ok(store.read().await.locale()
+        .map(String::from)
+        .unwrap_or_else(|| rust_i18n::locale().to_string()))
 }
 
+/// 切换 locale + 持久化 + 通知所有 webview（AGENTS.md #15）。
+///
+/// persist 失败时不静默吞：emit `usticky://persist-failed` 让前端 mini-flash
+/// 提示用户（避免"切语言 → 重启 → 退回默认"的鬼故事）。persist 失败也
+/// 不回滚内存态 —— 用户已经看到新语言了，再回滚体验更差；下次启动
+/// 默认值是次要损害。
 #[tauri::command]
-pub fn set_app_locale(app: AppHandle, locale: String) -> Result<(), String> {
+pub async fn set_app_locale(
+    app: AppHandle,
+    store: State<'_, SharedStore>,
+    locale: String,
+) -> Result<(), String> {
     rust_i18n::set_locale(&locale);
+    {
+        let mut s = store.write().await;
+        s.set_locale(locale.clone());
+    }
+    if let Err(e) = store.read().await.persist(&app) {
+        tracing::error!("set_app_locale persist failed: {}", e);
+        let _ = app.emit("usticky://persist-failed", e.to_string());
+    }
     let _ = app.emit("usticky://locale-changed", locale);
     Ok(())
 }

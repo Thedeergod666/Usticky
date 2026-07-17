@@ -282,7 +282,7 @@ root.addEventListener("click", async (e) => {
   // open github
   if (target.closest("[data-action='open-github']")) {
     try {
-      await openUrl("https://github.com/Thedeergod666/Musage");
+      await openUrl("https://github.com/Thedeergod666/Usticky");
     } catch (err) {
       console.error("[usticky] openUrl failed", err);
     }

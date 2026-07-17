@@ -279,11 +279,19 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
         .spawn(move || {
             let mut last_inside = false;
             let mut last_emitted = false;
-            // 边缘抖动防抖（macos.rs 同款）。50ms × 3 = 150ms 确认延迟，
-            // 人手移动窗口跨越边缘的典型时间已经足够，不会感知到延迟。
-            const DEBOUNCE_TICKS: u8 = 3;
+            // 边缘抖动防抖 —— 与 macOS 对齐。
+            // **2026-07-17 fix**：原来 enter/exit 共用 DEBOUNCE_TICKS=3 (150ms)。
+            // 短 hover（< 150ms）鼠标进入又被抖动吞掉 → PinBottom 模式下窗口
+            // 不置顶 + 玻璃不亮。macOS 已在 v0.1.2 改为 ENTER_THRESHOLD=1（50ms，
+            // 短 hover 也要触发）/ EXIT_THRESHOLD=2（100ms，防 level 切换 stale
+            // 振荡）—— 这里拆成两个阈值，与 macOS 行为完全一致。
+            // - **enter**：inside=true 必须连续 ≥1 个 tick（50ms）才采纳
+            // - **exit**：inside=false 必须连续 ≥2 个 tick（100ms）才采纳
+            // - **enter↔exit 切换瞬间 reset 计数器**：避免在过渡中误累计
             let mut pending_inside: Option<bool> = None;
             let mut pending_count: u8 = 0;
+            const ENTER_THRESHOLD: u8 = 1;
+            const EXIT_THRESHOLD: u8 = 2;
             loop {
                 thread::sleep(Duration::from_millis(50));
 
@@ -294,7 +302,8 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                 let inside = match pending_inside {
                     Some(p) if p == raw_inside => {
                         pending_count += 1;
-                        if pending_count >= DEBOUNCE_TICKS {
+                        let threshold = if p { ENTER_THRESHOLD } else { EXIT_THRESHOLD };
+                        if pending_count >= threshold {
                             pending_inside = None;
                             pending_count = 0;
                             raw_inside
