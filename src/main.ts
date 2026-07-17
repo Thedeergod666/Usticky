@@ -213,6 +213,24 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 }
 
+/// 检测用户是否正在输入 —— 涵盖主输入框 (.todo-input input) 和编辑态输入框
+/// (.todo-edit-input)。两者都应该抑制 autoResizeWindow：
+///   - 主输入：Enter 添加前 resize 会打断用户输入节奏（AGENTS.md #18）
+///   - 编辑态：v0.1.2 之前只查主输入 → 编辑 todo title 期间 hover-expand /
+///     后端 emit 触发的 resize 会让窗口抖一下打断编辑。
+///
+/// 判定条件：input 有内容（正在打字），不是聚焦本身 —— Enter 添加后 input
+/// 仍聚焦但已清空，此时 resize 是安全的，否则"添加新 todo"永远等不到 resize。
+function isUserTyping(): boolean {
+  const inputs = app.querySelectorAll<HTMLInputElement>(
+    ".todo-input input, .todo-edit-input",
+  );
+  for (const el of inputs) {
+    if (el.matches(":focus") && el.value.length > 0) return true;
+  }
+  return false;
+}
+
 function cssEscape(s: string): string {
   if (typeof (CSS as any).escape === "function") return (CSS as any).escape(s);
   return s.replace(/([!"#$%&'()*+,./:;<=>?@[\]^`{|}~])/g, "\\$1");
@@ -436,9 +454,8 @@ function render(snap: TodoSnapshot) {
   // 但"输入中"的判定是 input 有内容（正在打字），不是聚焦本身 ——
   // Enter 添加后 input 仍聚焦但已清空，此时 resize 是安全的，否则
   // "添加新 todo"永远等不到 resize（用户每次按 Enter 都被这里挡掉）。
-  const inputEl = app.querySelector<HTMLInputElement>(".todo-input input");
-  const typing = inputEl?.matches(":focus") && (inputEl.value.length > 0);
-  if (!typing) {
+  // **P2-2 fix**：用 isUserTyping() helper，涵盖 .todo-edit-input。
+  if (!isUserTyping()) {
     void autoResizeWindow(snap);
   }
 }
@@ -568,8 +585,8 @@ function scheduleHoverResize(card: HTMLElement, expanding: boolean) {
   if (!card.isConnected) return;
 
   // 输入中禁止 resize —— 跟 line 266-270 的 typing 检测保持一致
-  const inputEl = app.querySelector<HTMLInputElement>(".todo-input input");
-  if (inputEl?.matches(":focus") && inputEl.value.length > 0) return;
+  // **P2-2 fix**：用 isUserTyping() helper，涵盖 .todo-edit-input。
+  if (isUserTyping()) return;
 
   // 已经是目标态 → 跳过（鼠标快速进出同一卡 / 重复 enter）
   const wasExpanded = card.classList.contains(TITLE_EXPAND_CLASS);
@@ -997,11 +1014,17 @@ async function init() {
   //         / mouseenter 事件，spurious enter 实际很少触发。
   let pageVisible = true;
   const wForFocus = getCurrentWindow();
+  // **P2-8 fix**：onFocusChanged / onResized 之前 unlisten 没保存，
+  // beforeunload 关闭浮窗时 listener 残留（极端情况下多 webview
+  // 切换累积）。补两个 let + 同步 Promise.then 保存 fn。
+  let unlistenFocusChanged: UnlistenFn | null = null;
+  let unlistenResized: UnlistenFn | null = null;
   wForFocus
     .onFocusChanged(({ payload: f }) => {
       if (!f) setHoverAttr(false);
     })
-    .catch(() => {});
+    .then((fn) => (unlistenFocusChanged = fn))
+    .catch((e) => console.error("[usticky] onFocusChanged failed", e));
   // 窗口 resize → 重新评估 narrow 档位（hint 字号 / 文字 / 容器 padding 联动）。
   // Tauri resize 事件在拖完边放手后派发一次（不是连发），不需要 debounce。
   // 启动时也调一次确保正确初始态（用户启动时窗口可能 = minWidth 240px）。
@@ -1009,7 +1032,8 @@ async function init() {
     .onResized(() => {
       syncNarrowMode();
     })
-    .catch(() => {});
+    .then((fn) => (unlistenResized = fn))
+    .catch((e) => console.error("[usticky] onResized failed", e));
   syncNarrowMode();
   // ── 全局快捷键 → 激活视觉（等价于 hover）+ 输入聚焦 ──
   //
@@ -1449,12 +1473,10 @@ async function init() {
       if (document.body.dataset.hover !== "1") clearActive();
     });
   }
-  // 鼠标进入 → 在原 onBodyMouseEnter 的 setHoverAttr(true) 后跟一行
-  // clearActive()，避免双触发 + timeout 残留。onBodyMouseEnter 在文件流
-  // 中更早定义（见 ~720 行），把它替换为新的活跃感知版（同样的 0ms debounce
-  // 逻辑 —— 沿用 2026-07-08 fix 决策，去掉 40ms debounce 让响应即时）。
-  document.body.removeEventListener("mouseenter", onBodyMouseEnter);
-  document.body.addEventListener("mouseenter", () => {
+  // 鼠标进入 → 跟 onBodyMouseEnter 同样语义但额外 clearActive。
+  // **P2-8 fix**：原版用匿名函数 addEventListener，beforeunload removeEventListener
+  // 找不到引用，listener 残留。提到具名函数 onBodyMouseEnterActive。
+  function onBodyMouseEnterActive() {
     if (!pageVisible) return;
     if (hoverEnterTimer !== null) {
       clearTimeout(hoverEnterTimer);
@@ -1463,7 +1485,9 @@ async function init() {
     setHoverAttr(true);
     // hover 接管后清 active —— 视觉由 hover 维持，避免双触发 + 防 timeout 残留
     clearActive();
-  });
+  }
+  document.body.removeEventListener("mouseenter", onBodyMouseEnter);
+  document.body.addEventListener("mouseenter", onBodyMouseEnterActive);
 
   // ── 全局 Cmd+Z 撤销：v0.2 实现，先占位 ──
   document.addEventListener("keydown", (e) => {
@@ -1541,10 +1565,13 @@ async function init() {
     unlistenShortcut?.();
     unlistenBackdropRefresh?.();
     unlistenBottomed?.();
+    unlistenFocusChanged?.();
+    unlistenResized?.();
     cleanupSortables();
     // 摘掉 hover listener（setHoverAttr 路径，命名引用）
     document.body.removeEventListener("mouseenter", onBodyMouseEnter);
     document.body.removeEventListener("mouseleave", onBodyMouseLeave);
+    document.body.removeEventListener("mouseenter", onBodyMouseEnterActive);
     // 摘掉 hover-raise listener（仅在 PinBottom 模式注册过，需要命名引用）
     document.body.removeEventListener("mouseenter", onPinBottomHoverEnter);
     document.body.removeEventListener("mouseleave", onPinBottomHoverLeave);

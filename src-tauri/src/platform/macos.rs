@@ -36,6 +36,7 @@
 //! - `LEVEL_FLOATING = 3` ：就是 `kCGFloatingWindowLevel`，相当于 Tauri 的
 //!   `set_always_on_top(true)`。PinTop 模式用它，hover 临时置顶也用它。
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -72,6 +73,19 @@ pub const LEVEL_FLOATING: CGWindowLevel = kCGFloatingWindowLevel;
 /// 不参与运行时控制 —— 真正想动行为请改 [`LEVEL_SWITCHING_ACTIVE`]。
 static TRACKER_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// **P2-5 fix**：强制下一 tick 强制 emit 一次当前 hover 状态。
+///
+/// 场景：用户在 PinTop/Normal 模式时鼠标已在浮窗内 → 切到 PinBottom →
+/// `set_window_pin_bottom` 调 `set_window_level(BELOW_NORMAL)` 把窗口降下来。
+/// 但 hover emitter 的 `last_inside=true`，下一 tick 拿到 raw_inside=true
+/// 仍走 `inside == last_inside { continue }` 分支 → 不 emit hover + 不切
+/// level → 窗口卡 -1 被盖住。
+///
+/// `set_window_pin_bottom` 在调 set_window_level 之后置 true，emitter 下一
+/// tick 检测到后重置 last_inside 强制走 emit + level 切换分支。一性次
+/// 用完即清。
+static FORCE_HOVER_EMIT_ONCE: AtomicBool = AtomicBool::new(false);
+
 /// 鼠标 hover 时是否同步切 NSWindow level：仅 PinBottom 模式置 true。
 /// 这个开关只影响 level 切换；hover 事件 emit 不受影响（**永远 emit**），
 /// 因为前端的 iOS 26 玻璃 hover 效果需要它，不分 pin mode。
@@ -84,6 +98,11 @@ static LEVEL_SWITCHING_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub fn set_window_pin_bottom<R: Runtime>(app: &AppHandle<R>) {
     set_window_level(app, LEVEL_BELOW_NORMAL, false); // 不失焦隐藏，hover 临时置顶
     LEVEL_SWITCHING_ACTIVE.store(true, Ordering::SeqCst);
+    // **P2-5 fix**：强制 emitter 下一 tick 重新评估 hover 状态。
+    // 详见 FORCE_HOVER_EMIT_ONCE 注释 —— 切 pin mode 时如果鼠标已在
+    // 浮窗内，last_inside=true 会让下一 tick 走 inside == last_inside
+    // 短路，level 永远停在 -1。
+    FORCE_HOVER_EMIT_ONCE.store(true, Ordering::SeqCst);
     start_hover_emitter(app.clone());
 }
 
@@ -228,6 +247,20 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
     let builder = thread::Builder::new()
         .name("usticky-hover-emitter".into())
         .spawn(move || {
+            // **P2-9 fix**：spawn 闭包整体 catch_unwind。
+            //
+            // 旧实现：只在 builder.spawn() 自身返 Err 时才 reset TRACKER_RUNNING。
+            // 线程 loop 内 panic 时（dispatch 闭包野指针 / NSWindow 引用失效等）：
+            //   - release profile (panic="abort") → 整个进程 abort
+            //   - debug profile (panic="unwind") → 线程静默死掉，TRACKER_RUNNING 永远 true
+            //     → 后续 start_hover_emitter 全部 no-op → hover raise / 玻璃效果
+            //     永远失效直到重启 app
+            //
+            // 现在 AssertUnwindSafe 包闭包，panic 时 log + reset TRACKER_RUNNING。
+            // 下一轮 start_hover_emitter 就能重新拉起线程恢复功能。
+            // 注：catch_unwind 在 panic="abort" profile 下不会生效（abort 优先），
+            // 那时本来就会杀进程，所以这是 debug profile 的专属防御。
+            let result = catch_unwind(AssertUnwindSafe(|| {
             tracing::debug!("hover emitter 启动");
             let mut last_inside = false;
             // dwell-time hysteresis（沿用 Musage 2026-07-03 fix）：
@@ -269,6 +302,16 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 
                 let mouse = NSEvent::mouseLocation();
 
+                // **P2-5 fix**：检查强制 emit flag。pin mode 切换后置 true，
+                // 我们重置 pending_ticks 并让当前 tick 跳过 inside == last_inside
+                // 短路 → 真实 inside 状态穿透 emit + level 切换。
+                let force_emit = FORCE_HOVER_EMIT_ONCE.swap(false, Ordering::SeqCst);
+                if force_emit {
+                    pending_ticks = 0;
+                    pending_value = false;
+                    tracing::debug!("FORCE_HOVER_EMIT_ONCE: 强制下一 tick 重新评估 hover 状态");
+                }
+
                 // 关键：用 NSWindow.windowNumberAtPoint 做命中测试 ——
                 // 不光检查"鼠标在不在浮窗 frame 内"，还要确认浮窗在该点是**最上层**。
                 // **2026-07-03 fix**：当 inside=false 但**已知上次 inside=true 且
@@ -307,7 +350,10 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 
                 consecutive_dispatch_failures = 0; // 重置失败计数
 
-                if inside == last_inside {
+                // **P2-5 fix**：force_emit 时跳过 inside == last_inside 短路，
+                // 让本 tick 真实状态穿透 emit + level 切换。一性次，下一 tick
+                // last_inside 已经同步回真实值，状态机恢复正常。
+                if inside == last_inside && !force_emit {
                     pending_ticks = 0;
                     // inside 没变（持续在浮窗内 or 持续在浮窗外），但若当前
                     // 持续在浮窗内，鼠标坐标可能在卡 A→卡 B 之间移动 →
@@ -373,7 +419,21 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                     set_window_level(&app, level, false);
                 }
             }
-        });
+            })); // catch_unwind(inner closure) 收尾
+            if let Err(panic_payload) = result {
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                tracing::error!("hover emitter thread panic: {}，已 reset TRACKER_RUNNING", msg);
+                TRACKER_RUNNING.store(false, Ordering::SeqCst);
+            }
+        }); // spawn closure 收尾
+    // builder.spawn 自身失败（线程创建失败，如 OS 资源耗尽）也要 reset，
+    // 不让 start_hover_emitter 永远 no-op。
     if let Err(e) = builder {
         tracing::error!(error = %e, "spawn hover emitter thread 失败，hover raise / glass 效果将失效");
         TRACKER_RUNNING.store(false, Ordering::SeqCst);
@@ -406,17 +466,21 @@ pub fn set_window_level<R: Runtime>(
                     let window: &NSWindow = unsafe { &*ptr.cast::<NSWindow>() };
                     window.setLevel(level as _);
                     window.setHidesOnDeactivate(false);
+                    // **P2-4 fix**：把 backdrop-refresh emit 挪到闭包内、
+                    // setLevel 之后。run_on_main_thread 是**异步**入队的，原
+                    // 实现在 dispatch 之前同步 emit → 前端先收到 reflow 触发
+                    // paint invalidation → 但此时 WKWebView 的 z-order 还没
+                    // 真正变化（dispatch 闭包还没跑）→ reflow 击穿的是旧的
+                    // 2s sample 窗口，对新 z-order 完全无效。
+                    //
+                    // 现在 emit 跟在 setLevel 后面执行（同一 main thread dispatch
+                    // 任务，顺序保证）：reflow 触发时 z-order 已经切好，paint
+                    // invalidation 击穿的是新的 sample 失效窗口。
+                    let _ = app2.emit("usticky://backdrop-refresh", ());
                 }
             }
         }
     });
-    // **2026-07-03 fix（玻璃 2 秒丢失 — L3 修复）**：
-    // macOS WKWebView 对非 key / 透明 / backdrop-filter 窗口有合成层节流，
-    // level 切换时 sample 因 z-order 变化失效，约 2s 后才被重新计算。
-    // 这里 emit 事件让前端立刻 force reflow 击穿 2s 失效窗口。
-    // 前端会短时给 .todo-card / .todo-input 加 .force-reflow class（filter 微动
-    // → paint invalidation → backdrop layer 重采样），0.1s 后移除。
-    let _ = app.emit("usticky://backdrop-refresh", ());
 }
 
 /// 命中测试：鼠标在 `point` 处时，浮窗是否是**最上层**窗口。

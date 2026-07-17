@@ -50,6 +50,22 @@ fn parse_status(s: &str) -> Result<TodoStatus, String> {
     }
 }
 
+/// todo title 校验：trim + 非空 + ≤ 280 字符。
+///
+/// **P2-7 fix**：add_todo 已有这套校验，update_todo 之前**完全跳过**，
+/// 用户（或前端 bug）可以把 title 改成空串 / 纯空格 / 超长串。
+/// 抽到独立函数让 add/update 共用，避免校验规则分叉。
+fn validate_title(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(rust_i18n::t!("commands.error.empty_title").into());
+    }
+    if trimmed.chars().count() > 280 {
+        return Err(rust_i18n::t!("commands.error.too_long").into());
+    }
+    Ok(trimmed)
+}
+
 // ── CRUD ──
 
 #[tauri::command]
@@ -63,13 +79,7 @@ pub async fn add_todo(
     store: State<'_, SharedStore>,
     title: String,
 ) -> Result<Todo, String> {
-    let trimmed = title.trim().to_string();
-    if trimmed.is_empty() {
-        return Err(rust_i18n::t!("commands.error.empty_title").into());
-    }
-    if trimmed.chars().count() > 280 {
-        return Err(rust_i18n::t!("commands.error.too_long").into());
-    }
+    let trimmed = validate_title(&title)?;
     let todo = {
         let mut s = store.write().await;
         s.add(trimmed)
@@ -86,6 +96,12 @@ pub async fn update_todo(
     title: Option<String>,
     status: Option<String>,
 ) -> Result<Todo, String> {
+    // **P2-7 fix**：校验 title。前端可能传 None（只改 status）或 Some(string)。
+    // None 透传不校验；Some 必须走 validate_title，否则透传空串/超长串到 store。
+    let title = match title {
+        Some(t) => Some(validate_title(&t)?),
+        None => None,
+    };
     let status_enum = match status {
         Some(s) => Some(parse_status(&s)?),
         None => None,

@@ -285,6 +285,22 @@ impl Store {
             return;
         }
 
+        // **P2-3 fix**：拒绝重复 id。
+        //
+        // `id_set` 是 HashSet 自动去重，但 `moved: Vec<Todo>` 按 ids 顺序
+        // find + push —— 如果 ids 含重复 id，moved 会重复出现同一个 todo。
+        // 重建 Vec 时把重复 id 写回 → 同 id 在 Vec 里出现两次 → 后续
+        // `find` / `position` 永远命中第一个副本，update/delete 全部
+        // 作用于错误副本。
+        //
+        // 前端 SortableJS onEnd 在正常路径下不会产生重复 id（DOM 节点
+        // 自带唯一性），但并发拖拽 / 异常路径 / 中间人篡改 IPC payload
+        // 都可能触发。把防御放在 store 入口是最便宜的早返。
+        if ids.len() != ids.iter().collect::<std::collections::HashSet<_>>().len() {
+            tracing::warn!("reorder 拒绝：ids 含重复");
+            return;
+        }
+
         // 1. 找被拖 section 在 Vec 里的最早位置 —— 作为新顺序的锚点。
         //    不依赖"section 在 Vec 里连续"的假设：防御 add/update 之后
         //    pending/done 在数组里穿插（虽然 add() 总 append，但 v0.2
@@ -792,5 +808,24 @@ mod reorder_tests {
             .map(|t| t.order)
             .collect();
         assert_eq!(pending, vec![1, 2, 3]);
+    }
+
+    /// **P2-3 fix**：reorder 拒绝重复 id。
+    ///
+    /// 重复 id 会让 moved Vec 出现重复 todo，最终 store Vec 出现重复 id
+    /// → 后续 find/position 永远命中第一个副本。防御放在入口直接 return。
+    #[test]
+    fn reorder_rejects_duplicate_ids() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+            mk("c", TodoStatus::Pending, 2),
+        ]);
+        s.reorder(&["a".into(), "b".into(), "a".into()]);
+        // ids 重复 → 整批拒绝，store 不动
+        assert_eq!(ids(&s), vec!["a", "b", "c"]);
+        assert_eq!(s.data.todos[0].order, 0);
+        assert_eq!(s.data.todos[1].order, 1);
+        assert_eq!(s.data.todos[2].order, 2);
     }
 }
