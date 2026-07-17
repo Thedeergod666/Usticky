@@ -196,12 +196,10 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                             let _ = w.hide();
                         }
                     } else {
-                        if let Some(store) = app.try_state::<crate::SharedStore>() {
-                            crate::quick_show_floating_window(app, store.inner());
-                        } else {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
+                        // **P1-5 fix**：tray 左键单击的 show 分支走"普通 show"
+                        // 路径，不激活 QUICK_ADD_ACTIVE。否则用户托盘点开浮窗
+                        // → 切别 app → 被 blur_dismiss 还原 level 盖住。
+                        crate::show_floating_window_normal(app);
                     }
                 }
             }

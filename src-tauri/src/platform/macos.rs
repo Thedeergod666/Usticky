@@ -468,6 +468,26 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
 
     let app2 = app.clone();
     let slot2 = slot.clone();
+    // **P1-3 fix**：dispatch 之前显式清空 slot。
+    //
+    // 旧实现 wait 循环只在 slot 是 None 时阻塞，slot 一旦被任意一次
+    // dispatch 写入 (inside, false) 后就**永远是 Some**，后续 wait 立即
+    // 返回上次的 stale 结果。极端场景下：main thread 被 GPU 高负载卡住
+    // 数百 ms，dispatch 闭包排队但不执行 → slot 仍持有上一次成功 dispatch
+    // 的 `(true, false)`（鼠标之前在窗内）→ hover emitter 收到的 inside
+    // 永远跟 stale 值一致 → consecutive_dispatch_failures 永远不递增
+    // → "3 tick dispatch 失败兜底采纳 false" 防御**永远不触发** → 鼠标
+    // 实际移出后 PinBottom 窗口卡在 FLOATING / 玻璃持续亮。
+    //
+    // 修复：dispatch 前清空 slot 让 wait 阻塞必须等到新 dispatch 写入。
+    // dispatch 失败 / 走 None 分支（main thread dispatch 报错）会兜底写入
+    // `(false, true)`，超时分支（50ms 内 dispatch 没跑完）会保持 None，
+    // wait 超时返 `(false, true)` 兜底。两条兜底路径都让 hover emitter
+    // 走"未知"路径而不是 stale "inside=true"。
+    {
+        let mut g = slot.slot.lock().unwrap_or_else(|e| e.into_inner());
+        *g = None;
+    }
     let dispatch_result = app.run_on_main_thread(move || {
         let result = (|| -> Option<bool> {
             let win = app2.get_webview_window("floating")?;

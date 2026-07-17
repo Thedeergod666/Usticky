@@ -49,6 +49,23 @@ let isDragging = false;  // 自己跟踪 SortableJS 拖拽状态（比 sortableI
                           // SortableJS 偶尔会在某些边界场景里遗留 dragEl 不清，导致后续
                           // render 永远被 blocking）。进入 onStart 时置 true，onEnd 置 false。
 
+/// 标记当前是否有 todo 正在编辑（被 .todo-edit-input 占用）。
+///
+/// render() 看到这个 flag 时**跳过整窗重建** —— 否则外部 todos-changed
+/// 事件（设置面板切 pin mode / tray 菜单 / shortcut 同步等）会冲掉用户
+/// 正在输入的内容。这是 P1-1 修复的核心。
+///
+/// 释放条件：
+///   - 用户提交（成功/失败/取消）：exitEditMode / cancelEdit / reenterEditOnFailure
+///   - 切到空态：renderEmptyState 不需要守卫（输入框没了，无编辑可言）
+let isEditing = false;
+
+/// Rust hover 路径当前 hover 的 todo id。render() 重建 DOM 时必须重置为 null，
+/// 否则下一帧 hover-pos 事件 `newId === rustHoveredCardId` 短路 return，
+/// 新建 card 永远不展开（P1-7）。init() 内 rustHoveredCardId = null 是占位
+/// 声明（TDZ 兼容），实际初始值仍以 init() 内赋值为准。
+let rustHoveredCardId: string | null = null;
+
 /// SortableJS filter 用的"不可拖拽"子元素选择器 —— 命中即跳过拖拽判定，
 /// 让原生 click 事件正常派发到这些按钮上。这是修复"完成/取消完成/删除
 /// 被拖拽吞掉"的关键配置（详见 sortableOpts 注释）。
@@ -298,6 +315,26 @@ function render(snap: TodoSnapshot) {
   // 旧状态卡住，导致后续 render 全部被挡。
   if (isDragging) return;
 
+  // **P1-1 fix**：编辑模式期间跳过整窗重建。
+  // 外部 todos-changed 事件（设置面板切 pin mode / tray 菜单等链路）走
+  // render() 会把 .todo-edit-input 整个干掉 → 用户未保存输入直接丢。
+  // 编辑期间数据快照已存到 lastRenderedSnap；用户提交后下次 render 自然会
+  // 反映新 title，所以这里安全跳过。**不**刷新 isDragging/rustHoveredCardId
+  // 等次态（这些跟编辑态无冲突）。
+  if (isEditing) return;
+
+  // **P1-7 fix**：render 重建 DOM 后重置 rustHoveredCardId。
+  //
+  // 旧实现只 hover-leave 时清空，render 重建后**不**重置。场景：
+  //   1. Rust 路径激活，hover 卡 A → rustHoveredCardId = "A"
+  //   2. 外部 todos-changed 触发 render，DOM 重建
+  //   3. 下一个 hover-pos 事件：`newId === rustHoveredCardId`（都是 "A"）→
+  //      短路 return，不调 scheduleHoverResize
+  //   4. 新建卡 A 没有 .title-expanded，卡片永久不展开，直到鼠标移到别的卡
+  //
+  // 类似地（次要）isDragging 已由 cleanupSortables 清，这里不必重做。
+  rustHoveredCardId = null;
+
   // 清掉旧内容（保留 input / foot）
   cleanupSortables();
   const oldList = app.querySelector<HTMLElement>(".todo-list");
@@ -472,6 +509,11 @@ function renderEmptyState() {
   //  导致首启空态时 input 不可见、CTA 点了也找不到 input → "addTask 没反应"）
   app.querySelector<HTMLElement>(".todo-list")?.remove();
   app.querySelector<HTMLElement>(".empty-state")?.remove();
+
+  // **P1-6 fix**：reset fingerprint。空态 → 再 add 新 todo 时 fingerprint
+  // 还是上次非空态的值 → autoResizeWindow 检查 fp === lastFitFingerprint
+  // 短路 → 窗口停在空态尺寸，新 todo 被裁切。
+  lastFitFingerprint = null;
 
   const empty = document.createElement("div");
   empty.className = "empty-state";
@@ -716,6 +758,9 @@ function enterEditMode(card: HTMLElement, todo: Todo) {
   const titleEl = card.querySelector<HTMLElement>(".todo-title");
   if (!titleEl) return;
 
+  // **P1-1 fix**：进入编辑模式 → render 跳过整窗重建
+  isEditing = true;
+
   // 关闭 hover-expand 态（如果正展开中）—— input 编辑不应该被外层换行影响
   card.classList.remove("title-expanded");
 
@@ -764,6 +809,8 @@ function enterEditMode(card: HTMLElement, todo: Todo) {
     if (next.length > 280) {
       showMiniFlash(t("app.error.too_long", { max: 280 }));
       settled = false;  // 允许重新提交
+      // **P1-1 fix**：isEditing 已经是 true（enterEditMode 头置了），
+      // 继续保留。这里不调 exitEditMode，input 仍在编辑态。
       input.focus();
       return;
     }
@@ -838,6 +885,11 @@ function exitEditMode(card: HTMLElement, newTitle: string) {
     restoreSortableForCard(card);
     return;
   }
+  // **P1-1 fix**：先释放守卫再 replaceWith。顺序很重要 —— 如果先摘 input
+  // 再清 flag，期间若有同步 emit 触发的 render 看到 input 还在 + isEditing=false
+  // 会走"保留正在编辑卡"的路径（虽然现在我们用简单 return 跳过整窗，但语义上
+  // exitEditMode 应当先表示"不再编辑"，再操作 DOM）。
+  isEditing = false;
   const titleEl = document.createElement("div");
   titleEl.className = "todo-title";
   titleEl.textContent = newTitle;
@@ -1043,6 +1095,21 @@ async function init() {
     .then((fn) => (unlistenTodos = fn))
     .catch((e) => console.error("[usticky] listen todos-changed failed", e));
 
+  // **P1-4 fix**：监听 persist-failed 事件。
+  //
+  // 后端 commands/mod.rs + lib.rs 已在 4 个 persist 失败点 emit
+  // `usticky://persist-failed`（todo CRUD / window 几何 / pin mode /
+  // shortcut），但前端**完全没有 listener** —— 之前完全是死信号。
+  // 现在补上：磁盘满 / 权限被剥 / 临时目录异常时 mini-flash 提示用户，
+  // 否则 invoke 拿到 Ok 后用户以为写成功，重启数据全没。
+  let unlistenPersistFailed: UnlistenFn | null = null;
+  listen<string>("usticky://persist-failed", (e) => {
+    console.error("[usticky] persist failed:", e.payload);
+    showMiniFlash(t("app.error.save_failed"));
+  })
+    .then((fn) => (unlistenPersistFailed = fn))
+    .catch((e) => console.error("[usticky] listen persist-failed failed", e));
+
   // 后端 hover emitter 兜底（macOS / Win），与 JS mouseenter/leave 等效
   // (c) Rust emit 同值去重：避免 CSS spring 动画进行中反复重置起始点。
   //     Rust 端已有 dwell-time hysteresis，这里再做一层保险。
@@ -1054,7 +1121,7 @@ async function init() {
   // **不**依赖 `windowFocused`（PinBottom 默认 mode 下 macOS 不派 focus
   // change 事件，初值错了会让 Rust 路径永远短路）。
   let rustPathActive = false;
-  let rustHoveredCardId: string | null = null;
+  // rustHoveredCardId 在文件顶部声明（render() 也要引用）
   let unlistenHover: UnlistenFn | null = null;
   // **2026-07-03 fix（玻璃 2 秒后丢失问题）**：
   // 之前同值去重（`lastHoverPayload === e.payload`）是无时间窗口的永久短路 —— 如果
@@ -1464,6 +1531,7 @@ async function init() {
   // ── beforeunload 清理 ──
   window.addEventListener("beforeunload", () => {
     unlistenTodos?.();
+    unlistenPersistFailed?.();
     unlistenQuickAdd?.();
     unlistenPinMode?.();
     unlistenLocale?.();

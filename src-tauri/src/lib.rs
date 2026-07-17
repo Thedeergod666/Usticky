@@ -184,6 +184,35 @@ pub fn clear_quick_add_active() {
     QUICK_ADD_ACTIVE.store(false, Ordering::SeqCst);
 }
 
+/// **P1-5 fix**："普通 show"浮窗——只 raise + show + focus，**不**激活
+/// QUICK_ADD_ACTIVE，不 save prev app。
+///
+/// 跟 `quick_show_floating_window` 的区别：后者走全局快捷键路径（用户期待
+/// "我按了快捷键所以窗口从我身后出现 → 切回时再回原 app"），前者是用户从
+/// 设置面板 / 托盘主动"打开浮窗"按钮——用户期望"就显示在当前位置，不
+/// 切走原 app focus"。
+///
+/// **不**激活 QUICK_ADD_ACTIVE 的关键意义：QUICK_ADD_ACTIVE=true 会让
+/// `WindowEvent::Focused(false)` 触发 `blur_dismiss_floating_window` → 还原
+/// level 到 PinBottom 的 -1 → 浮窗被任何前台 app 盖住。这是"用户点完打开
+/// 浮窗 → 切到别的 app → 浮窗被盖住"的根因（违反用户"显示浮窗"的意图）。
+///
+/// 适用入口：
+///   - `show_floating_window` IPC 命令（设置面板"打开浮窗"按钮）
+///   - tray 左键单击的 show 分支
+pub fn show_floating_window_normal(app: &tauri::AppHandle) {
+    let Some(w) = app.get_webview_window("floating") else { return };
+    // 保留 pin mode 原生 level（不 raise 到 FLOATING）—— PinBottom 用户
+    // 主动打开浮窗时也希望它默认贴在桌面底部（hover 才临时置顶），不抢
+    // 前台 app 的位置感。只 show + focus 已经够。
+    QUICK_ADD_ACTIVE.store(false, Ordering::SeqCst);
+    let _ = w.show();
+    let _ = w.set_focus();
+    // **不** emit usticky://quick-add —— 那是"快捷键唤起"专用的视觉激活
+    // 信号，普通 show 不该触发（避免用户从设置面板打开浮窗时意外触发
+    // active 90s timeout 状态机）。
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()

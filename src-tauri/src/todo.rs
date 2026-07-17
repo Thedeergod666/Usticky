@@ -210,11 +210,52 @@ impl Store {
         todo
     }
 
+    /// 修改 todo 字段。**status 变化时**还会把 todo 从 Vec 中当前位置
+    /// 摘出并 append 到目标 status section 末尾，重置 `order` 为该 section
+    /// 的 `max_order + 1`。
+    ///
+    /// **为什么改 status 要移动 Vec 物理位置**：v0.1 之前 update() 只改 status
+    /// 字段不动 Vec，导致 pending/done 在数组里穿插。`reorder()` 的 `base_idx`
+    /// 锚定逻辑遇到穿插状态会出错，跨重启后用户看到的排序与预期不符。
+    /// 把 todo 移到目标 section 末尾 = 简单可预测：每次 toggleDone 把 todo
+    /// 放到该 section "最近完成 / 最近撤销" 的位置，跟用户心智模型一致。
+    ///
+    /// 边界：
+    ///   - 仅 title 改（status=None）：不动 Vec（编辑 title 不影响位置）
+    ///   - status 与旧值相同（toggle 取消）：当 no-op，不动 Vec
+    ///   - status 改变：摘出 + push 到目标 section 末尾 + 重置 order
     pub fn update(&mut self, id: &str, title: Option<String>, status: Option<TodoStatus>) -> Option<Todo> {
         let now = chrono::Utc::now().timestamp_millis();
-        let todo = self.data.todos.iter_mut().find(|t| t.id == id)?;
-        if let Some(title) = title { todo.title = title; }
-        if let Some(status) = status { todo.status = status; }
+        let idx = self.data.todos.iter().position(|t| t.id == id)?;
+        let current_status = self.data.todos[idx].status.clone();
+
+        // status 改变 → 摘出 + push 到目标 section 末尾 + 重置 order
+        if let Some(new_status) = status.as_ref() {
+            if *new_status != current_status {
+                // 目标 section 的 max_order（排除被摘出的 todo 自己）
+                let max_order = self.data.todos.iter()
+                    .enumerate()
+                    .filter(|(i, t)| *i != idx && t.status == *new_status)
+                    .map(|(_, t)| t.order)
+                    .max()
+                    .unwrap_or(-1);
+                let mut todo = self.data.todos.remove(idx);
+                todo.status = new_status.clone();
+                todo.order = max_order + 1;
+                todo.updated_at = now;
+                if let Some(title) = title {
+                    todo.title = title;
+                }
+                self.data.todos.push(todo.clone());
+                return Some(todo);
+            }
+        }
+
+        // status 没变（None 或同值）→ in-place update
+        let todo = &mut self.data.todos[idx];
+        if let Some(title) = title {
+            todo.title = title;
+        }
         todo.updated_at = now;
         Some(todo.clone())
     }
@@ -645,5 +686,111 @@ mod reorder_tests {
             .map(|t| t.id.as_str())
             .collect();
         assert_eq!(done, vec!["9", "10", "2", "3", "4"]);
+    }
+
+    /// **P1-2 fix** 回归测试：update() 改 status 必须把 todo 从 Vec 中当前位置
+    /// 摘出并 append 到目标 status section 末尾 + 重置 order。
+    /// 旧实现只改 status 字段不动 Vec，导致 pending/done 穿插 → reorder 出错。
+    #[test]
+    fn update_status_moves_todo_to_target_section_end() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Done, 0),
+            mk("c", TodoStatus::Done, 1),
+        ]);
+        // a: pending → done。预期：a 从 index 0 摘出，append 到 done 末尾，
+        // order = max(done.order) + 1 = 2。
+        let updated = s.update("a", None, Some(TodoStatus::Done)).unwrap();
+        assert_eq!(updated.status, TodoStatus::Done);
+        assert_eq!(updated.order, 2);
+        assert_eq!(ids(&s), vec!["b", "c", "a"]);
+        // 物理顺序：原 done 段保留原位置，新完成项追加到末尾
+        assert_eq!(s.data.todos[2].id, "a");
+        assert_eq!(s.data.todos[2].order, 2);
+    }
+
+    /// **P1-2 fix** 回归测试：撤销完成 (done → pending) 也走同样的移动逻辑。
+    #[test]
+    fn update_status_done_to_pending_moves() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+            mk("c", TodoStatus::Done, 0),
+            mk("d", TodoStatus::Done, 1),
+        ]);
+        // c: done → pending → append 到 pending 末尾
+        let updated = s.update("c", None, Some(TodoStatus::Pending)).unwrap();
+        assert_eq!(updated.status, TodoStatus::Pending);
+        assert_eq!(updated.order, 2);  // max(0,1) + 1
+        assert_eq!(ids(&s), vec!["a", "b", "d", "c"]);
+        // c 现在是 pending 段最后一条
+        let pending: Vec<&str> = s.data.todos.iter()
+            .filter(|t| t.status == TodoStatus::Pending)
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(pending, vec!["a", "b", "c"]);
+    }
+
+    /// **P1-2 fix**：仅改 title（status=None）→ in-place update，不动 Vec。
+    #[test]
+    fn update_title_only_does_not_move() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+        ]);
+        let updated = s.update("a", Some("renamed".into()), None).unwrap();
+        assert_eq!(updated.title, "renamed");
+        assert_eq!(updated.status, TodoStatus::Pending);
+        // Vec 位置 + order 不变
+        assert_eq!(ids(&s), vec!["a", "b"]);
+        assert_eq!(s.data.todos[0].order, 0);
+    }
+
+    /// **P1-2 fix**：status 与现值相同（toggle 取消等）→ no-op，不动 Vec。
+    #[test]
+    fn update_status_noop_when_unchanged() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+        ]);
+        let pinned_order = s.data.todos[0].order;
+        let updated = s.update("a", None, Some(TodoStatus::Pending)).unwrap();
+        assert_eq!(updated.status, TodoStatus::Pending);
+        assert_eq!(ids(&s), vec!["a", "b"]);
+        assert_eq!(s.data.todos[0].order, pinned_order);
+    }
+
+    /// **P1-2 fix**：同时改 title + status → status 路径生效（title 也更新）。
+    #[test]
+    fn update_title_and_status_together() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Done, 0),
+        ]);
+        let updated = s.update("a", Some("done item".into()), Some(TodoStatus::Done)).unwrap();
+        assert_eq!(updated.status, TodoStatus::Done);
+        assert_eq!(updated.title, "done item");
+        // a 已 append 到 done 末尾
+        assert_eq!(ids(&s), vec!["b", "a"]);
+    }
+
+    /// **P1-2 fix**：连续 toggle 不应让 order 出现重复或乱序。
+    #[test]
+    fn update_chained_toggles_give_monotonic_order() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+            mk("c", TodoStatus::Pending, 2),
+        ]);
+        // a → done (append 到 done 段，order=0)
+        s.update("a", None, Some(TodoStatus::Done)).unwrap();
+        // a → pending (append 到 pending 段，order=3 = max(1,2,?))
+        s.update("a", None, Some(TodoStatus::Pending)).unwrap();
+        // pending 段：b(1), c(2), a(3) —— 单调递增
+        let pending: Vec<i32> = s.data.todos.iter()
+            .filter(|t| t.status == TodoStatus::Pending)
+            .map(|t| t.order)
+            .collect();
+        assert_eq!(pending, vec![1, 2, 3]);
     }
 }

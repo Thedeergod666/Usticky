@@ -133,12 +133,13 @@ pub async fn reorder_todos(
 #[tauri::command]
 pub async fn show_floating_window(
     app: AppHandle,
-    store: State<'_, SharedStore>,
+    _store: State<'_, SharedStore>,
 ) -> Result<(), String> {
-    // 走 quick_show_floating_window 路径（save prev app + raise + show + focus）——
-    // 不是裸的 show + focus。PinBottom 默认 mode 下裸 show 会停在 level=-1，
-    // 被任何 app 窗口盖住 → 用户"看不到浮窗"。dismiss 时按 pin mode 还原。
-    crate::quick_show_floating_window(&app, store.inner());
+    // **P1-5 fix**：走"普通 show"路径——只 show + focus，**不**激活
+    // QUICK_ADD_ACTIVE。否则用户从设置面板/托盘主动"打开浮窗"后，
+    // 切到别的 app → WindowEvent::Focused(false) → blur_dismiss 把 level
+    // 还原到 PinBottom 的 -1 → 浮窗被盖住，违反用户意图。
+    crate::show_floating_window_normal(&app);
     Ok(())
 }
 
