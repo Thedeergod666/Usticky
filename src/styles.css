@@ -290,53 +290,47 @@ body[data-active] #app {
   cursor: grabbing;
 }
 
-/* 拖拽中三态共用的"只显示标题"规则。
+/* 拖拽中两态共用的"只显示标题"规则。
  *
- * SortableJS 一次拖拽里 .todo-card 可能带的 class：
+ * SortableJS 一次拖拽里**列表内**的 .todo-card 可能带的 class：
  *   - sortable-chosen：mousedown 后被选中的 source 卡（留在原位）
  *   - dragging：ghostClass 命名的占位卡（出现在目标 slot）
- *   - sortable-drag + sortable-fallback：forceFallback 模式下跟随光标的浮动克隆
+ * （forceFallback 的浮动克隆 .sortable-drag/.sortable-fallback 已整体
+ *  visibility:hidden —— 见下方规则 —— 不参与这里的样式。）
  *
- * 三种状态都"不该看到 checkbox / 删除按钮 / due 标签"：
+ * 两种状态都"不该看到 checkbox / 删除按钮 / due 标签"：
  *   - chosen 在原位透明显示完整控件是冗余（用户知道自己选了这张）
  *   - ghost 占位是个高亮提示，不该完整携带图标信息
- *   - drag 浮动克隆盖在 source 上，画完整控件视觉太重
  *
- * Hide 规则归一：所有四态都隐藏三个控件，加窄 padding 让标题贴左、
+ * Hide 规则归一：两态都隐藏三个控件，加窄 padding 让标题贴左、
  * 卡片视觉重心回到标题文字本身。 */
 .todo-card.dragging .todo-check,
 .todo-card.dragging .todo-delete,
 .todo-card.dragging .todo-due,
 .todo-card.sortable-chosen .todo-check,
 .todo-card.sortable-chosen .todo-delete,
-.todo-card.sortable-chosen .todo-due,
-.todo-card.sortable-drag .todo-check,
-.todo-card.sortable-drag .todo-delete,
-.todo-card.sortable-drag .todo-due,
-.todo-card.sortable-fallback .todo-check,
-.todo-card.sortable-fallback .todo-delete,
-.todo-card.sortable-fallback .todo-due {
+.todo-card.sortable-chosen .todo-due {
   display: none;
 }
 .todo-card.dragging,
-.todo-card.sortable-chosen,
-.todo-card.sortable-drag,
-.todo-card.sortable-fallback {
+.todo-card.sortable-chosen {
   padding-left: 11px;
 }
 
-/* SortableJS forceFallback 模式下，浮动克隆被 append 到 document.body
- * 上（fallbackOnBody: true），脱离 #app 的 CSS 变量作用域。标题用的
- * `color: var(--text-bright)` 没变量可解析，回落到浏览器默认黑色 →
- * "拖卡片文字变黑"。在两个 clone class 上显式 hard-code 颜色。 */
-.sortable-drag,
-.sortable-fallback {
-  color: rgba(255, 255, 255, 0.78);
-}
-.todo-card.sortable-drag .todo-title,
-.todo-card.sortable-fallback .todo-title {
-  color: rgba(255, 255, 255, 0.98);
-  text-shadow: none;
+/* SortableJS forceFallback 的浮动克隆（append 到 document.body，
+ * position:fixed + z-index:100000 跟随光标）**整体隐藏**。
+ *
+ * 原因（2026-07-20 用户决策）：落点已由列表内的 .dragging 占位卡
+ * 实时演算展示，浮动克隆纯属冗余遮挡（且它脱离 #app 的 CSS 变量
+ * 作用域，卡片外观还得单独 hard-code 维护，之前"透明底裸文字盖
+ * 最顶层"的 bug 也源于此）。用 visibility:hidden 而不是
+ * display:none / opacity：克隆保留盒模型，SortableJS 内部对它的
+ * transform 更新、drop 时移除都不受影响；opacity 也压不住——
+ * SortableJS 内联 opacity:0.8 + 心跳动画会盖掉普通声明，得靠
+ * !important，而 visibility 没有内联冲突，一行到位。 */
+.todo-card.sortable-drag,
+.todo-card.sortable-fallback {
+  visibility: hidden;
 }
 
 /* 已完成的 todo：fade out + 删除线

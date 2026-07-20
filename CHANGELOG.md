@@ -17,6 +17,15 @@
 
 ### Fixed
 
+- **拖拽 todo 卡时浮动克隆遮挡内容**：SortableJS
+  `forceFallback + fallbackOnBody` 会把被拖卡克隆一份 append 到
+  `document.body`，以 `position:fixed + z-index:100000` 跟随光标；
+  且克隆脱离 `#app` 的 CSS 变量作用域，卡片外观变量全部失效，
+  退化成透明底裸文字盖在最顶层。落点本已由列表内 `.dragging`
+  占位卡实时演算展示，浮动克隆纯属冗余 —— 直接
+  `.todo-card.sortable-drag / .sortable-fallback { visibility: hidden }`
+  整体隐藏（visibility 无内联样式冲突，克隆保留盒模型，不影响
+  SortableJS 内部 transform 更新 / drop 移除逻辑）。
 - reset_floating_window 加 `available_monitors().first()` fallback
   （Wayland 等场景下 `primary_monitor()` 返 None）+ tracing 日志
   输出目标显示器。
