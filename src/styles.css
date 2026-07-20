@@ -290,31 +290,40 @@ body[data-active] #app {
   cursor: grabbing;
 }
 
-/* 拖拽中两态共用的"只显示标题"规则。
+/* 拖拽中两态的"拖拽指示符"规则。
  *
- * SortableJS 一次拖拽里**列表内**的 .todo-card 可能带的 class：
- *   - sortable-chosen：mousedown 后被选中的 source 卡（留在原位）
- *   - dragging：ghostClass 命名的占位卡（出现在目标 slot）
- * （forceFallback 的浮动克隆 .sortable-drag/.sortable-fallback 已整体
+ * SortableJS forceFallback 下，**列表内**的 source/占位卡带的 class：
+ *   - sortable-chosen：mousedown 后被选中（fallback 模式拖拽全程保留）
+ *   - dragging：ghostClass 命名的占位态（drag 开始后加在同一元素上）
+ * （跟随光标的浮动克隆 .sortable-drag/.sortable-fallback 已整体
  *  visibility:hidden —— 见下方规则 —— 不参与这里的样式。）
  *
- * 两种状态都"不该看到 checkbox / 删除按钮 / due 标签"：
- *   - chosen 在原位透明显示完整控件是冗余（用户知道自己选了这张）
- *   - ghost 占位是个高亮提示，不该完整携带图标信息
+ * 2026-07-20 用户反馈调整：旧版把 .todo-check 一并 display:none +
+ * padding-left:11px，拖拽时文字左挤很难看。改为：
+ *   - checkbox 圆圈变 ⇅ 上下指示符 —— 占住原槽位，文字不位移，
+ *     同时明示"这张正在被你拖"，兼顾落点识别
+ *   - delete / due 仍隐藏（右侧控件对落点判断无信息量，保持占位卡干净）
  *
- * Hide 规则归一：两态都隐藏三个控件，加窄 padding 让标题贴左、
- * 卡片视觉重心回到标题文字本身。 */
-.todo-card.dragging .todo-check,
+ * #app 前缀（id 特异性）压过 .todo-card.done .todo-check（0,3,0）的
+ * 绿底 ✓ —— done 卡拖拽时同样显示 ⇅，行为一致。 */
+#app .todo-card.dragging .todo-check,
+#app .todo-card.sortable-chosen .todo-check {
+  background: transparent;
+  border-color: transparent;
+  cursor: grabbing;
+}
+#app .todo-card.dragging .todo-check::after,
+#app .todo-card.sortable-chosen .todo-check::after {
+  content: '⇅';
+  color: var(--text-mute);
+  font-size: 13px;
+  line-height: 1;
+}
 .todo-card.dragging .todo-delete,
 .todo-card.dragging .todo-due,
-.todo-card.sortable-chosen .todo-check,
 .todo-card.sortable-chosen .todo-delete,
 .todo-card.sortable-chosen .todo-due {
   display: none;
-}
-.todo-card.dragging,
-.todo-card.sortable-chosen {
-  padding-left: 11px;
 }
 
 /* SortableJS forceFallback 的浮动克隆（append 到 document.body，

@@ -8,6 +8,11 @@
 
 ### Changed
 
+- **拖拽时 checkbox 变 ⇅ 上下指示符**：旧版拖拽中 `.todo-check` 被
+  `display:none` + `padding-left:11px`，文字左挤。现在 checkbox 圆圈
+  在 dragging / sortable-chosen 态变成 ⇅（占住原槽位，文字不位移），
+  同时明示"正在拖的是这张"；delete / due 标签拖拽中仍隐藏。
+  done 卡拖拽同样显示 ⇅（`#app` 前缀压过 done 的绿底 ✓）。
 - **清理网络 entitlement 对齐"不联网"产品承诺**：删除
   `entitlements.plist` 的 `com.apple.security.network.client`。
   Usticky v0.1 实际零网络请求（前端静态 import + CSP 禁非 self/ipc
