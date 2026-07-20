@@ -6,6 +6,21 @@
 
 ### Added
 
+### Changed
+
+- **清理网络 entitlement 对齐"不联网"产品承诺**：删除
+  `entitlements.plist` 的 `com.apple.security.network.client`。
+  Usticky v0.1 实际零网络请求（前端静态 import + CSP 禁非 self/ipc
+  connect），保留 entitlement 只会扩大 Hardened Runtime 攻击面。
+  v0.2 加 Tauri updater 时再加回来。AGENTS.md / README 的"不联网"
+  承诺现在跟二进制实际权限一致。
+
+### Fixed
+
+- reset_floating_window 加 `available_monitors().first()` fallback
+  （Wayland 等场景下 `primary_monitor()` 返 None）+ tracing 日志
+  输出目标显示器。
+
 #### v0.1.0 骨架（2026-07-02）
 
 - Tauri 2 项目结构 + 双 locale i18n（en + zh-CN）+ iOS 26 玻璃质感 CSS + 浮窗位置/尺寸自动记忆

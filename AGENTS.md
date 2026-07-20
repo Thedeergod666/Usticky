@@ -22,7 +22,7 @@
 | 拖拽 | SortableJS | 自己写 DnD 边界是噩梦 |
 | 快捷键 | tauri-plugin-global-shortcut | 不抢 Spotlight/Cmd+Tab |
 | i18n | 双 locale（en + zh-CN），前端自写 helper + 后端 rust-i18n | 沿用 Musage 架构 |
-| 系统通知 | tauri-plugin-notification | v2+ 用（提醒临近 deadline） |
+| 系统通知 | tauri-plugin-notification | v0.2+ 用（提醒临近 deadline），v0.1 不依赖 |
 
 **Cargo 钉死**（避免重复踩坑）：
 - `crate-type = ["staticlib", "rlib"]` —— 删 cdylib 绕 MinGW ld 16-bit ordinal 溢出
@@ -53,7 +53,7 @@
 | `src-tauri/src/platform/macos.rs` 的 PinBottom + hover emitter | **已做（v0.1.2）** —— 三档 pin mode（PinTop/PinBottom/Normal，默认 PinBottom）+ 50ms tick hover emitter（`NSEvent.mouseLocation` + `windowNumberAtPoint` 命中测试）。Win 端 best-effort 实现（`HWND_BOTTOM`/`TOPMOST` dual-path），Linux no-op stub |
 | `src-tauri/tauri.conf.json` 的 CSP / 浮窗 windows 配置 | **整段抄**，改 label / productName |
 | `src-tauri/capabilities/` 的拆分模式 | **抄** —— 浮窗 capabilities vs 全局 capabilities 分开 |
-| `src-tauri/entitlements.plist` | **整段抄**（Usticky 不联网，可以把 `network.client` 删掉，留 `network.server` 给未来 updater） |
+| `src-tauri/entitlements.plist` | **整段抄**（Usticky 不联网——零 HTTP / 零 fetch / 零 IPC 之外的 connect——Hardened Runtime 不加任何 network entitlement，最小攻击面） |
 | AGENTS.md 里 18 条浮窗经验 | **直接抄**到本文档第 3 节 |
 
 **不借用 Musage 的**：
