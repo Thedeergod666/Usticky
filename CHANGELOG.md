@@ -8,6 +8,13 @@
 
 ### Changed
 
+- **idle（未 hover）背景压到 Musage 档位，hover 才显现**：`--tile-bg`
+  alpha 0.55 → 0.30、`--tile-border` 0.06 → 0、`--tile-shadow` → 0
+  （对齐 Musage idle：0.30 alpha / border 0 / shadow 0），idle 几乎只剩
+  文字浮在桌面上，hover 才显出玻璃瓦片（idle→hover 差 0.62 alpha）。
+  done 卡 idle 同步 0.24 → 0.12 保持"更折叠"相对关系。blur 仍 28px
+  写死不跟 Musage 的 10px —— 那是 WKWebView backdrop throttling
+  三层防御的前提。低电量模式（锁全强度）不受影响。
 - **拖拽时 checkbox 变 ⇅ 上下指示符**：旧版拖拽中 `.todo-check` 被
   `display:none` + `padding-left:11px`，文字左挤。现在 checkbox 圆圈
   在 dragging / sortable-chosen 态变成 ⇅（占住原槽位，文字不位移），

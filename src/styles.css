@@ -137,30 +137,28 @@ html, body {
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
   cursor: grab;
-  /* idle（未 hover）：浮窗和字体都淡化一点 —— "fold away" 视觉意图：
+  /* idle（未 hover）：浮窗和字体都淡化 —— "fold away" 视觉意图：
    * 浮窗静止不动鼠标时退到背景里，hover 才全强度介入。
-   * 注意：这里只动 alpha，**不动 --tile-blur / --tile-shadow**（blur 28px
-   * 写死是 WKWebView backdrop throttling 修复的关键，别再跟历史
+   * 注意：这里只动 alpha / 阴影，**不动 --tile-blur / saturate**（blur
+   * 28px 写死是 WKWebView backdrop throttling 修复的关键，别再跟历史
    * glass-fading 根因搞混）。色彩靠 CSS variable swap 切换，触发的是
    * background-color / color 的纯 paint —— 不重新合成 backdrop layer。
-   * transition 列表（line 219-223）已含 background-color / color，过渡
-   * 走 cubic-bezier(0.22, 1, 0.36, 1)，不会出现"折叠"突变。
+   * transition 列表（.todo-card）已含 background-color / border-color，
+   * 过渡走 cubic-bezier(0.22, 1, 0.36, 1)，不会出现"折叠"突变。
    *
-   * **2026-07-08 fix**：加深 idle alpha 0.62 → 0.55 拉开跟 hover 0.88
-   * 的差距（0.33 alpha）。Musage 对比组 idle 是 0.30 alpha + blur 10px，
-   * hover 0.82 + blur 28px（差 0.52 alpha + 18px blur）。Usticky v3 之前
-   * idle 0.62 / hover 0.82 差 0.20，hover 时视觉变化太微弱，用户感知到
-   * "瞬间切完但什么都没变"。加深 idle 让 hover 强调有明显"硬起来"。
-   * 同时文字层级 idle → hover 阶梯从 0.74/0.52/0.34 → #f4f5f7/0.72/0.52
-   * 加大到 0.58/0.36/0.18 → 0.98/0.78/0.58（更暗 → 更亮，对比度更强）。
-   * 不动 --tile-blur (28px 写死) —— 不踩 WKWebView backdrop throttling
-   * 2 秒丢失根因。 */
-  --tile-bg: rgba(28, 30, 38, 0.55);
+   * **2026-07-20 fix**：idle 背景进一步压到 Musage 档位 —— bg alpha
+   * 0.55 → 0.30、border 0.06 → 0、shadow → 0（对齐 Musage idle：
+   * 0.30 alpha / border 0 / shadow 0），idle 几乎只剩文字浮在桌面上，
+   * hover 才显出玻璃瓦片（idle→hover 差 0.62 alpha，比 Musage 的
+   * 0.52 还大）。rgb 保持 28,30,38 不动，纯 alpha 渐变。
+   * **不**学 Musage idle blur 10px —— Usticky 的 blur 28px 写死是
+   * backdrop throttling 三层防御的前提（见文件头 L1-L3）。
+   * 历史：2026-07-08 曾 0.62 → 0.55。 */
+  --tile-bg: rgba(28, 30, 38, 0.30);
   --tile-blur: 28px;
   --tile-saturate: 180%;
-  --tile-border: rgba(255, 255, 255, 0.06);
-  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.30),
-                 0 0 0 0.5px rgba(255, 255, 255, 0.02) inset;
+  --tile-border: rgba(255, 255, 255, 0);
+  --tile-shadow: 0 0 0 rgba(0, 0, 0, 0);
 
   /* 文字层级（idle：偏弱，让浮窗"折叠"到背景里） */
   --text-bright: rgba(255, 255, 255, 0.58);
@@ -219,11 +217,10 @@ html, body {
  * mouseenter），hover 接管或 input.blur 时撤销。 */
 body[data-hover] #app,
 body[data-active] #app {
-  /* **2026-07-08 fix**：hover tile-bg 0.82 → 0.92 加强 hover 强调。
-   * idle 0.55 → hover 0.92 = 0.37 alpha 差，比 Musage idle/hover 差 0.52
-   * 略小（Musage 还叠了 blur 10→28），但 idle 浮窗比 Musage 暗得多（idle 0.55
-   * vs Musage 0.30 —— Musage 更暗），净效果是"idle 时 Usticky 比 Musage 更
-   * 可见但还是'折叠'，hover 时两者都'硬起来'"。差距足够产生可感知的'fold/unfold'。
+  /* **2026-07-20**：idle 已压到 0.30（对齐 Musage idle 档），
+   * idle 0.30 → hover 0.92 = 0.62 alpha 差（比 Musage 的 0.52 还大），
+   * "fold/unfold" 感知足够强。hover 值本身不变（0.92 / border 0.12 /
+   * shadow 0.50 —— 2026-07-08 定稿）。
    * 不动 --tile-blur (28px 写死) —— 不踩 WKWebView backdrop throttling
    * 2 秒丢失根因。 */
   --tile-bg: rgba(28, 30, 38, 0.92);
@@ -362,13 +359,13 @@ body[data-active] #app {
    * 让划掉的标题在浮窗静止时几乎看不见。 */
 }
 body:not([data-hover]):not([data-low-power]) .todo-card.done {
-  /* **2026-07-09 加深 idle 透明**：done 卡比 pending 更"折叠"到背景里。
-   * pending idle = 0.55 alpha → done idle 推到 0.24（差 0.31 alpha），
+  /* **2026-07-20 跟随 pending idle 0.30 同步下探**：done idle 0.24 → 0.12，
+   * 保持 done 比 pending "更折叠"的相对关系（原差 0.31，现差 0.18，
+   * 绝对亮度都已很低，差距足够）。border 跟随 pending 归 0。
    * 让已完成任务在浮窗静止时几乎看不见，达到"折叠到背景"的目的。
-   * border 也压到 0.02（几乎不可见），让 done 卡视觉上完全"退场"。
    * 只动 alpha（背景 + 边框），不动 --tile-blur，跟 v3 设计原则一致。 */
-  --tile-bg: rgba(28, 30, 38, 0.24);
-  --tile-border: rgba(255, 255, 255, 0.02);
+  --tile-bg: rgba(28, 30, 38, 0.12);
+  --tile-border: rgba(255, 255, 255, 0);
   /* 勾圈颜色覆盖：idle 下不沿用 --c-data-ok（= 0.58 白），用更弱色 0.40
    * 保持"已完成"识别但明显比 pending 卡更"折叠"。
    * 文本：done 标题文字降到 --text-mute 之下，让"已划掉"标题几乎不可读，
