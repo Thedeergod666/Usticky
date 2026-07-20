@@ -8,6 +8,11 @@
 
 ### Changed
 
+- **hover 背景与 Musage 逐项对齐，两 app 同屏颜色统一**：hover
+  `--tile-bg` 0.92 → 0.82、`--tile-border` 0.12 → 0.10、`--tile-shadow`
+  0.50/0.05 → 0.45/0.04（此前 Usticky hover 比 Musage 深一档，同屏时
+  玻璃色不一致）。idle→hover 差随之与 Musage 相同（0.30 → 0.82 =
+  0.52 alpha）。blur 28px / saturate 180% 两边本就一致，不动。
 - **idle（未 hover）背景压到 Musage 档位，hover 才显现**：`--tile-bg`
   alpha 0.55 → 0.30、`--tile-border` 0.06 → 0、`--tile-shadow` → 0
   （对齐 Musage idle：0.30 alpha / border 0 / shadow 0），idle 几乎只剩

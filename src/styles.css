@@ -149,8 +149,9 @@ html, body {
    * **2026-07-20 fix**：idle 背景进一步压到 Musage 档位 —— bg alpha
    * 0.55 → 0.30、border 0.06 → 0、shadow → 0（对齐 Musage idle：
    * 0.30 alpha / border 0 / shadow 0），idle 几乎只剩文字浮在桌面上，
-   * hover 才显出玻璃瓦片（idle→hover 差 0.62 alpha，比 Musage 的
-   * 0.52 还大）。rgb 保持 28,30,38 不动，纯 alpha 渐变。
+   * hover 才显出玻璃瓦片（idle→hover 差 0.52 alpha，与 Musage 一致；
+   * hover 值也已跟 Musage 逐项对齐）。rgb 保持 28,30,38 不动，纯
+   * alpha 渐变。
    * **不**学 Musage idle blur 10px —— Usticky 的 blur 28px 写死是
    * backdrop throttling 三层防御的前提（见文件头 L1-L3）。
    * 历史：2026-07-08 曾 0.62 → 0.55。 */
@@ -217,16 +218,18 @@ html, body {
  * mouseenter），hover 接管或 input.blur 时撤销。 */
 body[data-hover] #app,
 body[data-active] #app {
-  /* **2026-07-20**：idle 已压到 0.30（对齐 Musage idle 档），
-   * idle 0.30 → hover 0.92 = 0.62 alpha 差（比 Musage 的 0.52 还大），
-   * "fold/unfold" 感知足够强。hover 值本身不变（0.92 / border 0.12 /
-   * shadow 0.50 —— 2026-07-08 定稿）。
+  /* **2026-07-20**：hover 值与 Musage hover **逐项对齐**（bg 0.92→0.82、
+   * border 0.12→0.10、shadow 0.50/0.05→0.45/0.04）—— 两个 app 同屏时
+   * 玻璃瓦片颜色完全一致（此前 Usticky hover 更深，用户反馈颜色不统一）。
+   * idle 0.30 → hover 0.82 = 0.52 alpha 差，也跟 Musage 一致。
+   * （与下方 body[data-low-power] 的锁定值相同纯属巧合：低电量模式
+   * 本来就直接锁在 Musage hover 档。）
    * 不动 --tile-blur (28px 写死) —— 不踩 WKWebView backdrop throttling
    * 2 秒丢失根因。 */
-  --tile-bg: rgba(28, 30, 38, 0.92);
-  --tile-border: rgba(255, 255, 255, 0.12);
-  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.50),
-                 0 0 0 0.5px rgba(255, 255, 255, 0.05) inset;
+  --tile-bg: rgba(28, 30, 38, 0.82);
+  --tile-border: rgba(255, 255, 255, 0.10);
+  --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.45),
+                 0 0 0 0.5px rgba(255, 255, 255, 0.04) inset;
 
   --text-bright: rgba(255, 255, 255, 0.98);
   --text-mute:   rgba(255, 255, 255, 0.78);
