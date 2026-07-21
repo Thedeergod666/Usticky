@@ -1,0 +1,210 @@
+name: Release
+
+# ──────────────────────────────────────────────────────────────
+# 触发：
+#   1) 推送 v*.*.* 标签（v0.2.0 之类）
+#   2) Actions 页手动 Run workflow（输入版本号）
+#
+# 产物（全部未签名，见 RELEASE_TEMPLATE.md 的安装说明）：
+#   macOS arm64 dmg / macOS x64 dmg / Windows x64 NSIS / Linux AppImage + deb
+# ──────────────────────────────────────────────────────────────
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（不带 v 前缀）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────
+  # 平台构建 + 发布矩阵（沿用 Musage release.yml 的打法）
+  #
+  # 每个 target 跑一次 tauri build，tauri-action 负责：
+  #   - 产物落到 target/<target>/release/bundle/
+  #   - 在第一个跑完的 job 里创建 GitHub Release（draft）
+  #   - 把所有 bundle 上传成 release assets
+  #
+  # 有意砍掉的产物（保持发布面最小、故障点最少）：
+  #   - Windows MSI：Musage 实测 WiX 镜像在 CI 上经常 timeout
+  #   - Linux RPM：AppImage + deb 已覆盖主流桌面 Linux 用户
+  # ────────────────────────────────────────────────────────
+  build:
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-arm64
+            bundles: dmg
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            label: macos-x64
+            bundles: dmg
+          # Windows 用 MSVC 工具链（Musage CI 同款）；Cargo.toml 的
+          # staticlib 钉法是给 MinGW 兜底的，对 MSVC 无副作用
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x64
+            bundles: nsis
+          # 钉 ubuntu-22.04 而非 ubuntu-latest —— 24.04 上 webkit2gtk-4.1
+          # 已被 mark deprecated，pin 住避免发版时炸（Musage 同款决策）
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: linux-x64
+            bundles: appimage,deb
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # ── Node / pnpm ──
+      - name: Setup pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 9.15.4
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          cache: "pnpm"
+
+      # ── Rust 工具链 ──
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+          shared-key: ${{ matrix.target }}
+
+      # ── macOS objc2 需要明确最低部署版本 ──
+      - name: Set macOS deployment target
+        if: runner.os == 'macOS'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> $GITHUB_ENV
+
+      # ── Linux 系统依赖：webkit2gtk-4.1 + libappindicator3 + librsvg + patchelf ──
+      # 跟 Tauri 2 官方 GitHub Actions 文档示例同一组包
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      # ── 注入版本号到 tauri.conf.json，再触发 sync-version.cjs 同步到另外两份 ──
+      - name: Sync version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "Building Usticky v${VERSION} for ${{ matrix.target }}"
+
+          # 用 Node 而不是 sed，更可靠（tauri.conf.json 含嵌套 JSON）
+          node -e "
+            const fs = require('fs');
+            const p = 'src-tauri/tauri.conf.json';
+            const c = JSON.parse(fs.readFileSync(p, 'utf8'));
+            c.version = '${VERSION}';
+            fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');
+          "
+
+          # 同步到 package.json + Cargo.toml
+          pnpm sync-version
+
+      # ── 前端依赖 ──
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      # ── 打包 + release（tauri-action 接管）──
+      #
+      # tauri-action 会：
+      #   1) 调 `tauri build --target ${{ matrix.target }}`
+      #   2) 第一个完成 build 的 job 创建 GitHub Release（draft）
+      #   3) 所有 job 完成后把 bundles 上传到 release
+      #
+      # 未配置任何签名 secret —— 产物全部未签名（macOS 右键打开 /
+      # Windows SmartScreen 选"仍要运行"，见 RELEASE_TEMPLATE.md）。
+      # 以后要签名：配好 APPLE_*（6 个）/ WINDOWS_CERTIFICATE(_PASSWORD)
+      # secret 后在这里加回对应 env（参考 Musage release.yml）。
+      - name: Tauri build & release
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # 不让 action 自己写 tagName：用本 workflow 触发的 tag
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', inputs.version) }}
+          releaseName: "Usticky ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', inputs.version) }}"
+          releaseDraft: true
+          releaseBody: .github/RELEASE_TEMPLATE.md
+          # 不走 tauri-plugin-updater，不上传 latest.json（defense-in-depth）
+          uploadUpdaterJson: false
+          # 不传 --bundles 时 tauri CLI 默认走 tauri.conf.json 的 bundle.targets，
+          # 会跟 matrix 冲突 —— 显式传
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+  # ────────────────────────────────────────────────────────
+  # 验证 job：build 完后确认 release assets 齐全
+  # ────────────────────────────────────────────────────────
+  verify:
+    name: verify release assets
+    needs: build
+    runs-on: ubuntu-22.04
+    if: success()
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Wait a moment for release
+        run: sleep 15
+      - name: Verify release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', inputs.version) }}"
+          echo "验证 release $TAG 所有平台的 bundle 都齐了"
+          # 期望产物（按平台）：
+          #   macOS arm64: *_aarch64.dmg
+          #   macOS x64  : *_x64.dmg
+          #   Windows    : *_x64-setup.exe (NSIS)
+          #   Linux      : *_amd64.AppImage + *_amd64.deb
+          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          echo "$ASSETS"
+
+          if [ -z "$ASSETS" ]; then
+            echo "::error::release $TAG 不存在或没有 assets（tauri-action 可能静默失败）"
+            exit 1
+          fi
+
+          echo "$ASSETS" | grep -q "_aarch64.dmg" \
+            || (echo "::error::macOS arm64 dmg 缺失"; exit 1)
+          echo "$ASSETS" | grep -q "_x64.dmg" \
+            || (echo "::error::macOS x64 dmg 缺失"; exit 1)
+          echo "$ASSETS" | grep -q "_x64-setup.exe" \
+            || (echo "::error::Windows NSIS installer 缺失"; exit 1)
+          echo "$ASSETS" | grep -q "_amd64.AppImage" \
+            || (echo "::error::Linux AppImage 缺失"; exit 1)
+          echo "$ASSETS" | grep -q "_amd64.deb" \
+            || (echo "::error::Linux deb 缺失"; exit 1)
+
+          echo "✓ 所有平台 bundle 都齐了"

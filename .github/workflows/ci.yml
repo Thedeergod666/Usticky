@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# action 全部钉到 commit SHA（沿用 Musage 同款钉法，避免上游 major 升级改语义）
+#   actions/checkout        v4.3.1 → 34e114876b0b11c390a56381ad16ebd13914f8d5
+#   actions/setup-node      v4.4.0 → 49933ea5288caeca8642d1e84afbd3f7d6820020
+#   pnpm/action-setup       v4.4.0 → fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+#   dtolnay/rust-toolchain  stable → 29eef336d9b2848a0b548edc03f92a220660cdb8
+#   Swatinem/rust-cache     v2.9.1 → c19371144df3bb44fab255c43d04cbc2ab54d1c4
+
+jobs:
+  # ── 前端：类型检查 + vite 构建（单平台即可，产物跨平台一致）──
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        # 钉到 9.15.4，跟 package.json 的 packageManager 严格对齐
+        with: { version: 9.15.4 }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build # tsc --noEmit 含在 build 脚本里（tsc && vite build）
+
+  # ── 后端：三平台 cargo check（不打包，省时间）──
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      # Tauri 2 在 Linux 链接 webkit2gtk 等系统库，runner 默认没装；
+      # 不装 cargo check 在 tauri build script 解析阶段就挂。
+      - name: Install Linux system deps (Tauri 2)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            build-essential \
+            libssl-dev
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # tauri::generate_context!() 在 cargo check 时就校验 frontendDist="../dist"
+      # 存在 —— 显式装前端依赖 + pnpm build 让 dist/ 存在
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with: { version: 9.15.4 }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+      - name: cargo check
+        working-directory: src-tauri
+        # --locked 必加：防 fresh cargo 在不同平台重解析依赖树
+        run: cargo check --locked --all-targets

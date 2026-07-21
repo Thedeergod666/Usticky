@@ -274,6 +274,18 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ⏳ **Cmd+Z 撤销栈**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 已占位 keydown listener，TODO 未实现，v0.2 候选）
 ⏳ **tray 图标任务数 badge**（v0.1 是静态图标 `tray-base.png`，v0.2 候选）
 
+## 发版（v0.2.0 起，2026-07-21）
+
+沿用 Musage 流水线打法（`.github/workflows/`）：
+
+- **CI**（`ci.yml`）：PR + main push 触发。frontend（pnpm build 单平台）+ rust（三平台 `cargo check --locked --all-targets`，Linux 需 webkit2gtk-4.1 系统依赖）。
+- **Release**（`release.yml`）：push `v*.*.*` tag 或 Actions 手动输入版本号触发。矩阵 = macOS arm64 dmg / macOS x64 dmg / Windows x64 NSIS（MSVC）/ Linux x64 AppImage+deb（pin ubuntu-22.04），`tauri-action@v1.0.0`（钉 SHA）出 **draft release** + verify job 校验 5 个产物齐全。
+- **产物未签名**：没配 APPLE_* / WINDOWS_CERTIFICATE secret。macOS 用户右键打开或 `xattr -cr`；Windows SmartScreen 选"仍要运行"。以后要签名时把 Musage release.yml 的 env 块抄回来。
+- **有意砍掉**：Windows MSI（Musage 实测 WiX 镜像 CI 上常 timeout）、Linux RPM（AppImage+deb 覆盖面已够）。
+- **版本号三处同步**：`pnpm sync-version`（package.json → tauri.conf.json + Cargo.toml）。发版流程：改 package.json version → sync → 更新 CHANGELOG → commit → `git tag vX.Y.Z && git push origin vX.Y.Z` → 等 draft release → 人工 review 后 publish。
+- Windows 目标用 **MSVC**（Musage CI 同款）。Cargo.toml 的 `crate-type = ["staticlib", "rlib"]` 是给 MinGW 兜底的，对 MSVC 无副作用，别删。
+- 不上传 `latest.json`（不走 tauri-plugin-updater；要加 updater 时记得把 network entitlement 加回 entitlements.plist）。
+
 ## v0.2 候选
 
 | Feature | 价值 | 复杂度 |

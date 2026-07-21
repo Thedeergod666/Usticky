@@ -4,7 +4,21 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-21
+
+首个公开发布版。含 v0.1.2 之后的全部交互修复与新功能，以及 CI/CD 流水线。
+
 ### Added
+
+- **复制按钮**（删除键左侧）：一键复制 todo 文本，mini-flash 反馈；
+  `navigator.clipboard.writeText` + `execCommand` 双路径兜底
+- **删除二次确认**：第一次点击进入确认态（实红 + tooltip 提示），
+  3s 内第二次点击才真删；超时 / hover 结束自动撤销
+- **GitHub Actions 流水线**：CI（前端构建 + 三平台 cargo check）+
+  Release（macOS arm64/x64 dmg、Windows NSIS、Linux AppImage/deb，
+  tag 触发自动出 draft release）
+- 新增 i18n key：`app.action.copy` / `app.action.confirm_delete` /
+  `app.copy.flash` / `app.error.copy_failed`
 
 ### Changed
 
@@ -31,9 +45,26 @@
   connect），保留 entitlement 只会扩大 Hardened Runtime 攻击面。
   v0.2 加 Tauri updater 时再加回来。AGENTS.md / README 的"不联网"
   承诺现在跟二进制实际权限一致。
+- **卡内按钮压缩 + 不占位**：复制/删除按钮包进 `.todo-actions` 容器
+  （22→18px、组内 gap 10→2），默认 `display:none`，hover 卡片才显示
+  —— 未 hover 时 title 不再被白挤 ~46px
 
 ### Fixed
 
+- **未聚焦时 hover 卡片无交互**（删除按钮不显示、长文不展开，必须
+  点一下聚焦才生效）：根因是 hover-pos 屏幕坐标→视口坐标换算链
+  （tao 单位混用 + `window.screen` 基准屏假设）在部分机器上错位，
+  `elementFromPoint` 恒 null。**换算挪到 Rust 端同坐标系直接相减**
+  （macOS 用窗口自身高度翻 Y 轴，Win 除 scale），前端拿到直接用
+- **未聚焦时 hover 按钮无反馈**（不变色、光标不变手型）：按钮
+  显隐/反馈弃用 CSS `:hover`（非 key window 不激活且 stuck），
+  统一 `.card-hover` / `.btn-hover` class 状态机（JS mouseenter +
+  Rust hover-pos 双路径驱动）；手型光标走 `set_cursor_pointer`
+  命令 → macOS `NSCursor` 兜底
+- **未聚焦时点按钮要点两次**（第一击被 click-to-focus 吞掉）：
+  `acceptFirstMouse: true`，点一次复制键即触发
+- **多张卡 × 删除按钮概率残留**：`:hover` stuck 所致，显隐改单一
+  `.card-hover` 状态机后实测穿梭 9 卡计数恒 ≤1
 - **拖拽 todo 卡时浮动克隆遮挡内容**：SortableJS
   `forceFallback + fallbackOnBody` 会把被拖卡克隆一份 append 到
   `document.body`，以 `position:fixed + z-index:100000` 跟随光标；
@@ -46,6 +77,11 @@
 - reset_floating_window 加 `available_monitors().first()` fallback
   （Wayland 等场景下 `primary_monitor()` 返 None）+ tracing 日志
   输出目标显示器。
+
+## [0.1.2] - 2026-07-06
+
+hover emitter + 设置面板 + tray 子菜单 + 三档 pin mode + SortableJS 拖拽
+（累计 v0.1.1 / v0.1.2 两轮迭代）：
 
 #### v0.1.0 骨架（2026-07-02）
 
@@ -99,15 +135,6 @@
 - hover 玻璃效果在切回浮窗时丢（`setHoverAttr(false)` 重置 dedup 状态）
 - 光标移上浮窗时闪烁（hover emitter 同值去重 + JS 40ms debounce）
 - 浮窗位置 `set_position` 在副屏拔了之后扔到屏幕外（启动时 clamp 到主显示器范围）
-
-### Pending（next sprint）
-
-- Cmd+Z 撤销栈（最多 50 条）—— `main.ts` 已占位 keydown listener，TODO 未实现
-- 全局快捷键冲突检测
-- 全文搜索（Cmd+F 浮窗内）
-- tray 图标任务总数 badge（v0.1 是静态图标 `tray-base.png`）
-- 提醒通知（tauri-plugin-notification，临近 deadline 弹）
-- 标签分组（折叠）
 
 ## [0.1.0] - 2026-07-02
 
