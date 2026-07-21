@@ -252,6 +252,15 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ✅ Pin mode 跨 webview 同步（`usticky://pin-mode-changed` listener 在浮窗 / 设置面板 / tray 三处生效）
 ✅ `persist_and_emit` 失败时 emit `usticky://persist-failed`（不再静默吞掉，前端 mini-flash 提示）
 
+### v0.1.3（2026-07-21，未聚焦卡片 hover 修复 + 复制按钮 + 删除二次确认）
+
+✅ **hover-pos 改发视口相对坐标（根因修复）**：旧实现 Rust 发屏幕坐标、前端用 `innerPosition()` + `window.screen.height` 手工换算 —— 叠了 tao `bottom_left_to_top_left` physical/logical 单位混用、`window.screen` 是窗口所在屏而 `mouseLocation` 以主屏为基准、Retina scale 三层易碎假设。实测同一公式在不同机器/显示器配置下换算结果不同（85dc58a 修副屏反而打破主屏，relY 算出 1204px 远超 703px 窗口 → `elementFromPoint` 恒 null → 未聚焦 hover 卡片永远不展开、删除按钮（纯 CSS `:hover`）永不显示）。**修复：换算挪到 Rust 端 —— `NSEvent.mouseLocation` / `GetCursorPos` 与窗口 frame 同坐标系直接相减（macOS 用窗口自身高度翻 Y 轴，Win 除 scale），前端拿到直接用，零假设**。规则：**永远别让前端做屏幕坐标→视口坐标换算**。
+✅ 前端 hover-pos listener 不再要 `rustPathActive` 开关（hover-pos 只在 Rust inside=true 时发送，收到即激活，vite HMR 刷新后自愈）
+✅ `.card-hover` class 驱动卡内按钮显隐：未聚焦窗口 WKWebView 不激活 CSS `:hover`，Rust hover-pos 命中的卡片挂 `.card-hover`，CSS `.todo-card:hover` 与 `.todo-card.card-hover` 双条件显示操作按钮
+✅ 复制按钮（删除键左侧，`navigator.clipboard.writeText` + `execCommand` 兜底，mini-flash 反馈）
+✅ 删除二次确认：第一次点击进入确认态（实红 + `data-confirm="1"`），3s 内第二次点击才真删；超时 / hover 结束（`unhoverCard` / `mouseleave`）自动撤销 —— 防"按钮已隐藏但确认态还在"的误删
+✅ 新增 i18n key：`app.action.copy` / `app.action.confirm_delete` / `app.copy.flash` / `app.error.copy_failed`
+
 ### 仍未做
 
 ⏳ **Cmd+Z 撤销栈**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 已占位 keydown listener，TODO 未实现，v0.2 候选）

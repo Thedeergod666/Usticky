@@ -259,10 +259,11 @@ pub fn restore_level_after_quick_add<R: Runtime>(app: &AppHandle<R>, mode: PinMo
 
 /// 浮窗内鼠标坐标 payload，发到前端驱动 `elementFromPoint`。
 ///
-/// 坐标系 = 屏幕 logical pixels（前端拿到直接喂 elementFromPoint）。
-/// Win 上 `GetCursorPos` 是 physical px，要在 emit 前除 scale 转 logical，
-/// 否则 Retina 上 elementFromPoint 命中错位（前端的 clientWidth/scrollHeight
-/// 都是 logical px）。
+/// 坐标系 = **视口相对坐标**（CSS px，原点 = webview 内容区左上角），
+/// 前端拿到直接喂 `elementFromPoint`，**不需要任何转换**（2026-07-21 fix，
+/// 与 macOS 端对齐：旧实现发屏幕坐标让前端换算，跨屏/缩放假设易碎）。
+/// Win 上 `GetCursorPos` / `GetWindowRect` 是 physical px，emit 前除 scale
+/// 转 logical（前端的 clientWidth/scrollHeight 都是 logical px）。
 #[derive(serde::Serialize, Clone, Copy)]
 struct HoverPos {
     x: f64,
@@ -322,7 +323,7 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
             loop {
                 thread::sleep(Duration::from_millis(50));
 
-                let Some((raw_inside, pt)) = is_cursor_inside_floating(&app) else {
+                let Some((raw_inside, pt, rect)) = is_cursor_inside_floating(&app) else {
                     continue;
                 };
 
@@ -356,9 +357,10 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                 // mouseenter，title-expand 必须靠这条路径。
                 //
                 // **P2-1 fix**：用 spawn 时缓存的 scale_factor，不调 Tauri。
+                // 坐标 = 视口相对（cursor - window rect 左上角）/ scale。
                 if inside && !hwnd_cache.is_null() {
-                    let logical_x = pt.x as f64 / scale_cache;
-                    let logical_y = pt.y as f64 / scale_cache;
+                    let logical_x = (pt.x - rect.left) as f64 / scale_cache;
+                    let logical_y = (pt.y - rect.top) as f64 / scale_cache;
                     let _ = app.emit(
                         "usticky://floating-hover-pos",
                         HoverPos { x: logical_x, y: logical_y },
@@ -412,8 +414,10 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 ///    后必须等于浮窗自己 —— 防止"被另一个 app 窗口盖住时误触发 raise"
 ///
 /// 返回 `None` 表示本轮无法判定（窗口未上屏 / Win API 失败），caller
-/// continue 即可。坐标永远是物理像素，emit 到前端时 caller 转 logical。
-fn is_cursor_inside_floating<R: Runtime>(app: &AppHandle<R>) -> Option<(bool, POINT)> {
+/// continue 即可。`POINT` 是物理像素光标位置，`RECT` 是浮窗物理像素
+/// 外框（同一坐标系），emit hover-pos 时 caller 相减 + 除 scale 转
+/// 视口相对 logical 坐标。
+fn is_cursor_inside_floating<R: Runtime>(app: &AppHandle<R>) -> Option<(bool, POINT, RECT)> {
     let win = app.get_webview_window("floating")?;
     let hwnd_t = win.hwnd().ok()?;
     if hwnd_t.0.is_null() {
@@ -443,19 +447,19 @@ fn is_cursor_inside_floating<R: Runtime>(app: &AppHandle<R>) -> Option<(bool, PO
             return None;
         }
         if !point_in_rect(pt, &rect) {
-            return Some((false, pt));
+            return Some((false, pt, rect));
         }
         // WindowFromPoint 成功 → topmost non-null = 真实命中窗口。
         // 失败 → null = 当作"未被浮窗遮挡",返 false (保守不 raise)。
         let topmost: WIN_HWND = WindowFromPoint(pt);
         if topmost.is_null() {
-            return Some((false, pt));
+            return Some((false, pt, rect));
         }
         let root = GetAncestor(topmost, GA_ROOT);
         if root.is_null() {
-            return Some((topmost == our_hwnd, pt));
+            return Some((topmost == our_hwnd, pt, rect));
         }
-        Some((root == our_hwnd, pt))
+        Some((root == our_hwnd, pt, rect))
     }
 }
 

@@ -72,7 +72,7 @@ let rustHoveredCardId: string | null = null;
 ///
 /// 未来新增"不应被 SortableJS 当作拖拽起点"的卡内控件（如优先级 chip、
 /// 标签按钮），只需把选择器追加到这条常量里。
-const NON_DRAGGABLE_SELECTORS = ".todo-check, .todo-delete, .todo-edit-input";
+const NON_DRAGGABLE_SELECTORS = ".todo-check, .todo-delete, .todo-copy, .todo-edit-input";
 
 // 浮窗层级模式（pin_top / pin_bottom / normal）
 // 启动时从后端 get_pin_mode 拉，跟 usticky://pin-mode-changed 事件同步
@@ -234,48 +234,6 @@ function isUserTyping(): boolean {
 function cssEscape(s: string): string {
   if (typeof (CSS as any).escape === "function") return (CSS as any).escape(s);
   return s.replace(/([!"#$%&'()*+,./:;<=>?@[\]^`{|}~])/g, "\\$1");
-}
-
-/// 把 Rust 上报的屏幕 logical 坐标转成 viewport 相对坐标，再喂给
-/// `document.elementFromPoint`。
-///
-/// 跨平台 Y 轴差异：
-///   - **macOS**：`NSEvent.mouseLocation()` 是 bottom-left origin
-///     of **main display**（global screen coords，logical points），
-///     跟 CSS `elementFromPoint` 期待的 top-left 反着。要先
-///     `screenH - y` 翻一次到 top-origin。
-///   - **Win**：`GetCursorPos` 已是 top-left origin 且 Rust 已转 logical，
-///     直接用。
-///
-/// `winY` 来自 Tauri `innerPosition()`（tao 0.35.3
-/// `bottom_left_to_top_left`），该函数用 `pixels_high()`（物理像素）
-/// 减 `origin.y + height`（logical points）→ mixed-unit。对 Retina
-/// scale=2，返回值比正确的 frame top Y (in main top-origin logical)
-/// 多了 `fullScreenH`。所以这里不传修正后的 winY，而是直接在公式里
-/// 用 `fullScreenH*2 - screenY - winY` 把 two-fold 误差消掉：
-/// 正确的 `fullScreenH - screenY - (winY - fullScreenH)`
-/// = `fullScreenH*2 - screenY - winY`。
-/// 多屏场景同样适用（无论在主屏/副屏，tao 的误差都 = 主屏 fullScreenH）。
-function screenToViewportCoords(
-  screenX: number,
-  screenY: number,
-  winX: number,
-  winY: number,
-): { x: number; y: number } {
-  const isMac = /mac/i.test(navigator.platform);
-  if (isMac) {
-    // screenH = 主屏 logical height（full screen，含 menu bar）。
-    // mouseLocation 是 main bottom-origin → `screenH - screenY` 翻到
-    // main top-origin → 再减 winY（已经是修过的 frame top Y in main top-origin
-    // logical）→ viewport-relative Y。
-    const fullScreenH = window.screen?.height ?? window.innerHeight;
-    // tao 0.35.3 `bottom_left_to_top_left` 用 `pixels_high()`（物理像素）
-    // 减 `origin.y + height`（logical points）→ mixed-unit → 对 Retina
-    // scale=2 多 fullScreenH。`cachedWinY` 比正确值多了 fullScreenH，
-    // 所以这里要补一个 fullScreenH：2*H - sy - cy。
-    return { x: screenX - winX, y: fullScreenH * 2 - screenY - winY };
-  }
-  return { x: screenX - winX, y: screenY - winY };
 }
 
 /// 内容指纹 —— 只看结构维度（todo 数 / 状态 / due），不看 title 文本。
@@ -496,13 +454,30 @@ function buildTodoRow(todo: Todo): HTMLElement {
     row.appendChild(due);
   }
 
+  const copyBtn = document.createElement("button");
+  copyBtn.className = "todo-copy";
+  copyBtn.innerHTML = COPY_ICON_SVG;
+  copyBtn.title = t("app.action.copy");
+  copyBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    void copyTodoText(todo);
+  });
+  row.appendChild(copyBtn);
+
   const del = document.createElement("button");
   del.className = "todo-delete";
   del.textContent = "×";
   del.title = t("app.action.delete");
   del.addEventListener("click", (e) => {
     e.stopPropagation();
-    deleteTodo(todo);
+    // 二次确认：第一次点击只进入确认态（按钮变红），3s 内第二次点击
+    // 才真正删除。超时 / hover 结束自动撤销确认态。
+    if (del.dataset.confirm === "1") {
+      resetDeleteConfirm(todo.id);
+      void deleteTodo(todo);
+    } else {
+      armDeleteConfirm(todo.id, del);
+    }
   });
   row.appendChild(del);
 
@@ -514,6 +489,8 @@ function buildTodoRow(todo: Todo): HTMLElement {
   });
   row.addEventListener("mouseleave", () => {
     scheduleHoverResize(row, false);
+    // hover 结束撤销删除确认态（理由见 unhoverCard 注释）
+    resetDeleteConfirm(todo.id);
   });
 
   return row;
@@ -564,6 +541,9 @@ function renderEmptyState() {
 /// autoResizeWindow 的 contentFingerprint 去重 —— 文本变化不该触发结构
 /// resize，但 hover 是用户主动意图，每次都要按需 fit）。
 const TITLE_EXPAND_CLASS = "title-expanded";
+/// 卡片级 hover 态 class：Rust hover-pos 路径（未聚焦窗口收不到 CSS :hover）
+/// 命中的卡片挂上它，CSS 据此显示卡内操作按钮（复制 / 删除）。
+const CARD_HOVER_CLASS = "card-hover";
 // delta < 4px 视为不变化，跳过 resize（避免 1px 抖动触发 IPC）
 const HOVER_RESIZE_DELTA_PX = 4;
 // rAF coalescing：同一帧内多次 mouseenter/mouseleave 只触发一次 resize
@@ -605,6 +585,22 @@ function scheduleHoverResize(card: HTMLElement, expanding: boolean) {
     if (Math.abs(delta) < HOVER_RESIZE_DELTA_PX) return;
     void resizeWindowToContent(appEl);
   });
+}
+
+/// Rust hover-pos 路径：把卡片切到 hover 态（操作按钮显隐 + 长文展开）。
+/// 聚焦窗口的 CSS :hover / mouseenter 路径不走这里。
+function hoverCard(card: HTMLElement) {
+  card.classList.add(CARD_HOVER_CLASS);
+  scheduleHoverResize(card, true);
+}
+
+/// hoverCard 的逆操作 —— 卡间切换 / 离开浮窗 / 坐标出界时调用。
+/// 顺手撤销删除按钮的二次确认态（hover 结束还留着 armed 态会让用户
+/// 在看不到按钮的情况下第二次点击直接删除）。
+function unhoverCard(card: HTMLElement) {
+  card.classList.remove(CARD_HOVER_CLASS);
+  if (card.dataset.todoId) resetDeleteConfirm(card.dataset.todoId);
+  scheduleHoverResize(card, false);
 }
 
 async function autoResizeWindow(snap: TodoSnapshot) {
@@ -698,6 +694,70 @@ async function toggleDone(todo: Todo) {
         console.error("[usticky] undo failed", e);
       }
     }
+  }
+}
+
+// ── 复制按钮 ──
+/// 复制图标（两个叠放的圆角矩形，feather "copy" 风格），currentColor
+/// 跟随按钮文字色，跟 .todo-delete 的 "×" 一样是 inline 图标。
+const COPY_ICON_SVG = `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.2" y="4.2" width="6.8" height="6.8" rx="1.4"/><path d="M7.8 4.2V2.6A1.6 1.6 0 0 0 6.2 1H2.6A1.6 1.6 0 0 0 1 2.6v3.6a1.6 1.6 0 0 0 1.6 1.6h1.6"/></svg>`;
+
+async function copyTodoText(todo: Todo) {
+  try {
+    await navigator.clipboard.writeText(todo.title);
+    showMiniFlash(t("app.copy.flash"));
+    return;
+  } catch (e) {
+    console.debug("[usticky] navigator.clipboard 失败，走 execCommand 兜底", e);
+  }
+  // 兜底：隐藏 textarea + execCommand（未聚焦 webview / clipboard 权限受限时）
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = todo.title;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    ta.style.pointerEvents = "none";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+    showMiniFlash(t("app.copy.flash"));
+  } catch (e2) {
+    console.error("[usticky] copy failed", e2);
+    showMiniFlash(t("app.error.copy_failed"));
+  }
+}
+
+// ── 删除二次确认 ──
+/// 第一次点击删除键后的确认态保持时长（ms）。超时自动撤销。
+const DELETE_CONFIRM_MS = 3000;
+/// todo.id → 确认态超时 timer。确认态本体在 DOM（.todo-delete[data-confirm]），
+/// timer 只负责到点撤销；卡片被 render 重建后 DOM 没了，reset 自然 no-op。
+const deleteConfirmTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function armDeleteConfirm(todoId: string, del: HTMLElement) {
+  del.dataset.confirm = "1";
+  del.title = t("app.action.confirm_delete");
+  const prev = deleteConfirmTimers.get(todoId);
+  if (prev) clearTimeout(prev);
+  deleteConfirmTimers.set(
+    todoId,
+    setTimeout(() => resetDeleteConfirm(todoId), DELETE_CONFIRM_MS),
+  );
+}
+
+function resetDeleteConfirm(todoId: string) {
+  const timer = deleteConfirmTimers.get(todoId);
+  if (timer) {
+    clearTimeout(timer);
+    deleteConfirmTimers.delete(todoId);
+  }
+  const del = app.querySelector<HTMLElement>(
+    `.todo-card[data-todo-id="${cssEscape(todoId)}"] .todo-delete`,
+  );
+  if (del) {
+    delete del.dataset.confirm;
+    del.title = t("app.action.delete");
   }
 }
 
@@ -1141,11 +1201,10 @@ async function init() {
   //     失焦时 `onFocusChanged` 主动 setHoverAttr(false) 已清状态；visibility
   //     hidden 时 pageVisible=false 守卫挡掉。focus check 已被证明是 bug。
 
-  // Rust 路径状态机：由 `usticky://floating-hover` 的 inside edge 驱动，
-  // **不**依赖 `windowFocused`（PinBottom 默认 mode 下 macOS 不派 focus
-  // change 事件，初值错了会让 Rust 路径永远短路）。
-  let rustPathActive = false;
-  // rustHoveredCardId 在文件顶部声明（render() 也要引用）
+  // rustHoveredCardId 在文件顶部声明（render() 也要引用）。
+  // hover-pos 事件只在 Rust 判定 inside=true 时发送，收到即代表 hover
+  // 激活（vite HMR 刷新后状态丢失时也能自愈），所以不再需要
+  // floating-hover 边沿事件维护激活开关。
   let unlistenHover: UnlistenFn | null = null;
   // **2026-07-03 fix（玻璃 2 秒后丢失问题）**：
   // 之前同值去重（`lastHoverPayload === e.payload`）是无时间窗口的永久短路 —— 如果
@@ -1180,80 +1239,47 @@ async function init() {
       hoverEnterTimer = null;
     }
     setHoverAttr(e.payload);
-    // Rust 路径激活 / 收尾
-    rustPathActive = e.payload;
+    // hover 收尾：收起 Rust 路径当前 hover 的卡（激活判定见 hover-pos 注释）
     if (!e.payload && rustHoveredCardId !== null) {
       const oldId = rustHoveredCardId;
       rustHoveredCardId = null;
       const old = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(oldId)}"]`);
-      if (old) scheduleHoverResize(old, false);
+      if (old) unhoverCard(old);
     }
   })
     .then((fn) => (unlistenHover = fn))
     .catch((e) => console.error("[usticky] listen floating-hover failed", e));
 
-  // ── 未聚焦时 per-card hover：Rust 50ms tick emit 鼠标屏幕坐标 ──
+  // ── 未聚焦时 per-card hover：Rust 50ms tick emit 视口相对鼠标坐标 ──
   //
-  // 聚焦时 WebView 自己派 mouseenter/leave，已经驱动 scheduleHoverResize。
-  // 未聚焦时 WKWebView 不派 mouseenter，必须靠这条路径：拿到屏幕 logical
-  // 坐标 → 转 viewport logical 坐标 → document.elementFromPoint → 命中
-  // 哪张 .todo-card → scheduleHoverResize(true)。
+  // 聚焦时 WebView 自己派 mouseenter/leave，已经驱动 scheduleHoverResize +
+  // CSS :hover（操作按钮显隐）。未聚焦时 WKWebView 不派 mouseenter 也不
+  // 激活 :hover，必须靠这条路径：Rust 发视口相对坐标（macOS/Windows 端
+  // 各自在同坐标系下相减完成换算，见 platform/*/HoverPos 注释）→
+  // document.elementFromPoint → 命中哪张 .todo-card → 挂 .card-hover
+  // （按钮显隐）+ scheduleHoverResize(true)（长文展开）。
   //
   // 跟 body[data-hover] 玻璃色的关系：
   //   - body[data-hover] 用 usticky://floating-hover（edge-trigger，每 tick 不发）
-  //   - per-card title-expand 用 usticky://floating-hover-pos（inside=true 每 tick 发）
-  //   两条独立 —— 玻璃色只看 in/out boundary，title-expand 要跟踪卡间切换。
+  //   - per-card hover 用 usticky://floating-hover-pos（inside=true 每 tick 发）
+  //   两条独立 —— 玻璃色只看 in/out boundary，per-card 要跟踪卡间切换。
   //
   // 频率 50ms × ~20Hz，每 tick 调一次 elementFromPoint。开销 ~微秒，
   // 不会触发任何 layout（elementFromPoint 走 hit test 不强制 reflow）。
   //
-  // **激活判定**：由 `usticky://floating-hover` 的 inside edge 控制
-  // `rustPathActive`（声明在前面的 listener 块），**不再依赖 `windowFocused`**
-  // —— PinBottom 默认 mode 下浮窗被其他 app 盖住时 macOS 不派 focus change
-  // 事件，初值 `true` 会让 Rust 路径永远短路。Rust emitter 50ms tick 自己
-  // 判 topmost 是更准的"鼠标是否在浮窗未被遮挡区域"信号。
+  // **激活判定**：hover-pos 只在 Rust 判定 inside=true 时才发送，收到即
+  // 代表 hover 路径激活 —— 不需要 floating-hover 边沿事件先维护开关
+  // （vite HMR 刷新后即便状态丢失，靠这里也能自愈，不用等鼠标重新进出）。
   let unlistenHoverPos: UnlistenFn | null = null;
-  // 缓存浮窗位置 + scale。50ms × 20Hz 持续 hover-pos 时反复
-  // `await innerPosition()` 是浪费 IPC，只在 onMoved 时刷新。
-  let cachedWinX = 0;
-  let cachedWinY = 0;
-  let unlistenMoved: UnlistenFn | null = null;
-  (async () => {
-    try {
-      const [pos, scale] = await Promise.all([
-        wForFocus.innerPosition(),
-        wForFocus.scaleFactor(),
-      ]);
-      cachedWinX = pos.x / scale;
-      cachedWinY = pos.y / scale;
-    } catch {
-      /* fallback to 0/0 */
-    }
-  })();
-  wForFocus
-    .onMoved(() => {
-      Promise.all([wForFocus.innerPosition(), wForFocus.scaleFactor()])
-        .then(([pos, scale]) => {
-          cachedWinX = pos.x / scale;
-          cachedWinY = pos.y / scale;
-        })
-        .catch(() => {});
-    })
-    .then((fn) => (unlistenMoved = fn))
-    .catch(() => {});
 
   listen<{ x: number; y: number }>("usticky://floating-hover-pos", (e) => {
-    if (!rustPathActive) return;
     if (!pageVisible) return;
     const appEl = document.getElementById("app");
     if (!appEl) return;
 
-    const { x: relX, y: relY } = screenToViewportCoords(
-      e.payload.x,
-      e.payload.y,
-      cachedWinX,
-      cachedWinY,
-    );
+    // payload 已是视口相对坐标（Rust 端换算），直接喂 elementFromPoint
+    const relX = e.payload.x;
+    const relY = e.payload.y;
     if (relX < 0 || relY < 0) {
       // Rust 报 inside=true 但坐标落在浮窗外（极少见，理论上 windowNumberAtPoint
       // 命中浮窗就一定在 frame 内），保守视为"没命中卡"。
@@ -1263,7 +1289,7 @@ async function init() {
         const old = appEl.querySelector<HTMLElement>(
           `.todo-card[data-todo-id="${cssEscape(oldId)}"]`,
         );
-        if (old) scheduleHoverResize(old, false);
+        if (old) unhoverCard(old);
       }
       return;
     }
@@ -1280,10 +1306,10 @@ async function init() {
       const old = appEl.querySelector<HTMLElement>(
         `.todo-card[data-todo-id="${cssEscape(oldId)}"]`,
       );
-      if (old) scheduleHoverResize(old, false);
+      if (old) unhoverCard(old);
     }
     rustHoveredCardId = newId;
-    if (card && newId) scheduleHoverResize(card, true);
+    if (card && newId) hoverCard(card);
   })
     .then((fn) => (unlistenHoverPos = fn))
     .catch((e) => console.error("[usticky] listen floating-hover-pos failed", e));
@@ -1561,7 +1587,6 @@ async function init() {
     unlistenLocale?.();
     unlistenHover?.();
     unlistenHoverPos?.();
-    unlistenMoved?.();
     unlistenShortcut?.();
     unlistenBackdropRefresh?.();
     unlistenBottomed?.();
