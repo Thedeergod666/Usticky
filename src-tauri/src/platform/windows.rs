@@ -69,7 +69,7 @@ use windows_sys::Win32::Foundation::{HWND as WIN_HWND, POINT, RECT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WindowFromPoint,
-    ASFW_ANY, GA_ROOT, GWLP_EXSTYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
+    ASFW_ANY, GA_ROOT, GWL_EXSTYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
 };
 
@@ -117,17 +117,17 @@ unsafe fn apply_z_order(hwnd: *mut core::ffi::c_void, z: ZOrder) {
     // 避免 LONG (i32) 截断。windows-sys 0.59 把两者放在同一 feature gate。
     match z {
         ZOrder::TopMost => {
-            let ex_style = GetWindowLongPtrW(hwnd, GWLP_EXSTYLE);
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             let new_style: isize = ex_style | (WS_EX_TOPMOST as isize);
-            SetWindowLongPtrW(hwnd, GWLP_EXSTYLE, new_style);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
         }
         ZOrder::Bottom | ZOrder::NotTopMost => {
             // Bottom + NotTopMost 都显式 AND-out WS_EX_TOPMOST。
             // WebView2 会在自己的 message handler 里 re-assert WS_EX_TOPMOST，
             // 不显式清的话 Normal 模式在 Win10/11 上不可靠。
-            let ex_style = GetWindowLongPtrW(hwnd, GWLP_EXSTYLE);
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             let new_style: isize = ex_style & !((WS_EX_TOPMOST as isize));
-            SetWindowLongPtrW(hwnd, GWLP_EXSTYLE, new_style);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
         }
     }
 
@@ -207,8 +207,9 @@ pub fn set_cursor_pointer_shape<R: Runtime>(_app: &AppHandle<R>, _pointer: bool)
 //   - Win32 SetForegroundWindow 有权限限制（调用方必须是当前前台进程等），
 //     调用前先 AllowSetForegroundWindow(ASFW_ANY) 放权
 
-/// 保存的"原前台 HWND"。None = 没保存过（dismiss 时不切回，让 OS 自然降级）。
-static SAVED_PREV_HWND: OnceLock<std::sync::Mutex<Option<WIN_HWND>>> = OnceLock::new();
+/// 保存的"原前台 HWND"（存 usize —— `*mut c_void` 不实现 Send，不能进 static；
+/// HWND 本质是句柄值，usize 双向 cast 无损）。None = 没保存过。
+static SAVED_PREV_HWND: OnceLock<std::sync::Mutex<Option<usize>>> = OnceLock::new();
 
 pub fn save_previous_app_for_quick_add() {
     // SAFETY: GetForegroundWindow 是 thread-safe Win32 API
@@ -220,14 +221,14 @@ pub fn save_previous_app_for_quick_add() {
     // 这里拿不到 app handle（这个函数没有 app 参数），简单跳过自检：
     // 实际场景下 quick-add 是全局快捷键，触发时前台几乎不可能是 Usticky 自己
     let lock = SAVED_PREV_HWND.get_or_init(|| std::sync::Mutex::new(None));
-    *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(foreground);
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(foreground as usize);
 }
 
 pub fn activate_previous_app_after_quick_add() {
     let lock = SAVED_PREV_HWND.get_or_init(|| std::sync::Mutex::new(None));
     let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let Some(hwnd) = *guard else { return };
-    if hwnd.is_null() {
+    if hwnd == 0 {
         return;
     }
     // SAFETY: AllowSetForegroundWindow + SetForegroundWindow 都是 thread-safe
@@ -236,7 +237,7 @@ pub fn activate_previous_app_after_quick_add() {
         // 大概率被 OS 拒绝（除非 Usticky 此刻刚好是前台进程，那 dismiss 路径
         // 上调用方就是前台，可以直接调；保守起见还是放权）
         AllowSetForegroundWindow(ASFW_ANY);
-        let _ = SetForegroundWindow(hwnd);
+        let _ = SetForegroundWindow(hwnd as WIN_HWND);
     }
 }
 
