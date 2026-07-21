@@ -261,6 +261,14 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ✅ 删除二次确认：第一次点击进入确认态（实红 + `data-confirm="1"`），3s 内第二次点击才真删；超时 / hover 结束（`unhoverCard` / `mouseleave`）自动撤销 —— 防"按钮已隐藏但确认态还在"的误删
 ✅ 新增 i18n key：`app.action.copy` / `app.action.confirm_delete` / `app.copy.flash` / `app.error.copy_failed`
 
+### v0.1.4（2026-07-21，未聚焦按钮交互 + 单击直达 + × 残留修复）
+
+✅ **按钮显隐/反馈彻底弃用 CSS `:hover`**：非 key window 的 WKWebView `:hover` 既不激活、又会在聚焦/失焦边界 **stuck 残留**（× 残留在多张卡上的根因）。改为单一状态机：`.card-hover` / `.btn-hover` class，由 JS `mouseenter/leave`（聚焦）+ Rust hover-pos `elementFromPoint` 命中（未聚焦）双路径驱动同一对 `hoverCard`/`unhoverCard`/`setBtnHover`。规则：**浮窗内一切 hover 驱动的样式，都不许用 `:hover`，走 class**
+✅ 按钮 hover 反馈（背景变色）走 `.btn-hover`；手型光标走 `set_cursor_pointer` 命令 → macOS `NSCursor.pointingHandCursor().set()`（非 key window WKWebView 不更新光标；Win 上悬停窗口自收 `WM_SETCURSOR`，no-op）
+✅ **`acceptFirstMouse: true`（tauri.conf.json）**：未聚焦时点一次复制键即触发（旧行为第一击被 click-to-focus 吞掉，要点两次）
+✅ 按钮压缩 + 不占位：`.todo-actions` 容器（gap 2px，按钮 22→18px），**默认 `display:none`**，`.card-hover` 才 `display:flex` —— 未 hover 时 title 不再被白挤 ~46px
+✅ 实测（CGEvent warp + CGWindowList + 临时 IPC 信标）：穿梭 9 卡 × 3 往返 `.card-hover` 计数恒 ≤1，单击复制落剪贴板成功（`hasFocus:true` 说明 acceptFirstMouse 生效）
+
 ### 仍未做
 
 ⏳ **Cmd+Z 撤销栈**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 已占位 keydown listener，TODO 未实现，v0.2 候选）

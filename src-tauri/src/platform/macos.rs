@@ -127,6 +127,25 @@ pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) 
     // no-op —— tracker 自己处理 level 切换
 }
 
+/// 未聚焦浮窗的光标反馈：hover 命中操作按钮时前端调 `set_cursor_pointer`
+/// 命令切手型，离开切回箭头。
+///
+/// 为什么需要：非 key window 的 WKWebView 不按 hit-test 元素更新光标
+/// （cursor 更新走 mouseMoved 事件流，非 key window 不分发），用户在
+/// 未聚焦浮窗上看不到"这个按钮可点"的反馈。`NSCursor.set()` 是进程级
+/// 全局设置，非激活 app 调用也立即生效；鼠标离开浮窗后前端在
+/// floating-hover(false) 时切回箭头，其他 app 区域的光标由各 app 的
+/// mouseMoved 自行管理，互不影响。
+pub fn set_cursor_pointer_shape<R: Runtime>(app: &AppHandle<R>, pointer: bool) {
+    let _ = app.run_on_main_thread(move || {
+        if pointer {
+            objc2_app_kit::NSCursor::pointingHandCursor().set();
+        } else {
+            objc2_app_kit::NSCursor::arrowCursor().set();
+        }
+    });
+}
+
 // ── Quick-add 临时置顶 + 切回原应用 ──
 //
 // 用户场景：Cmd+Shift+Space 唤出浮窗 → 自动置顶（即便 PinBottom 模式）→

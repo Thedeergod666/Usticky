@@ -319,11 +319,9 @@ body[data-active] #app {
   font-size: 13px;
   line-height: 1;
 }
-.todo-card.dragging .todo-delete,
-.todo-card.dragging .todo-copy,
+.todo-card.dragging .todo-actions,
 .todo-card.dragging .todo-due,
-.todo-card.sortable-chosen .todo-delete,
-.todo-card.sortable-chosen .todo-copy,
+.todo-card.sortable-chosen .todo-actions,
 .todo-card.sortable-chosen .todo-due {
   display: none;
 }
@@ -597,49 +595,56 @@ body[data-active] #app .todo-due.overdue  { color: var(--c-data-alert); backgrou
 body[data-hover] #app .todo-due.days,
 body[data-active] #app .todo-due.days     { color: var(--c-data-cyan);  background: rgba(90, 200, 250, 0.18); }
 
-/* 卡内操作按钮：复制（左）+ 删除（右），hover / .card-hover 才显示
+/* 卡内操作按钮：复制（左）+ 删除（右），只在 hover 卡片时显示
  *
- * .card-hover 是 Rust hover-pos 路径挂的 class（main.ts hoverCard）——
- * 未聚焦窗口 WKWebView 不激活 CSS :hover，删除按钮/复制按钮在 PinBottom
- * 未聚焦 hover 时也要能显示，所以显隐条件是 :hover **或** .card-hover。 */
+ * **显隐只走 .card-hover，不走 CSS :hover**（2026-07-21 fix）：
+ * 非 key window 的 WKWebView 不派发/不可靠更新 :hover —— 修复前用户实测
+ * "删除按钮不出现"，且 :hover 一旦在失焦/聚焦边界卡住会**残留**在多张卡上。
+ * .card-hover 由 JS mouseenter（聚焦）+ Rust hover-pos（未聚焦）双路径驱动
+ * 同一状态机（main.ts hoverCard/unhoverCard），单一来源，不会 stuck。
+ *
+ * **display:none 默认不占横向空间** —— 旧实现 opacity:0 占位，240px 窄窗
+ * 下 title 被白挤 ~46px。hover 时才 flex 出现。
+ *
+ * .todo-actions 容器：卡片 gap 10px 是 checkbox/title 共享的，按钮组内部
+ * 用 2px 紧凑 gap，横向占用从 ~64px 压到 ~46px。 */
+.todo-actions {
+  display: none;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+}
+.todo-card.card-hover .todo-actions { display: flex; }
 .todo-delete,
 .todo-copy {
-  flex: 0 0 auto;
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   border: none;
   background: transparent;
   color: var(--text-faint);
-  font-size: 14px;
+  font-size: 12px;
   line-height: 1;
-  border-radius: 6px;
+  border-radius: 5px;
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.18s, background-color 0.18s, color 0.18s;
-}
-.todo-copy {
-  /* SVG 图标居中（按钮本身是 22px 方块，图标 12px） */
+  padding: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 0;
+  transition: background-color 0.18s, color 0.18s;
 }
-.todo-card:hover .todo-delete,
-.todo-card:hover .todo-copy,
-.todo-card.card-hover .todo-delete,
-.todo-card.card-hover .todo-copy { opacity: 1; }
-.todo-delete:hover {
+/* 按钮 hover 反馈同样不走 :hover —— .btn-hover 由 JS mouseenter（聚焦）+
+ * Rust hover-pos 命中按钮（未聚焦）双路径驱动（main.ts setBtnHover）。 */
+.todo-delete.btn-hover {
   color: var(--c-data-alert);
   background: rgba(255, 69, 58, 0.16);
 }
-.todo-copy:hover {
+.todo-copy.btn-hover {
   color: var(--c-data-info);
   background: rgba(10, 132, 255, 0.16);
 }
 /* 删除二次确认态：第一次点击后按钮变实红，3s 内第二次点击才真删
- * （main.ts armDeleteConfirm）。实色 + 常显，让用户一眼看出"再点一下就删"。 */
+ * （main.ts armDeleteConfirm）。实色，让用户一眼看出"再点一下就删"。 */
 .todo-delete[data-confirm="1"] {
-  opacity: 1;
   color: #fff;
   background: var(--c-data-alert);
 }

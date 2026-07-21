@@ -398,6 +398,14 @@ pub async fn set_floating_hover_raise(
     Ok(())
 }
 
+/// 切手型/箭头光标（前端 hover 命中操作按钮时调用）。
+/// macOS 未聚焦窗口 WKWebView 不更新光标，靠 NSCursor 手动兜底；
+/// Win/Linux 由平台层 no-op（详见 platform::set_cursor_pointer_shape）。
+#[tauri::command]
+pub fn set_cursor_pointer(app: AppHandle, pointer: bool) {
+    crate::platform::set_cursor_pointer_shape(&app, pointer);
+}
+
 // ── Quick-add 快捷键 ──
 
 /// 返回当前持久化的 quick-add 快捷键（accelerator 字符串，如 `"Cmd+Shift+Space"`）。

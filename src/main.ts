@@ -454,6 +454,9 @@ function buildTodoRow(todo: Todo): HTMLElement {
     row.appendChild(due);
   }
 
+  const actions = document.createElement("div");
+  actions.className = "todo-actions";
+
   const copyBtn = document.createElement("button");
   copyBtn.className = "todo-copy";
   copyBtn.innerHTML = COPY_ICON_SVG;
@@ -462,7 +465,7 @@ function buildTodoRow(todo: Todo): HTMLElement {
     e.stopPropagation();
     void copyTodoText(todo);
   });
-  row.appendChild(copyBtn);
+  actions.appendChild(copyBtn);
 
   const del = document.createElement("button");
   del.className = "todo-delete";
@@ -479,18 +482,26 @@ function buildTodoRow(todo: Todo): HTMLElement {
       armDeleteConfirm(todo.id, del);
     }
   });
-  row.appendChild(del);
+  actions.appendChild(del);
+  row.appendChild(actions);
 
-  // hover-expand：卡片 hover 时展开截断的 title，离开时收回。
-  // 复用 scheduleHoverResize 的 rAF coalescing + delta 检测，
-  // 同帧跨卡切换只触发一次 resize IPC，视觉无抖动。
+  // 聚焦路径的按钮 hover 反馈（未聚焦路径由 hover-pos 驱动，见 setBtnHover）
+  for (const btn of [copyBtn, del]) {
+    btn.addEventListener("mouseenter", () => setBtnHover(btn));
+    btn.addEventListener("mouseleave", () => setBtnHover(null));
+  }
+
+  // 卡片 hover：挂 .card-hover（操作按钮显隐）+ 展开截断的 title，
+  // 离开时收回。聚焦走这里的 mouseenter/leave，未聚焦走 Rust hover-pos
+  // （同一对 hoverCard/unhoverCard，单一状态机，不依赖 CSS :hover ——
+  // 非 key window 的 WKWebView :hover 不可靠且会 stuck 残留）。
+  // scheduleHoverResize 复用 rAF coalescing + delta 检测，同帧跨卡切换
+  // 只触发一次 resize IPC，视觉无抖动。
   row.addEventListener("mouseenter", () => {
-    scheduleHoverResize(row, true);
+    hoverCard(row);
   });
   row.addEventListener("mouseleave", () => {
-    scheduleHoverResize(row, false);
-    // hover 结束撤销删除确认态（理由见 unhoverCard 注释）
-    resetDeleteConfirm(todo.id);
+    unhoverCard(row);
   });
 
   return row;
@@ -601,6 +612,26 @@ function unhoverCard(card: HTMLElement) {
   card.classList.remove(CARD_HOVER_CLASS);
   if (card.dataset.todoId) resetDeleteConfirm(card.dataset.todoId);
   scheduleHoverResize(card, false);
+}
+
+// ── 按钮 hover 反馈（.btn-hover + 手型光标） ──
+//
+// 非 key window 的 WKWebView 既不激活 CSS :hover，也不按 hit-test 元素
+// 更新鼠标光标 —— 未聚焦时 hover 到复制/删除键上没有任何"可点"反馈。
+// 统一由本函数驱动（聚焦走按钮 mouseenter/leave，未聚焦走 hover-pos
+// 命中检测，同值短路幂等）：
+//   1. 挂/摘 .btn-hover class → CSS 背景变色（替代 :hover 样式）
+//   2. invoke set_cursor_pointer → macOS 端 NSCursor 切手型/箭头
+//      （Win 上悬停窗口自收 WM_SETCURSOR，CSS cursor 本就生效，no-op）
+let btnHoveredEl: HTMLElement | null = null;
+function setBtnHover(el: HTMLElement | null) {
+  if (btnHoveredEl === el) return;
+  btnHoveredEl?.classList.remove("btn-hover");
+  btnHoveredEl = el;
+  el?.classList.add("btn-hover");
+  invoke("set_cursor_pointer", { pointer: !!el }).catch((e) =>
+    console.debug("[usticky] set_cursor_pointer failed", e),
+  );
 }
 
 async function autoResizeWindow(snap: TodoSnapshot) {
@@ -1240,11 +1271,14 @@ async function init() {
     }
     setHoverAttr(e.payload);
     // hover 收尾：收起 Rust 路径当前 hover 的卡（激活判定见 hover-pos 注释）
-    if (!e.payload && rustHoveredCardId !== null) {
-      const oldId = rustHoveredCardId;
-      rustHoveredCardId = null;
-      const old = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(oldId)}"]`);
-      if (old) unhoverCard(old);
+    if (!e.payload) {
+      setBtnHover(null);
+      if (rustHoveredCardId !== null) {
+        const oldId = rustHoveredCardId;
+        rustHoveredCardId = null;
+        const old = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(oldId)}"]`);
+        if (old) unhoverCard(old);
+      }
     }
   })
     .then((fn) => (unlistenHover = fn))
@@ -1296,6 +1330,10 @@ async function init() {
 
     // elementFromPoint 走 hit-test 不强制 layout；viewport 坐标 = viewport-relative。
     const el = document.elementFromPoint(relX, relY);
+    // 命中操作按钮 → 挂 .btn-hover + 切手型光标（未聚焦时 WKWebView 不
+    // 更新 :hover / cursor，这条路径是唯一的 hover 反馈来源）
+    const btnHit = el?.closest<HTMLElement>(".todo-copy, .todo-delete") ?? null;
+    setBtnHover(btnHit);
     const card = el?.closest<HTMLElement>(".todo-card") ?? null;
     const newId = card?.dataset.todoId ?? null;
     if (newId === rustHoveredCardId) return; // 还在同一张卡上

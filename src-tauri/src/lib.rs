@@ -402,6 +402,7 @@ pub fn run() {
             commands::get_pin_mode,
             commands::set_pin_mode,
             commands::set_floating_hover_raise,
+            commands::set_cursor_pointer,
             commands::open_settings_window,
             commands::get_quick_add_shortcut,
             commands::set_quick_add_shortcut,

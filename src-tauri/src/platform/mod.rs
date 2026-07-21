@@ -42,6 +42,7 @@ mod plat {
     pub fn set_window_pin_bottom<R: Runtime>(_app: &AppHandle<R>) {}
     pub fn set_window_normal<R: Runtime>(_app: &AppHandle<R>) {}
     pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) {}
+    pub fn set_cursor_pointer_shape<R: Runtime>(_app: &AppHandle<R>, _pointer: bool) {}
     pub fn start_hover_emitter<R: Runtime>(_app: AppHandle<R>) {}
     // Quick-add 临时置顶 + 切回原应用：Linux no-op（无稳定切回原 app 路径）
     pub fn save_previous_app_for_quick_add() {}

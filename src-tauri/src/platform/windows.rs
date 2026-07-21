@@ -195,6 +195,11 @@ pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) 
     // no-op —— tracker 自己处理
 }
 
+/// 光标反馈：Win 上 no-op。Windows 会给鼠标悬停的窗口发 WM_SETCURSOR
+/// （与是否聚焦无关），WKWebView 自己按 hit-test 元素切 CSS cursor，
+/// 不需要 macOS 那样的 NSCursor 手动兜底。
+pub fn set_cursor_pointer_shape<R: Runtime>(_app: &AppHandle<R>, _pointer: bool) {}
+
 // ── Quick-add 临时置顶 + 切回原应用 ──
 //
 // 跟 macOS 同套接口（详见 platform/macos.rs 顶部 doc）。Win 实现要点：
