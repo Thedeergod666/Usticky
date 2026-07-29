@@ -11,7 +11,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ use tauri::Manager;
 
 // rust_i18n::i18n!("locales") 在 lib.rs 顶部 crate 级初始化，此处不需要再调。
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum TodoStatus {
     Pending,
@@ -42,7 +42,7 @@ pub enum PinMode {
 
 impl Default for PinMode {
     fn default() -> Self {
-        Self::PinBottom  // v0.1.2 默认置底（hover 时临时置顶，不挡其他 app）
+        Self::PinBottom // v0.1.2 默认置底（hover 时临时置顶，不挡其他 app）
     }
 }
 
@@ -68,7 +68,7 @@ pub enum TodoPriority {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Todo {
-    pub id: String,                  // UUID v4
+    pub id: String, // UUID v4
     pub title: String,
     pub status: TodoStatus,
     pub priority: TodoPriority,
@@ -138,7 +138,6 @@ impl Default for StoreData {
 pub struct Store {
     data: StoreData,
     data_path: Mutex<Option<PathBuf>>,
-    persist_lock: Mutex<()>,
 }
 
 impl Store {
@@ -171,7 +170,6 @@ impl Store {
         Ok(Self {
             data,
             data_path: Mutex::new(Some(data_path)),
-            persist_lock: Mutex::new(()),
         })
     }
 
@@ -180,7 +178,10 @@ impl Store {
     }
 
     pub fn todos_sorted(&self, status: TodoStatus) -> Vec<Todo> {
-        let mut v: Vec<Todo> = self.data.todos.iter()
+        let mut v: Vec<Todo> = self
+            .data
+            .todos
+            .iter()
             .filter(|t| t.status == status)
             .cloned()
             .collect();
@@ -190,7 +191,10 @@ impl Store {
 
     pub fn add(&mut self, title: String) -> Todo {
         let now = chrono::Utc::now().timestamp_millis();
-        let max_order = self.data.todos.iter()
+        let max_order = self
+            .data
+            .todos
+            .iter()
             .filter(|t| t.status == TodoStatus::Pending)
             .map(|t| t.order)
             .max()
@@ -224,16 +228,47 @@ impl Store {
     ///   - 仅 title 改（status=None）：不动 Vec（编辑 title 不影响位置）
     ///   - status 与旧值相同（toggle 取消）：当 no-op，不动 Vec
     ///   - status 改变：摘出 + push 到目标 section 末尾 + 重置 order
-    pub fn update(&mut self, id: &str, title: Option<String>, status: Option<TodoStatus>) -> Option<Todo> {
+    /// 修改 todo 字段。
+    ///
+    /// 返回 `Ok(Some(todo))` 表示实际改了什么；`Ok(None)` 表示 **no-op**
+    /// （title 和 status 都是 None）—— 调用方应该跳过 persist + emit。
+    /// `Err(_)` 表示 id 找不到（i18n key `commands.error.not_found`）。
+    ///
+    /// **P2-4 fix**：no-op 早返。旧实现对 "title=None, status=None" 这种
+    /// 调用（前端误传 / 误用 / toggle 取消）也会走一遍 mutate Vec + 刷
+    /// updated_at 路径，纯浪费 CPU + 触发 todos-changed emit。
+    pub fn update(
+        &mut self,
+        id: &str,
+        title: Option<String>,
+        status: Option<TodoStatus>,
+    ) -> Result<Option<Todo>> {
+        let idx = self
+            .data
+            .todos
+            .iter()
+            .position(|t| t.id == id)
+            .ok_or_else(
+                || anyhow::anyhow!(rust_i18n::t!("commands.error.not_found").to_string()),
+            )?;
+
+        // **P2-4 fix**：no-op detection。两侧都 None → 调用方大概率误用，
+        // 不动 Vec / 不刷 updated_at / 返回 None 让 command 跳过 persist+emit。
+        if title.is_none() && status.is_none() {
+            return Ok(None);
+        }
+
         let now = chrono::Utc::now().timestamp_millis();
-        let idx = self.data.todos.iter().position(|t| t.id == id)?;
         let current_status = self.data.todos[idx].status.clone();
 
         // status 改变 → 摘出 + push 到目标 section 末尾 + 重置 order
         if let Some(new_status) = status.as_ref() {
             if *new_status != current_status {
                 // 目标 section 的 max_order（排除被摘出的 todo 自己）
-                let max_order = self.data.todos.iter()
+                let max_order = self
+                    .data
+                    .todos
+                    .iter()
                     .enumerate()
                     .filter(|(i, t)| *i != idx && t.status == *new_status)
                     .map(|(_, t)| t.order)
@@ -247,7 +282,7 @@ impl Store {
                     todo.title = title;
                 }
                 self.data.todos.push(todo.clone());
-                return Some(todo);
+                return Ok(Some(todo));
             }
         }
 
@@ -257,7 +292,7 @@ impl Store {
             todo.title = title;
         }
         todo.updated_at = now;
-        Some(todo.clone())
+        Ok(Some(todo.clone()))
     }
 
     pub fn delete(&mut self, id: &str) -> Option<Todo> {
@@ -280,9 +315,9 @@ impl Store {
     ///      改动的 todo `order` 保持原值，跨重启仍能正确还原。
     ///   3. 只在 `t.order` 变化时刷新 updated_at —— 拖了但 ids 顺序没变
     ///      时不应产生"更新时间"噪声（前版注释意图）。
-    pub fn reorder(&mut self, ids: &[String]) {
+    pub fn reorder(&mut self, ids: &[String]) -> Result<()> {
         if ids.is_empty() {
-            return;
+            return Ok(());
         }
 
         // **P2-3 fix**：拒绝重复 id。
@@ -298,7 +333,7 @@ impl Store {
         // 都可能触发。把防御放在 store 入口是最便宜的早返。
         if ids.len() != ids.iter().collect::<std::collections::HashSet<_>>().len() {
             tracing::warn!("reorder 拒绝：ids 含重复");
-            return;
+            return Ok(());
         }
 
         // 1. 找被拖 section 在 Vec 里的最早位置 —— 作为新顺序的锚点。
@@ -306,10 +341,65 @@ impl Store {
         //    pending/done 在数组里穿插（虽然 add() 总 append，但 v0.2
         //    之后可能改）。
         let id_set: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
-        let base_idx = match self.data.todos.iter().position(|t| id_set.contains(t.id.as_str())) {
+        let base_idx = match self
+            .data
+            .todos
+            .iter()
+            .position(|t| id_set.contains(t.id.as_str()))
+        {
             Some(i) => i,
-            None => return,  // ids 全部找不到 —— 防御，不动 store
+            None => return Ok(()), // ids 全部找不到 —— 防御，不动 store
         };
+
+        // **P1-1 fix**：reorder ids 必须是"单一 status section 的完整排列"。
+        // 不允许传混合 status 或部分子集。前端 SortableJS onEnd 传 section
+        // 内 DOM 顺序，正常路径下总是完整 section —— 但并发 toggleDone /
+        // 中间人篡改 IPC 可能传一个部分子集（例如 pending 段 [a,b,c,d]
+        // 拖完只传 [c,b]），或混 status（pending + done 一起）。
+        //
+        // 防御：
+        //   1. ids 必须全部是同一个 status（in_ids.len() == 1）
+        //   2. 该 status 在 self.data.todos 里的总数 == id_set 长度
+        // 任何一条不满足整批拒绝，避免 base_idx 锚错 + order 重复。
+        {
+            use std::collections::HashMap;
+            let mut in_ids: HashMap<&TodoStatus, usize> = HashMap::new();
+            for t in self
+                .data
+                .todos
+                .iter()
+                .filter(|t| id_set.contains(t.id.as_str()))
+            {
+                *in_ids.entry(&t.status).or_insert(0) += 1;
+            }
+            if in_ids.len() != 1 {
+                tracing::warn!(
+                    "reorder 拒绝：ids 混 status（len={}, expected 1）",
+                    in_ids.len()
+                );
+                return Err(anyhow::anyhow!(
+                    "reorder ids must be a permutation of a single section"
+                ));
+            }
+            let (status, cnt) = in_ids.iter().next().unwrap();
+            let store_cnt = self
+                .data
+                .todos
+                .iter()
+                .filter(|t| t.status == **status)
+                .count();
+            if *cnt != store_cnt {
+                tracing::warn!(
+                    "reorder 拒绝：ids 不是 section 的完整排列（status {:?} ids={} store={}）",
+                    status,
+                    cnt,
+                    store_cnt
+                );
+                return Err(anyhow::anyhow!(
+                    "reorder ids must be a permutation of a single section"
+                ));
+            }
+        }
 
         // 2. 把"被拖集合"按 ids 新顺序抽出来。若某 id 在 ids 里但
         //    self.data.todos 找不到（防御），整批跳过 —— 不让 store
@@ -318,7 +408,7 @@ impl Store {
         for id in ids {
             match self.data.todos.iter().find(|t| &t.id == id) {
                 Some(t) => moved.push(t.clone()),
-                None => return,
+                None => return Ok(()),
             }
         }
 
@@ -361,6 +451,7 @@ impl Store {
         }
 
         self.data.todos = new_todos;
+        Ok(())
     }
 
     pub fn last_window_geom(&self) -> &WindowGeom {
@@ -368,13 +459,21 @@ impl Store {
     }
 
     pub fn update_window_pos(&mut self, x: Option<i32>, y: Option<i32>) {
-        if let Some(x) = x { self.data.window_geom.x = Some(x); }
-        if let Some(y) = y { self.data.window_geom.y = Some(y); }
+        if let Some(x) = x {
+            self.data.window_geom.x = Some(x);
+        }
+        if let Some(y) = y {
+            self.data.window_geom.y = Some(y);
+        }
     }
 
     pub fn update_window_size(&mut self, w: Option<u32>, h: Option<u32>) {
-        if let Some(w) = w { self.data.window_geom.width = Some(w); }
-        if let Some(h) = h { self.data.window_geom.height = Some(h); }
+        if let Some(w) = w {
+            self.data.window_geom.width = Some(w);
+        }
+        if let Some(h) = h {
+            self.data.window_geom.height = Some(h);
+        }
     }
 
     pub fn pin_mode(&self) -> PinMode {
@@ -388,7 +487,9 @@ impl Store {
     /// 当前快速唤出快捷键（accelerator 字符串，如 `"Cmd+Shift+Space"`）。
     /// 没存过就用平台默认（macOS = Cmd，其他 = Ctrl）。
     pub fn quick_add_shortcut(&self) -> String {
-        self.data.quick_add_shortcut.clone()
+        self.data
+            .quick_add_shortcut
+            .clone()
             .unwrap_or_else(default_quick_add_shortcut)
     }
 
@@ -410,9 +511,13 @@ impl Store {
 /// 写的 `CmdOrCtrl+Shift+Space` 语义一致。
 pub fn default_quick_add_shortcut() -> String {
     #[cfg(target_os = "macos")]
-    { "Cmd+Shift+Space".to_string() }
+    {
+        "Cmd+Shift+Space".to_string()
+    }
     #[cfg(not(target_os = "macos"))]
-    { "Ctrl+Shift+Space".to_string() }
+    {
+        "Ctrl+Shift+Space".to_string()
+    }
 }
 
 /// AppConfig —— 已废弃。locale 字段在 v0.1.2 已并入 [`StoreData::locale`]，
@@ -438,45 +543,44 @@ impl Store {
         }
     }
 
-    /// 持久化 + emit。
+    /// 拿 data_path clone —— 给调用方在 drop RwLock guard 后自己调 [`persist_to_disk`]。
     ///
-    /// 拿 `persist_lock` 串行化磁盘 I/O：拖窗时 Moved/Resized 事件 ~60Hz
-    /// 派发，每个事件 spawn 出的 task 都进这里 —— 没锁就并发打开 tmp 文件，
-    /// chmod 和 rename 互相覆盖，触发 "atomic rename failed" 噪声日志。
-    ///
-    /// poison 恢复（`unwrap_or_else(|e| e.into_inner())`）跟其他 Mutex 同款：
-    /// 一旦 task panic 不让后续 persist 全部卡死。
-    pub fn persist(&self, _app: &AppHandle) -> Result<()> {
-        self.persist_to_path(&self.data_path()?)
-    }
-
-    /// 拿 data_path clone —— 给调用方在 drop RwLock guard 后自己调 persist_to_path。
-    /// 跟 `persist()` 的区别：persist_to_path 是 **裸函数**，不需要 &self，
-    /// 调用方可以彻底不持任何锁地完成 I/O。
-    ///
-    /// **P3-4 fix**：拆分 persist 是为了避免 RwLockReadGuard 跨 I/O。
-    /// 见 [commands::persist_and_emit] 注释。
+    /// **P1-2 fix**：persist 拆成"调用方 clone StoreData → drop guard → 调裸
+    /// free function [`persist_to_disk`]"，彻底避免 RwLockReadGuard 跨 fs
+    /// write/sync/rename（拖窗 ~60Hz + 同时 add_todo 时旧实现会让 IPC 写命令
+    /// 排队等锁）。
     pub fn data_path_clone(&self) -> Option<PathBuf> {
-        self.data_path.lock()
+        self.data_path
+            .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
-    /// 拿 data_path（不可变引用版本）。给 [persist] 内部用。
+    /// 拿 data_path（不可变引用版本）。给 [`persist`] 内部用。
     fn data_path(&self) -> Result<PathBuf> {
-        self.data_path.lock()
+        self.data_path
+            .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .context("data_path not initialized")
     }
 
-    /// 拿当前 data + 用给定 path 持久化。**不持任何锁**（只有 persist_lock）。
-    /// 调用方应已 clone 出 path 后才调本方法，否则 data 跟磁盘上的数据可能
-    /// 跨并发写不一致（但 persist_lock 串行化了实际 I/O，所以这是 OK 的）。
-    pub fn persist_to_path(&self, path: &Path) -> Result<()> {
-        let _guard: MutexGuard<()> = self.persist_lock.lock()
-            .unwrap_or_else(|e| e.into_inner());
-        persist_to_disk(path, &self.data)
+    /// 拿当前 data 的 clone —— 给调用方在 drop RwLock guard 后自己调 [`persist_to_disk`]。
+    /// 调用方应已 clone 出 path 后才调 [`persist_to_disk`]，否则 data 跟磁盘上的
+    /// 数据可能跨并发写不一致（但 [`persist_to_disk`] 内部的静态 `PERSIST_LOCK`
+    /// 串行化了实际 I/O，所以这是 OK 的）。
+    pub fn data_clone(&self) -> StoreData {
+        self.data.clone()
+    }
+
+    /// 持久化（带 data_path lookup 的便捷方法）。内部走 [`persist_to_disk`]，
+    /// 不持 RwLock 跨 I/O。
+    ///
+    /// **P1-2 fix**：之前用 self.persist_lock（每 store 一把），现在 [`persist_to_disk`]
+    /// 改成 process 级静态锁（`OnceLock<Mutex<()>>`）—— 同一进程内所有 store
+    /// 共享一把 I/O 锁，多 store 路径下也安全（v0.1 只一个 store，行为兼容）。
+    pub fn persist(&self, _app: &AppHandle) -> Result<()> {
+        persist_to_disk(&self.data_path()?, &self.data)
     }
 }
 
@@ -497,26 +601,79 @@ fn load_from_disk(path: &Path) -> Result<StoreData> {
     Ok(data)
 }
 
-fn persist_to_disk(path: &Path, data: &StoreData) -> Result<()> {
+/// 串行化磁盘 I/O 的 process 级锁。
+///
+/// **P1-2 fix**：从 Store 上的 `Mutex<()>` 字段提升到 process 级 `OnceLock`。
+/// 旧实现让每个 store 自带锁，调用方为了"不持 RwLockReadGuard 跨 I/O"必须
+/// 在 Store 上额外调用一次方法（[`Store::persist_to_path`]）—— 那样本质上
+/// 仍然把整个 store 的 read guard 借给了方法，只是释放得早一点。提升到
+/// 静态锁后 [`persist_to_disk`] 是真正裸 free function：调用方 clone StoreData
+/// → drop guard → 调本函数，零 store-level lock 跨 I/O。
+///
+/// 多个 store 共用同一把锁在 v0.1 不是问题（只有 1 个 store），将来真的多 store
+/// 也能保证 tmp 文件名冲突时仍串行写。
+static PERSIST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// 裸 I/O 函数：拿 `data` + `path` 写盘，**不**访问 Store —— 调用方应已 drop
+/// 任何 RwLock guard 后再调本函数。
+///
+/// 实现要点：
+///   - **P2-1 fix**：tmp 文件用 `OpenOptions::mode(0o600)` 在 create 时直接定
+///     权限位，旧 `File::create + 后续 chmod` 在并发场景下会留一段窗口期
+///     world-readable。`OpenOptions::open` 失败时**不**会创建文件（仅在
+///     `create(true)` + 早于 truncate 阶段打开才会创建 partial 内容），安全。
+///   - **P2-2 fix**：rename 后对 parent dir 调 `sync_all()`（unix only），保证
+///     dir entry 落盘 —— 否则崩溃在 tmp fsync 之后、rename 之前，新文件可能
+///     出现在 dir 但 inode 还没持久化，下次启动看不见。Windows 上 `File::sync_all`
+///     对目录是 no-op，省 cfg 掉。
+///   - **P1-2 fix**：通过 `PERSIST_LOCK` 静态串行化所有并发的 tmp 写 + chmod +
+///     rename，避免 60Hz Moved/Resized + 同时 add_todo 时 tmp 文件互相覆盖。
+pub fn persist_to_disk(path: &Path, data: &StoreData) -> Result<()> {
+    let lock = PERSIST_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("create data dir")?;
     }
     let tmp = path.with_extension("json.tmp");
     {
-        let mut f = fs::File::create(&tmp).context("create tmp file")?;
+        // **P2-1 fix**：OpenOptions 直接在 create 时设 mode(0o600)，不依赖
+        // 后续 chmod。open 失败时不会留下 partial 文件（Rust stdlib 保证）。
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&tmp)
+                .context("create tmp file")?
+        };
+        #[cfg(not(unix))]
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .context("create tmp file")?;
+
         let json = serde_json::to_vec_pretty(data).context("serialize")?;
         f.write_all(&json).context("write tmp")?;
         f.sync_all().context("fsync tmp")?;
-
-        // Unix: 设 0600 权限
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&tmp, perms).context("chmod 0600")?;
-        }
     }
     fs::rename(&tmp, path).context("atomic rename")?;
+
+    // **P2-2 fix**：parent dir fsync，保证 dir entry 持久化。Windows 上 dir
+    // handle 的 sync_all 是 no-op，跳过。
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
     Ok(())
 }
 
@@ -541,7 +698,6 @@ mod reorder_tests {
                 ..StoreData::default()
             },
             data_path: Mutex::new(None),
-            persist_lock: Mutex::new(()),
         }
     }
 
@@ -573,7 +729,7 @@ mod reorder_tests {
             mk("b", TodoStatus::Pending, 1),
             mk("c", TodoStatus::Pending, 2),
         ]);
-        s.reorder(&["c".into(), "a".into(), "b".into()]);
+        let _ = s.reorder(&["c".into(), "a".into(), "b".into()]);
         assert_eq!(ids(&s), vec!["c", "a", "b"]);
         // section-local order 也在 0..N-1 重写
         assert_eq!(s.data.todos[0].order, 0);
@@ -591,7 +747,7 @@ mod reorder_tests {
             mk("d", TodoStatus::Done, 3),
         ]);
         // done 段从 [c, d] 重排为 [d, c]
-        s.reorder(&["d".into(), "c".into()]);
+        let _ = s.reorder(&["d".into(), "c".into()]);
         assert_eq!(ids(&s), vec!["a", "b", "d", "c"]);
         // pending 段 order 保持原值（没被拖到）
         assert_eq!(s.data.todos[0].order, 0);
@@ -610,7 +766,7 @@ mod reorder_tests {
             mk("a", TodoStatus::Pending, 0),
             mk("b", TodoStatus::Pending, 1),
         ]);
-        s.reorder(&["z".into(), "x".into()]);  // 全是找不到的 id
+        let _ = s.reorder(&["z".into(), "x".into()]); // 全是找不到的 id
         assert_eq!(ids(&s), vec!["a", "b"]);
         assert_eq!(s.data.todos[0].order, 0);
         assert_eq!(s.data.todos[1].order, 1);
@@ -624,7 +780,7 @@ mod reorder_tests {
             mk("a", TodoStatus::Pending, 0),
             mk("b", TodoStatus::Pending, 1),
         ]);
-        s.reorder(&["a".into(), "ghost".into()]);
+        let _ = s.reorder(&["a".into(), "ghost".into()]);
         // ghost 找不到 → 整批不动
         assert_eq!(ids(&s), vec!["a", "b"]);
     }
@@ -633,7 +789,7 @@ mod reorder_tests {
     #[test]
     fn reorder_empty_is_noop() {
         let mut s = fresh_store(vec![mk("a", TodoStatus::Pending, 0)]);
-        s.reorder(&[]);
+        let _ = s.reorder(&[]);
         assert_eq!(ids(&s), vec!["a"]);
     }
 
@@ -650,8 +806,8 @@ mod reorder_tests {
         for t in s.data.todos.iter_mut() {
             t.updated_at = pinned;
         }
-        s.reorder(&["a".into(), "b".into()]);  // 同顺序
-        // ids 没动 → updated_at 也不动
+        let _ = s.reorder(&["a".into(), "b".into()]); // 同顺序
+                                                      // ids 没动 → updated_at 也不动
         for t in &s.data.todos {
             assert_eq!(t.updated_at, pinned, "no-op reorder bumped updated_at");
         }
@@ -666,7 +822,7 @@ mod reorder_tests {
             mk("b", TodoStatus::Done, 1),
             mk("c", TodoStatus::Done, 2),
         ]);
-        s.reorder(&["c".into(), "b".into()]);
+        let _ = s.reorder(&["c".into(), "b".into()]);
         assert_eq!(ids(&s), vec!["a", "c", "b"]);
         assert_eq!(s.data.todos[1].order, 0);
         assert_eq!(s.data.todos[2].order, 1);
@@ -679,8 +835,8 @@ mod reorder_tests {
     #[test]
     fn reorder_real_data_pending_changes_array_order() {
         let mut s = fresh_store(vec![
-            mk("26", TodoStatus::Pending, 0),       // 26年百度智能云考试能力提升
-            mk("123", TodoStatus::Pending, 1),      // 123123...
+            mk("26", TodoStatus::Pending, 0),  // 26年百度智能云考试能力提升
+            mk("123", TodoStatus::Pending, 1), // 123123...
             mk("5", TodoStatus::Pending, 3),
             mk("6", TodoStatus::Pending, 4),
             mk("9", TodoStatus::Done, 2),
@@ -691,7 +847,7 @@ mod reorder_tests {
             mk("1", TodoStatus::Pending, 5),
         ]);
         // 模拟把 pending 段中"26"(index 0) 拖到"5"之后 —— section 内新顺序
-        s.reorder(&[
+        let _ = s.reorder(&[
             "123".into(),
             "5".into(),
             "26".into(),
@@ -699,18 +855,24 @@ mod reorder_tests {
             "1".into(),
         ]);
         // 验证 Vec 顺序变化（done 段位置不动）
-        assert_eq!(ids(&s), vec![
-            "123", "5", "26", "6", "1",
-            "9", "10", "2", "3", "4",
-        ]);
+        assert_eq!(
+            ids(&s),
+            vec!["123", "5", "26", "6", "1", "9", "10", "2", "3", "4",]
+        );
         // pending 段的 Vec 切片顺序 = 新顺序
-        let pending: Vec<&str> = s.data.todos.iter()
+        let pending: Vec<&str> = s
+            .data
+            .todos
+            .iter()
             .filter(|t| t.status == TodoStatus::Pending)
             .map(|t| t.id.as_str())
             .collect();
         assert_eq!(pending, vec!["123", "5", "26", "6", "1"]);
         // done 段的 Vec 切片顺序 = 原序（未动）
-        let done: Vec<&str> = s.data.todos.iter()
+        let done: Vec<&str> = s
+            .data
+            .todos
+            .iter()
             .filter(|t| t.status == TodoStatus::Done)
             .map(|t| t.id.as_str())
             .collect();
@@ -729,7 +891,10 @@ mod reorder_tests {
         ]);
         // a: pending → done。预期：a 从 index 0 摘出，append 到 done 末尾，
         // order = max(done.order) + 1 = 2。
-        let updated = s.update("a", None, Some(TodoStatus::Done)).unwrap();
+        let updated = s
+            .update("a", None, Some(TodoStatus::Done))
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.status, TodoStatus::Done);
         assert_eq!(updated.order, 2);
         assert_eq!(ids(&s), vec!["b", "c", "a"]);
@@ -748,12 +913,18 @@ mod reorder_tests {
             mk("d", TodoStatus::Done, 1),
         ]);
         // c: done → pending → append 到 pending 末尾
-        let updated = s.update("c", None, Some(TodoStatus::Pending)).unwrap();
+        let updated = s
+            .update("c", None, Some(TodoStatus::Pending))
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.status, TodoStatus::Pending);
-        assert_eq!(updated.order, 2);  // max(0,1) + 1
+        assert_eq!(updated.order, 2); // max(0,1) + 1
         assert_eq!(ids(&s), vec!["a", "b", "d", "c"]);
         // c 现在是 pending 段最后一条
-        let pending: Vec<&str> = s.data.todos.iter()
+        let pending: Vec<&str> = s
+            .data
+            .todos
+            .iter()
             .filter(|t| t.status == TodoStatus::Pending)
             .map(|t| t.id.as_str())
             .collect();
@@ -767,7 +938,10 @@ mod reorder_tests {
             mk("a", TodoStatus::Pending, 0),
             mk("b", TodoStatus::Pending, 1),
         ]);
-        let updated = s.update("a", Some("renamed".into()), None).unwrap();
+        let updated = s
+            .update("a", Some("renamed".into()), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.title, "renamed");
         assert_eq!(updated.status, TodoStatus::Pending);
         // Vec 位置 + order 不变
@@ -783,7 +957,10 @@ mod reorder_tests {
             mk("b", TodoStatus::Pending, 1),
         ]);
         let pinned_order = s.data.todos[0].order;
-        let updated = s.update("a", None, Some(TodoStatus::Pending)).unwrap();
+        let updated = s
+            .update("a", None, Some(TodoStatus::Pending))
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.status, TodoStatus::Pending);
         assert_eq!(ids(&s), vec!["a", "b"]);
         assert_eq!(s.data.todos[0].order, pinned_order);
@@ -796,7 +973,10 @@ mod reorder_tests {
             mk("a", TodoStatus::Pending, 0),
             mk("b", TodoStatus::Done, 0),
         ]);
-        let updated = s.update("a", Some("done item".into()), Some(TodoStatus::Done)).unwrap();
+        let updated = s
+            .update("a", Some("done item".into()), Some(TodoStatus::Done))
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.status, TodoStatus::Done);
         assert_eq!(updated.title, "done item");
         // a 已 append 到 done 末尾
@@ -812,15 +992,94 @@ mod reorder_tests {
             mk("c", TodoStatus::Pending, 2),
         ]);
         // a → done (append 到 done 段，order=0)
-        s.update("a", None, Some(TodoStatus::Done)).unwrap();
+        s.update("a", None, Some(TodoStatus::Done))
+            .unwrap()
+            .unwrap();
         // a → pending (append 到 pending 段，order=3 = max(1,2,?))
-        s.update("a", None, Some(TodoStatus::Pending)).unwrap();
+        s.update("a", None, Some(TodoStatus::Pending))
+            .unwrap()
+            .unwrap();
         // pending 段：b(1), c(2), a(3) —— 单调递增
-        let pending: Vec<i32> = s.data.todos.iter()
+        let pending: Vec<i32> = s
+            .data
+            .todos
+            .iter()
             .filter(|t| t.status == TodoStatus::Pending)
             .map(|t| t.order)
             .collect();
         assert_eq!(pending, vec![1, 2, 3]);
+    }
+
+    /// **P2-4 fix**：update(title=None, status=None) → Ok(None) no-op，
+    /// 不动 Vec、不刷 updated_at、让 caller 跳过 persist_and_emit。
+    #[test]
+    fn update_no_op_when_both_none() {
+        let mut s = fresh_store(vec![mk("a", TodoStatus::Pending, 0)]);
+        let pinned_order = s.data.todos[0].order;
+        let pinned_updated_at = s.data.todos[0].updated_at;
+        let res = s.update("a", None, None).unwrap();
+        assert!(res.is_none(), "no-op update should return Ok(None)");
+        // Vec 不变 + order 不变 + updated_at 不变
+        assert_eq!(s.data.todos[0].order, pinned_order);
+        assert_eq!(s.data.todos[0].updated_at, pinned_updated_at);
+    }
+
+    /// **P2-4 fix**：update("not_exist", None, None) → Err (id 找不到)，不是 Ok(None)。
+    #[test]
+    fn update_no_op_with_unknown_id_errors() {
+        let mut s = fresh_store(vec![mk("a", TodoStatus::Pending, 0)]);
+        let res = s.update("ghost", None, None);
+        assert!(
+            res.is_err(),
+            "unknown id + both None should error (not_found)"
+        );
+    }
+
+    /// **P1-1 fix**：reorder ids 是 section 部分的子集（不是完整
+    /// permutation）→ 整批拒绝 + 返 Err。防御并发 toggleDone / 中间人
+    /// 篡改 IPC 场景。
+    #[test]
+    fn reorder_rejects_partial_subset_of_section() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+            mk("c", TodoStatus::Pending, 2),
+        ]);
+        // 只传 [a, b]（c 漏了） → 不是完整 permutation → Err
+        let res = s.reorder(&["a".into(), "b".into()]);
+        assert!(res.is_err(), "subset of pending should error");
+        // store 不动（防御位置）
+        assert_eq!(ids(&s), vec!["a", "b", "c"]);
+        assert_eq!(s.data.todos[0].order, 0);
+        assert_eq!(s.data.todos[1].order, 1);
+        assert_eq!(s.data.todos[2].order, 2);
+    }
+
+    /// **P1-1 fix**：reorder ids 是另一个 section 的全部 + 当前 section 部分
+    /// （混合 status）→ 整批拒绝。
+    #[test]
+    fn reorder_rejects_mixed_status_subset() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+            mk("c", TodoStatus::Done, 0),
+        ]);
+        // pending 段只有 a,b，传 [a, b, c]（混了 done）→ Err
+        let res = s.reorder(&["a".into(), "b".into(), "c".into()]);
+        assert!(res.is_err(), "mixed status should error");
+        assert_eq!(ids(&s), vec!["a", "b", "c"]);
+    }
+
+    /// **P1-1 fix**：reorder ids 是当前 section 的完整 permutation → 接受。
+    #[test]
+    fn reorder_accepts_complete_section_permutation() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+        ]);
+        let res = s.reorder(&["b".into(), "a".into()]);
+        assert!(res.is_ok(), "complete permutation should succeed");
+        assert_eq!(ids(&s), vec!["b", "a"]);
     }
 
     /// **P2-3 fix**：reorder 拒绝重复 id。
@@ -834,7 +1093,7 @@ mod reorder_tests {
             mk("b", TodoStatus::Pending, 1),
             mk("c", TodoStatus::Pending, 2),
         ]);
-        s.reorder(&["a".into(), "b".into(), "a".into()]);
+        let _ = s.reorder(&["a".into(), "b".into(), "a".into()]);
         // ids 重复 → 整批拒绝，store 不动
         assert_eq!(ids(&s), vec!["a", "b", "c"]);
         assert_eq!(s.data.todos[0].order, 0);

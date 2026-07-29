@@ -30,6 +30,8 @@
 // 触发 NSStatusBar `assertBarrierOnQueue` SIGTRAP（Musage 2026-06-18 踩过）。
 // Usticky 没有 poller 高频写 tray，所以不需要 mpsc channel，单次派发足够。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tauri::{
     menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -39,6 +41,25 @@ use tauri::{
 use crate::commands;
 use crate::todo::PinMode;
 use crate::SharedStore;
+
+/// **P2-7 fix**：tray 菜单"打开中"标志。
+///
+/// 旧实现：locale / pin mode 切换时 `rebuild_tray` 无脑调 `set_menu()`。
+/// 若用户**正在**点 tray 菜单（macOS NSMenu 弹出中 / Win32 PopupMenu 弹出中），
+/// `set_menu()` 会把当前菜单替换 / 销毁，导致用户已弹出的菜单条目悬空、
+/// 点击事件丢失、菜单瞬间关闭 —— 用户体感是"按了没反应 / 菜单突然没了"。
+///
+/// 新实现：维护 `MENU_OPEN_FLAG`，在右键按下（菜单即将弹出）时 set true，
+/// 在 on_menu_event 任意条目点击 / 菜单 dismiss 后 set false。
+/// `rebuild_tray` 检查 flag —— true 时跳过 rebuild + trace log "tray menu
+/// open, deferring rebuild"，下一次 locale / pin mode 切换（用户已经收
+/// 完菜单了）再重建。
+///
+/// Tauri 2 没有"菜单弹出 / 关闭"的官方 event，我们靠 Right Down + on_menu_event
+/// 启发式推断 —— 偶有 menu 弹出后用户 click outside（on_menu_event 不 fire）
+/// 会让 flag 卡 true，但 rebuild 本来就罕见，下一次切换时还能补建，
+/// 安全性 OK。
+static MENU_OPEN_FLAG: AtomicBool = AtomicBool::new(false);
 
 /// 读 store 当前 pin mode（blocking_read 在 sync 上下文安全 —— 跟 lib.rs setup 同款）。
 fn current_pin_mode<R: Runtime>(app: &AppHandle<R>) -> PinMode {
@@ -67,7 +88,7 @@ fn format_shortcut_for_display(s: &str) -> String {
             let p = part.trim();
             match p.to_lowercase().as_str() {
                 "cmd" | "command" | "super" | "meta" | "cmdorctrl" | "cmdorcontrol"
-                    | "commandorctrl" | "commandorcontrol" => out.push('⌘'),
+                | "commandorctrl" | "commandorcontrol" => out.push('⌘'),
                 "ctrl" | "control" => out.push('⌃'),
                 "shift" => out.push('⇧'),
                 "alt" | "option" | "opt" => out.push('⌥'),
@@ -131,16 +152,13 @@ fn build_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     )?;
     let sep_settings = PredefinedMenuItem::separator(app)?;
     let cur_sc = current_quick_add_shortcut(app);
-    let sc_label = format!("{} ({})",
+    let sc_label = format!(
+        "{} ({})",
         rust_i18n::t!("tray.quick_add_change").to_string(),
-        format_shortcut_for_display(&cur_sc));
-    let change_shortcut_i = MenuItem::with_id(
-        app,
-        "change_shortcut",
-        sc_label,
-        true,
-        None::<&str>,
-    )?;
+        format_shortcut_for_display(&cur_sc)
+    );
+    let change_shortcut_i =
+        MenuItem::with_id(app, "change_shortcut", sc_label, true, None::<&str>)?;
     let settings_sub = Submenu::with_items(
         app,
         rust_i18n::t!("tray.settings").to_string(),
@@ -179,64 +197,110 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             tauri::image::Image::from_bytes(include_bytes!("../icons/tray-base.png"))
                 .expect("tray icon")
         }))
-        .on_menu_event(move |app, event| match event.id().as_ref() {
-            "toggle" => {
-                // 走统一 show / hide_dismiss 路径 —— 保持 quick-add 状态一致性。
-                //
-                // **关键**：show 分支用 `quick_show_floating_window`（raise + show + focus），
-                // 不是裸的 `w.show() + w.set_focus()`。PinBottom 默认 mode 下裸 show
-                // 会让窗口停在 level=-1，被任何 app 盖住 → 用户"看不到浮窗"。
-                // raise 完再 show 视觉一致，dismiss 时按 pin mode 还原。
-                if let Some(w) = app.get_webview_window("floating") {
-                    let is_visible = w.is_visible().unwrap_or(false);
-                    if is_visible {
-                        if let Some(store) = app.try_state::<crate::SharedStore>() {
-                            crate::hide_dismiss_floating_window(app, store.inner());
+        .on_menu_event(move |app, event| {
+            // **P2-7 fix**：on_menu_event 触发 = 用户已经看到菜单并点了某个
+            // 条目（或菜单 dismiss 后又被点开），总之"菜单打开中"状态结束。
+            // clear flag 让下一次 rebuild_tray 能正常 set_menu()。
+            MENU_OPEN_FLAG.store(false, Ordering::SeqCst);
+            match event.id().as_ref() {
+                "toggle" => {
+                    // 走统一 show / hide_dismiss 路径 —— 保持 quick-add 状态一致性。
+                    //
+                    // **关键**：show 分支用 `quick_show_floating_window`（raise + show + focus），
+                    // 不是裸的 `w.show() + w.set_focus()`。PinBottom 默认 mode 下裸 show
+                    // 会让窗口停在 level=-1，被任何 app 盖住 → 用户"看不到浮窗"。
+                    // raise 完再 show 视觉一致，dismiss 时按 pin mode 还原。
+                    if let Some(w) = app.get_webview_window("floating") {
+                        let is_visible = w.is_visible().unwrap_or(false);
+                        if is_visible {
+                            if let Some(store) = app.try_state::<crate::SharedStore>() {
+                                crate::hide_dismiss_floating_window(app, store.inner());
+                            } else {
+                                let _ = w.hide();
+                            }
                         } else {
-                            let _ = w.hide();
+                            // **P1-5 fix**：tray 左键单击的 show 分支走"普通 show"
+                            // 路径，不激活 QUICK_ADD_ACTIVE。否则用户托盘点开浮窗
+                            // → 切别 app → 被 blur_dismiss 还原 level 盖住。
+                            crate::show_floating_window_normal(app);
                         }
-                    } else {
-                        // **P1-5 fix**：tray 左键单击的 show 分支走"普通 show"
-                        // 路径，不激活 QUICK_ADD_ACTIVE。否则用户托盘点开浮窗
-                        // → 切别 app → 被 blur_dismiss 还原 level 盖住。
-                        crate::show_floating_window_normal(app);
                     }
                 }
+                "settings" => {
+                    let app2 = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = commands::open_settings_window(app2).await {
+                            tracing::warn!(error = %e, "打开设置失败");
+                        }
+                    });
+                }
+                "change_shortcut" => {
+                    // 打开设置面板 —— 快捷键的录入 UI 在设置面板里。
+                    // 直接在 tray 菜单里做录入（NSMenu 不支持捕获 keydown）。
+                    let app2 = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = commands::open_settings_window(app2).await {
+                            tracing::warn!(error = %e, "打开设置失败");
+                        }
+                    });
+                }
+                "pin_top" | "pin_bottom" | "normal" => {
+                    let app2 = app.clone();
+                    let mode = event.id().as_ref().to_string();
+                    tauri::async_runtime::spawn(async move {
+                        // **P2-9 fix**：tray menu event 的 spawn 在用户点 pin mode
+                        // 时触发。store 可能还没 manage 完（启动早期）或已经被 drop
+                        // （app shutdown）—— 用 try_state 拿，None 时 warn + return，
+                        // 不让 `state()` 内部 panic 把整个 event loop 拖死。
+                        let store = if let Some(s) = app2.try_state::<SharedStore>() {
+                            s.inner().clone()
+                        } else {
+                            tracing::warn!("tray pin-mode handler: store not ready, skipping");
+                            return;
+                        };
+                        if let Err(e) = commands::set_pin_mode_core(&app2, &store, &mode).await {
+                            tracing::warn!(error = %e, "tray set_pin_mode 失败");
+                        }
+                    });
+                }
+                "quit" => {
+                    app.exit(0);
+                }
+                _ => {}
             }
-            "settings" => {
-                let app2 = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(e) = commands::open_settings_window(app2).await {
-                        tracing::warn!(error = %e, "打开设置失败");
-                    }
-                });
-            }
-            "change_shortcut" => {
-                // 打开设置面板 —— 快捷键的录入 UI 在设置面板里。
-                // 直接在 tray 菜单里做录入（NSMenu 不支持捕获 keydown）。
-                let app2 = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(e) = commands::open_settings_window(app2).await {
-                        tracing::warn!(error = %e, "打开设置失败");
-                    }
-                });
-            }
-            "pin_top" | "pin_bottom" | "normal" => {
-                let app2 = app.clone();
-                let mode = event.id().as_ref().to_string();
-                tauri::async_runtime::spawn(async move {
-                    let store = app2.state::<SharedStore>().inner().clone();
-                    if let Err(e) = commands::set_pin_mode_core(&app2, &store, &mode).await {
-                        tracing::warn!(error = %e, "tray set_pin_mode 失败");
-                    }
-                });
-            }
-            "quit" => {
-                app.exit(0);
-            }
-            _ => {}
         })
         .on_tray_icon_event(|tray, event| {
+            // **P2-7 fix**：维护 MENU_OPEN_FLAG，让 rebuild_tray 能跳过
+            // 菜单打开中的 set_menu() 调用。
+            //
+            // Right Down → 菜单即将弹出（Windows / Linux 上右键弹菜单，
+            // macOS 上虽然 show_menu_on_left_click(false) 把右键也路由到 on_menu_event，
+            // 但 NSStatusItem 仍先派发 on_tray_icon_event Click Right Down）
+            // → set true。
+            // Right Up → 菜单已弹出完毕 → set true（双保险，避免在 Up 之前
+            // rebuild 抢先）。
+            // Left Down → 用户左键交互（toggle 浮窗），菜单**不**打开 →
+            // set false（兜底：万一上次 menu 弹出后未 dismiss 让 flag 卡 true）。
+            if let TrayIconEvent::Click {
+                button,
+                button_state,
+                ..
+            } = &event
+            {
+                match (button, button_state) {
+                    (MouseButton::Right, MouseButtonState::Down) => {
+                        MENU_OPEN_FLAG.store(true, Ordering::SeqCst);
+                    }
+                    (MouseButton::Right, MouseButtonState::Up) => {
+                        MENU_OPEN_FLAG.store(true, Ordering::SeqCst);
+                    }
+                    (MouseButton::Left, _) => {
+                        MENU_OPEN_FLAG.store(false, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+
             // 左键单击 = 切换浮窗显隐。show 分支用 quick_show_floating_window
             // （raise + show + focus），见上 "toggle" 注释 —— PinBottom 默认 mode
             // 下裸 show 会停在 level=-1 被其它 app 盖住，看不到。
@@ -278,8 +342,22 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 /// 派发到 main thread 上做 `tray_by_id` + `set_menu` + drop（drop 在 main
 /// thread 跑才不会触发 NSStatusBar SIGTRAP）。
 pub fn rebuild_tray(app: &AppHandle) -> tauri::Result<()> {
+    // **P2-7 fix**：菜单打开中时跳过 rebuild。set_menu() 会销毁当前 NSMenu /
+    // 替换 Win32 PopupMenu，正在跟用户交互的菜单条目瞬间悬空 / 关闭 ——
+    // 用户体感"按了没反应 / 菜单突然消失"。等用户收完菜单（on_menu_event
+    // 清 flag）再 rebuild。
+    if MENU_OPEN_FLAG.load(Ordering::SeqCst) {
+        tracing::trace!("tray menu open, deferring rebuild");
+        return Ok(());
+    }
     let app2 = app.clone();
     app.run_on_main_thread(move || {
+        // 在 main thread 上**再次**确认 —— 之前 listener 派发到这里时可能
+        // 距上次 check 已有几十微秒，期间用户右键弹了菜单。
+        if MENU_OPEN_FLAG.load(Ordering::SeqCst) {
+            tracing::trace!("tray menu open (re-check on main thread), deferring rebuild");
+            return;
+        }
         let Some(tray) = app2.tray_by_id("main-tray") else {
             tracing::warn!("rebuild_tray: tray_by_id 返 None（tray 还没建好？）");
             return;

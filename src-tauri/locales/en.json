@@ -2,15 +2,12 @@
   "commands": {
     "error": {
       "empty_title": "Title cannot be empty",
-      "too_long": "Title too long (max 280 characters)",
+      "too_long": "Title too long (max {max} characters)",
       "not_found": "Todo not found",
-      "no_primary_monitor": "No primary monitor detected"
+      "no_primary_monitor": "No primary monitor detected",
+      "unsupported_locale": "Unsupported locale",
+      "shortcut_no_modifier": "Shortcut must include at least one modifier (Ctrl / Alt / Shift / Cmd)"
     }
-  },
-  "error": {
-    "empty_title": "Title cannot be empty",
-    "too_long": "Title too long (max {max} characters)",
-    "not_found": "Todo not found"
   },
   "window": {
     "settings": "Settings"

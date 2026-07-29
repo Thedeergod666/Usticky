@@ -8,10 +8,12 @@ rust-version = "1.77"
 
 [lib]
 name = "usticky_lib"
-# Windows 上只用 staticlib 就够（main.rs 静态链接 usticky_lib）。
-# 删 cdylib 是为了绕过 MinGW ld 16-bit ordinal 表上限 —— Tauri 2 + GNU 工具链的已知坑
-# （cargo 给 cdylib 自动生成的 .def 含 14 万+ 符号，ld 不让过）。
-crate-type = ["staticlib", "rlib"]
+# **P3-20 fix**：只用 rlib 就够 —— main.rs `use usticky_lib::run()`，没有
+# 外部消费者链接这个 lib。删 staticlib：它当初是为了 MinGW 兜底绕 ld 16-bit
+# ordinal 溢出，但 MSVC 是 release CI 主路径（详见 AGENTS.md "发版"段）
+# 不需要 staticlib；GNU 上 rlib 也够本 crate 内 run() 链接。少一个 crate-type
+# = 少一次链接器选项处理、cargo 调用更简洁。
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -20,6 +22,9 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
+# **P2-6 fix**：single-instance 插件 —— 第二次启动 Usticky 时聚焦已有浮窗
+# 而不是新开一个进程（macOS 上 dock 图标重复 + 各持一份 store 会触发并发写）。
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

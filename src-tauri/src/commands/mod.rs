@@ -7,7 +7,7 @@
 // 也走 camelCase 转换（Musage PR 1b 实测坑）。
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
-use crate::todo::{PinMode, Todo, TodoStatus, TodoSnapshot};
+use crate::todo::{PinMode, Todo, TodoSnapshot, TodoStatus};
 use crate::SharedStore;
 
 /// 把 pin mode 应用到窗口（跨平台，platform/mod.rs 统一导出）。
@@ -29,28 +29,19 @@ fn emit_todos_changed(app: &AppHandle, snap: &TodoSnapshot) {
 /// emit `usticky://persist-failed` 让前端 mini-flash 提示用户 —— 否则前端
 /// invoke 拿到 Ok 后以为写成功了，下次启动数据全没。
 ///
-/// **P3-4 fix**：提前 clone snapshot 然后 drop read guard，再调 persist。
-/// 旧实现全程持有 RwLockReadGuard 跨整个 persist_to_disk（fs write +
-/// sync_all + rename，几十 ms），期间所有 IPC 写命令排队等 write guard
-/// —— 拖窗时 ~60Hz spawn Moved/Resized 任务 + 用户同时 add_todo 会卡顿。
-/// 现在分两段锁：拿 snapshot → drop guard → 重新短暂拿 read guard 调 persist。
-/// 第二次 read guard 也立刻在 persist 返回后 drop（persist 内部用
-/// persist_lock 串行化 I/O，不需要 RwLock 跨 I/O）。
+/// **P1-2 fix**：一次拿 TodoSnapshot + StoreData + path 三个 clone，**立刻**
+/// drop read guard，然后调裸 free function [`crate::todo::persist_to_disk`]
+/// 写盘。整段 I/O 不持任何 RwLock，旧实现里 RwLockReadGuard 跨 fs write +
+/// sync_all + rename（几十 ms）会让同时到来的 IPC 写命令排队等锁 ——
+/// 拖窗 ~60Hz spawn Moved/Resized 任务 + 用户同时 add_todo 时会感知卡顿。
 async fn persist_and_emit(app: &AppHandle, store: &SharedStore) -> TodoSnapshot {
-    // (1) 拿 snapshot + 立刻 drop read guard
-    let snap = {
+    let (snap, data, path) = {
         let s = store.read().await;
-        s.snapshot()
+        (s.snapshot(), s.data_clone(), s.data_path_clone())
     };
-    // (2) 拿 data_path clone 也提前 drop guard，persist 内部用 persist_lock
-    let path = {
-        let s = store.read().await;
-        s.data_path_clone()
-    };
-    // (3) 真正调 persist（短暂拿 read guard，调完立刻 drop）
     match path {
         Some(p) => {
-            if let Err(e) = store.read().await.persist_to_path(&p) {
+            if let Err(e) = crate::todo::persist_to_disk(&p, &data) {
                 tracing::error!("persist failed: {}", e);
                 let _ = app.emit("usticky://persist-failed", e.to_string());
             }
@@ -62,6 +53,30 @@ async fn persist_and_emit(app: &AppHandle, store: &SharedStore) -> TodoSnapshot 
     }
     emit_todos_changed(app, &snap);
     snap
+}
+
+/// 仅落盘（**不** emit todos-changed）—— 给 pin mode / locale / shortcut /
+/// 窗口几何等"改了跟 todo 列表无关"的路径用。
+///
+/// **P1-2 fix**：跟 [`persist_and_emit`] 共享同一份"clone snapshot → drop guard
+/// → 调裸 [`persist_to_disk`]"模板，零 RwLock 跨 I/O。
+async fn persist_only(app: &AppHandle, store: &SharedStore) {
+    let (path, data) = {
+        let s = store.read().await;
+        (s.data_path_clone(), s.data_clone())
+    };
+    match path {
+        Some(p) => {
+            if let Err(e) = crate::todo::persist_to_disk(&p, &data) {
+                tracing::error!("persist failed: {}", e);
+                let _ = app.emit("usticky://persist-failed", e.to_string());
+            }
+        }
+        None => {
+            tracing::error!("persist failed: data_path 未初始化");
+            let _ = app.emit("usticky://persist-failed", "data path not initialized");
+        }
+    }
 }
 
 /// 状态字符串 → enum。非法值直接报错，让前端知道走错了路径。
@@ -129,13 +144,32 @@ pub async fn update_todo(
         Some(s) => Some(parse_status(&s)?),
         None => None,
     };
-    let updated = {
+    let maybe_updated = {
         let mut s = store.write().await;
+        // **P2-4 fix**：update 现在返 Result<Option<Todo>>。None = no-op
+        // （title/status 都是 None 的误用），跳过 persist + emit，省一次
+        // 磁盘 I/O 和一次 todos-changed 渲染。Some = 实际改了。
         s.update(&id, title, status_enum)
-            .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?
+            .map_err(|e| e.to_string())?
     };
-    persist_and_emit(&app, &store).await;
-    Ok(updated)
+    match maybe_updated {
+        Some(updated) => {
+            persist_and_emit(&app, &store).await;
+            Ok(updated)
+        }
+        None => {
+            // No-op：fetch current state 返给前端，**不**触发 persist / emit。
+            let cur = store
+                .read()
+                .await
+                .todos()
+                .iter()
+                .find(|t| t.id == id)
+                .cloned()
+                .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?;
+            Ok(cur)
+        }
+    }
 }
 
 #[tauri::command]
@@ -161,7 +195,9 @@ pub async fn reorder_todos(
 ) -> Result<(), String> {
     {
         let mut s = store.write().await;
-        s.reorder(&ids);
+        // **P1-1 fix**：reorder 现在返 Result，非完整 section 子集直接 Err 上抛，
+        // 前端拿到非 Ok 后不要 retry / render 脏数据。
+        s.reorder(&ids).map_err(|e| e.to_string())?;
     }
     persist_and_emit(&app, &store).await;
     Ok(())
@@ -209,36 +245,74 @@ pub async fn reset_floating_window(
     // Wayland 上 primary_monitor() 可能返 None（tao 历史 panic 改 None），
     // fallback 到 available_monitors().first()（= 当前拿到的第一个 monitor，
     // 不一定是 OS 主屏，但比崩溃好）。
-    let monitor = app.primary_monitor().map_err(|e| e.to_string())?
+    let monitor = app
+        .primary_monitor()
+        .map_err(|e| e.to_string())?
         .or_else(|| {
-            app.available_monitors().ok().and_then(|m| m.into_iter().next())
+            app.available_monitors()
+                .ok()
+                .and_then(|m| m.into_iter().next())
         })
         .ok_or_else(|| rust_i18n::t!("commands.error.no_primary_monitor").to_string())?;
     let mon_size = monitor.size();
     let mon_pos = monitor.position();
     if let Some(w) = app.get_webview_window("floating") {
-        let win_size = w.outer_size().map_err(|e| e.to_string())?;
-        let x = mon_pos.x + ((mon_size.width as i32 - win_size.width as i32) / 2);
-        let y = mon_pos.y + ((mon_size.height as i32 - win_size.height as i32) / 2);
+        // **P2-12 fix**：用持久化的 (w, h)（来自上次 Resized 事件 + 跨重启）
+        // 而不是当前 outer_size。后者会拿"现在显示的尺寸"——若用户曾在浮窗
+        // hide 时被 macOS 自动 resize 过、或副屏拔了被 fallback 到主屏缩放，
+        // outer_size 跟用户实际想保存的不一致。持久化窗口尺寸跟位置是同一
+        // 个生命周期（来自 WindowGeom），一起用更连贯。
+        let (win_w, win_h) = {
+            let geom = store.read().await.last_window_geom().clone();
+            match (geom.width, geom.height) {
+                (Some(pw), Some(ph)) if pw > 0 && ph > 0 => (pw, ph),
+                _ => {
+                    let cur = w.outer_size().map_err(|e| e.to_string())?;
+                    (cur.width, cur.height)
+                }
+            }
+        };
+        let x = mon_pos.x + ((mon_size.width as i32 - win_w as i32) / 2);
+        let y = mon_pos.y + ((mon_size.height as i32 - win_h as i32) / 2);
         tracing::debug!(
-            "reset_floating_window: 目标显示器 pos=({}, {}) size={}x{} → 窗口新位置 ({}, {})",
-            mon_pos.x, mon_pos.y, mon_size.width, mon_size.height, x, y
+            "reset_floating_window: 目标显示器 pos=({}, {}) size={}x{} → 窗口新位置 ({}, {}) size={}x{}",
+            mon_pos.x, mon_pos.y, mon_size.width, mon_size.height, x, y, win_w, win_h
         );
-        w.set_position(tauri::PhysicalPosition::new(x, y))
-            .map_err(|e| e.to_string())?;
+
+        // **P2-16 fix**：浮窗 hide 时**不**调 set_position。macOS 上
+        // set_position 会把 hidden window 提到 front → 用户"明明没主动开
+        // 却被浮窗挡住"。改成只持久化新 (x, y)，下次 show() 时由 setup 流程
+        // 启动时或下次 Resized 时自然应用。
+        let is_visible = w.is_visible().unwrap_or(false);
+        if is_visible {
+            w.set_position(tauri::PhysicalPosition::new(x, y))
+                .map_err(|e| e.to_string())?;
+        }
+
         {
             let mut s = store.write().await;
             s.update_window_pos(Some(x), Some(y));
+            // **P2-12 fix**：同时把当前计算出的尺寸写回 store，让持久化
+            // 跟"用户上次实际看到的尺寸"对齐——防止下次启动 restore 时
+            // outer_size / persisted size 出现 drift。
+            s.update_window_size(Some(win_w), Some(win_h));
         }
-        // 落盘（窗口几何 + todos 一起）但不 emit todos-changed —— 复位位置
-        // 跟 todo 列表无关，前端不要白白 render 一遍。
-        // **P3-4 fix**：用 data_path_clone + persist_to_path，提前 drop read guard。
-        let path = store.read().await.data_path_clone();
-        if let Some(p) = path {
-            if let Err(e) = store.read().await.persist_to_path(&p) {
-                tracing::error!("persist failed: {}", e);
-                let _ = app.emit("usticky://persist-failed", e.to_string());
-            }
+
+        // **P1-2 fix**：调裸 persist_only helper（无 RwLock 跨 I/O）。
+        persist_only(&app, store.inner()).await;
+
+        // **P2-19 fix**：emit `usticky://window-pos-changed` 给浮窗 webview
+        // （reset 后浮窗的位置已变，前端 cached 的"outer_pos"和 CSS 渲染
+        // 都需要刷新；不影响其他 webview）。set_position 成功 OR 持久化成功
+        // 都 emit —— hidden 分支没调 set_position 但用户期望"按了重置按钮
+        // 后下次 show 的位置就是这里算的"。
+        if let Some(floating) = app.get_webview_window("floating") {
+            let _ = floating.emit(
+                "usticky://window-pos-changed",
+                serde_json::json!({
+                    "x": x, "y": y, "w": win_w, "h": win_h,
+                }),
+            );
         }
     }
     Ok(())
@@ -269,10 +343,9 @@ pub async fn resize_floating_window(app: AppHandle, height: f64) -> Result<(), S
         let mon_size = mon.size();
         const BOTTOM_MARGIN_PX: i32 = 12;
         let cur_y = w.outer_position().map_err(|e| e.to_string())?.y;
-        let max_h_in_mon =
-            ((mon_pos.y + mon_size.height as i32 - BOTTOM_MARGIN_PX - cur_y)
-                .min(mon_size.height as i32)
-                .max(160)) as u32;
+        let max_h_in_mon = ((mon_pos.y + mon_size.height as i32 - BOTTOM_MARGIN_PX - cur_y)
+            .min(mon_size.height as i32)
+            .max(160)) as u32;
         let final_h = new_h_physical.min(max_h_in_mon);
         // width 沿用 outer_size，**不**调 set_position —— 顶部不动是用户的
         // 预期，resize 不能改 y。
@@ -301,7 +374,10 @@ pub async fn get_app_locale(store: State<'_, SharedStore>) -> Result<String, Str
     // store 持久化的 locale 是单一来源；rust-i18n 状态在 load_or_init 时
     // 已经同步过 set_locale，这里直接读 store（即便中途有别处改了
     // rust_i18n 状态，重启就同步回来）。
-    Ok(store.read().await.locale()
+    Ok(store
+        .read()
+        .await
+        .locale()
         .map(String::from)
         .unwrap_or_else(|| rust_i18n::locale().to_string()))
 }
@@ -318,19 +394,20 @@ pub async fn set_app_locale(
     store: State<'_, SharedStore>,
     locale: String,
 ) -> Result<(), String> {
+    // **P2-3 / P2-20 fix**：locale whitelist。rust_i18n::set_locale 接受任意字符串
+    // 但**不**校验是否在 `locales/*.json` 里 —— 错值会导致后续 t!() 调用返
+    // 原 key 字符串（`"commands.error.empty_title"` 直接当 UI 文案），用户
+    // 看到的是 dotted key 而不是翻译。先白名单再 set_locale。
+    if !["en", "zh-CN"].contains(&locale.as_str()) {
+        return Err(rust_i18n::t!("commands.error.unsupported_locale").to_string());
+    }
     rust_i18n::set_locale(&locale);
     {
         let mut s = store.write().await;
         s.set_locale(locale.clone());
     }
-    // **P3-4 fix**：path_clone + persist_to_path 提前 drop read guard
-    let path = store.read().await.data_path_clone();
-    if let Some(p) = path {
-        if let Err(e) = store.read().await.persist_to_path(&p) {
-            tracing::error!("set_app_locale persist failed: {}", e);
-            let _ = app.emit("usticky://persist-failed", e.to_string());
-        }
-    }
+    // **P1-2 fix**：走 persist_only helper，无 RwLock 跨 I/O。
+    persist_only(&app, store.inner()).await;
     let _ = app.emit("usticky://locale-changed", locale);
     Ok(())
 }
@@ -365,21 +442,15 @@ pub async fn set_pin_mode_core(
     store: &SharedStore,
     mode: &str,
 ) -> Result<(), String> {
-    let parsed = PinMode::from_str_opt(mode)
-                .ok_or_else(|| format!("invalid pin mode: {}", mode))?;
+    let parsed =
+        PinMode::from_str_opt(mode).ok_or_else(|| format!("invalid pin mode: {}", mode))?;
     apply_pin_mode_to_window(app, parsed);
     {
         let mut s = store.write().await;
         s.set_pin_mode(parsed);
     }
-    // **P3-4 fix**：path_clone + persist_to_path
-    let path = store.read().await.data_path_clone();
-    if let Some(p) = path {
-        if let Err(e) = store.read().await.persist_to_path(&p) {
-            tracing::error!("persist failed: {}", e);
-            let _ = app.emit("usticky://persist-failed", e.to_string());
-        }
-    }
+    // **P1-2 fix**：走 persist_only helper，无 RwLock 跨 I/O。
+    persist_only(app, store).await;
     let _ = app.emit("usticky://pin-mode-changed", mode);
     Ok(())
 }
@@ -431,25 +502,50 @@ pub async fn set_quick_add_shortcut(
     store: State<'_, SharedStore>,
     accelerator: String,
 ) -> Result<(), String> {
-    // 1. 校验：能 parse 才放行
-    crate::parse_shortcut(&accelerator)
-        .map_err(|e| format!("invalid shortcut: {e}"))?;
-    // 2. 写 store + persist
+    // 1. parse + **P1-5 fix**：modifier 必需。裸键（"F12"、"Space"）会被 OS
+    //    直接吞掉或抢走其它 app 的焦点输入 —— 强制要求 CONTROL/ALT/META/SUPER
+    //    至少一个。后端再校验一遍，防止前端 UI 没拦截（中间人篡改 IPC、未来
+    //    加新入口忘记前端校验）。
+    let parsed =
+        crate::parse_shortcut(&accelerator).map_err(|e| format!("invalid shortcut: {e}"))?;
+    use tauri_plugin_global_shortcut::Modifiers as Mods;
+    let has_modifier = parsed
+        .mods
+        .intersects(Mods::CONTROL | Mods::ALT | Mods::META | Mods::SUPER);
+    if !has_modifier {
+        return Err(rust_i18n::t!("commands.error.shortcut_no_modifier").to_string());
+    }
+
+    // 2. **P1-4 fix**：snapshot 旧 accelerator —— persist 失败时回滚 in-memory
+    //    + 不重新注册 OS 级快捷键，让用户保留旧可用快捷键。
+    let previous = store.read().await.quick_add_shortcut();
     {
         let mut s = store.write().await;
         s.set_quick_add_shortcut(accelerator.clone());
     }
-    // **P3-4 fix**：path_clone + persist_to_path
-    let path = store.read().await.data_path_clone();
+
+    // 3. **P1-2 fix**：裸 persist_only helper，零 RwLock 跨 I/O。
+    let (path, data) = {
+        let s = store.read().await;
+        (s.data_path_clone(), s.data_clone())
+    };
     if let Some(p) = path {
-        if let Err(e) = store.read().await.persist_to_path(&p) {
-            tracing::error!("persist failed: {}", e);
+        if let Err(e) = crate::todo::persist_to_disk(&p, &data) {
+            tracing::error!("set_quick_add_shortcut persist failed: {}", e);
+            // 回滚 in-memory state 到 previous
+            store.write().await.set_quick_add_shortcut(previous.clone());
             let _ = app.emit("usticky://persist-failed", e.to_string());
+            // 不重新注册 —— store 还是 previous，OS 绑定也没动，行为一致
+            return Err(format!("persist failed: {e}"));
         }
     }
-    // 3. 重新注册（unregister_all + on_shortcut）
-    crate::register_quick_add_shortcut(&app, store.inner());
-    // 4. emit 同步给前端 / tray
+
+    // 4. **P1-3 fix**：传 previous 给 register_quick_add_shortcut 作为回退，
+    //    它的内部"parse → unregister_all → on_shortcut"流程在 on_shortcut
+    //    失败时 best-effort 用同一 handler 装回 previous。
+    crate::register_quick_add_shortcut(&app, store.inner(), Some(&previous));
+
+    // 5. emit 同步给前端 / tray
     let _ = app.emit("usticky://shortcut-changed", accelerator);
     Ok(())
 }
