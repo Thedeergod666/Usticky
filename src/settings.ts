@@ -61,7 +61,12 @@ function escapeHtml(s: string): string {
 /// （浮窗 input hint 也要用，避免每个 webview 都 invoke 一次后端）。
 function formatShortcutForDisplay(s: string): string {
   const isMac = /mac/i.test(navigator.platform);
-  if (!isMac) return s;
+  if (!isMac) {
+    // P2-13 fix: non-Mac 显示 "Ctrl+..." 而非字面 "Cmd+..."
+    return s.replace(/\bCmd\b/g, "Ctrl")
+             .replace(/\bCommand\b/g, "Ctrl")
+             .replace(/\bSuper\b/g, "Ctrl");
+  }
   const parts = s.split("+").map((p) => p.trim());
   let out = "";
   for (const p of parts) {
@@ -171,8 +176,8 @@ function render(): void {
         <div class="row">
           <div class="row-label">${escapeHtml(t("settings.language.label"))}</div>
           <div class="segmented" data-locale>
-            <button data-locale-value="en">English</button>
-            <button data-locale-value="zh-CN">中文</button>
+            <button data-locale-value="en">${escapeHtml(t("settings.language.option_en"))}</button>
+            <button data-locale-value="zh-CN">${escapeHtml(t("settings.language.option_zh-CN"))}</button>
           </div>
         </div>
       </div>
@@ -215,6 +220,20 @@ function render(): void {
 
   refreshPinSegmented();
   refreshLocaleSegmented();
+
+  // P2-17 fix: locale 切换触发 render() 后 .shortcut-btn 被替换。
+  // 若用户当时在 recording，新按钮丢了 .recording class + label。
+  // 这里按模块级 recording 标志重新挂上。
+  if (recording) {
+    const btn = root.querySelector<HTMLElement>(".shortcut-btn");
+    const hint = root.querySelector<HTMLElement>("[data-shortcut-hint]");
+    if (btn) {
+      btn.classList.add("recording");
+      btn.textContent = t("settings.shortcut.recording");
+      btn.addEventListener("blur", () => setRecording(false), { once: true });
+    }
+    if (hint) hint.textContent = t("settings.shortcut.cancel_hint");
+  }
 }
 
 function refreshPinSegmented(): void {
@@ -231,10 +250,12 @@ function refreshLocaleSegmented(): void {
 
 // ── 事件代理 ──
 root.addEventListener("click", async (e) => {
+  // P2-14 fix: 忽略中键 / 右键（macOS 触控板手势 + contextmenu 用的）
+  if (e.button !== 0) return;
   const target = e.target as HTMLElement;
 
-  // pin mode
-  const pinBtn = target.closest<HTMLElement>("[data-pin-value]");
+  // pin mode (P2-15 fix: scope by [data-pin] container)
+  const pinBtn = target.closest<HTMLElement>("[data-pin] [data-pin-value]");
   if (pinBtn) {
     const newMode = pinBtn.dataset.pinValue as PinMode | undefined;
     if (newMode && newMode !== currentPinMode) {
@@ -249,8 +270,8 @@ root.addEventListener("click", async (e) => {
     return;
   }
 
-  // locale
-  const localeBtn = target.closest<HTMLElement>("[data-locale-value]");
+  // locale (P2-15 fix: scope by [data-locale] container)
+  const localeBtn = target.closest<HTMLElement>("[data-locale] [data-locale-value]");
   if (localeBtn) {
     const newLocale = localeBtn.dataset.localeValue as Locale | undefined;
     if (newLocale && newLocale !== currentLocale) {
@@ -317,6 +338,9 @@ function setRecording(on: boolean): void {
       // 10s 超时自动退出 recording —— 防"用户点了录入后走开"
       // 把整页键盘 capture 一直拦截，10s 内没操作就当放弃。
       recordingTimer = setTimeout(() => setRecording(false), 10_000);
+      // P1-12 fix: button blur → 退出 recording。
+      // 旧版只能等 10s timer 或 Esc；用户 tab 出去就锁死键盘 capture。
+      btn.addEventListener("blur", () => setRecording(false), { once: true });
     } else {
       btn.classList.remove("recording");
       btn.textContent = formatShortcutForDisplay(currentShortcut);
@@ -353,14 +377,33 @@ document.addEventListener("keydown", async (e) => {
 
 // ── 启动 ──
 async function init(): Promise<void> {
+  // Hoist unlisten handles so beforeunload can clean up regardless of when
+  // listen() callbacks resolve (P2-19 fix).
+  let unlistenLocaleEvt: UnlistenFn | null = null;
+  let unlistenPin: UnlistenFn | null = null;
+  let unlistenShortcut: UnlistenFn | null = null;
+
+  // P2-19 fix: 尽早注册 beforeunload —— 旧版放在 render() + listen() 之后，
+  // 初始化过程中点 X 关闭窗口，listener 还没绑定、也未注册清理 → Vite HMR
+  // 期间 listener 累积。
+  window.addEventListener("beforeunload", () => {
+    unlistenLocaleEvt?.();
+    unlistenPin?.();
+    unlistenShortcut?.();
+  });
+
   await initLocale();
   currentLocale = getLocale() as Locale;
+
+  // P1-11 fix: invoke 失败要给用户提示（不要静默回退到硬编码默认值）。
+  let loadFailed = false;
 
   // 拉 pin mode
   try {
     currentPinMode = await invoke<PinMode>("get_pin_mode");
   } catch (e) {
     console.error("[usticky] get_pin_mode failed", e);
+    loadFailed = true;
   }
 
   // 拉 quick-add 快捷键
@@ -368,6 +411,7 @@ async function init(): Promise<void> {
     currentShortcut = await invoke<string>("get_quick_add_shortcut");
   } catch (e) {
     console.error("[usticky] get_quick_add_shortcut failed", e);
+    loadFailed = true;
   }
 
   // 拉 app 版本
@@ -377,27 +421,35 @@ async function init(): Promise<void> {
     console.debug("[usticky] getVersion failed, using default", e);
   }
 
+  if (loadFailed) {
+    flash(t("settings.error.load_failed"));
+  }
+
   render();
 
-  // locale 切换：re-render（pin mode 按钮 / 标题等 i18n 文案要更新）
+  // P1-10 fix: 不再单独 onLocaleChange 触发 render。
+  // Tauri listener 调 setLocale → 内部 onLocaleChange 已触发 render。
+  // 旧逻辑双重 render → 切档瞬间 active class 与 dict 错位闪烁。
   onLocaleChange((newLocale) => {
     currentLocale = newLocale as Locale;
-    render();
   });
 
   // 监听后端 locale-changed（来自 tray 菜单 / 浮窗的切换）
-  let unlistenLocaleEvt: UnlistenFn | null = null;
   listen<string>("usticky://locale-changed", async (e) => {
     const newLocale = e.payload;
     if (newLocale === "en" || newLocale === "zh-CN") {
-      if (newLocale !== getLocale()) await setLocale(newLocale);
+      // P2-18 fix: 始终 setLocale（不再 gate 在 getLocale() 上）。
+      // 后端是真相来源 —— getLocale() 缓存在 HMR/重建后可能滞后，
+      // 跳过 setLocale 会让 i18n state 跟 backend 不一致。
+      await setLocale(newLocale);
     }
   })
     .then((fn) => (unlistenLocaleEvt = fn))
     .catch((e) => console.error("[usticky] listen locale-changed failed", e));
 
   // 监听后端 pin-mode-changed（来自浮窗 foot 的切换）
-  let unlistenPin: UnlistenFn | null = null;
+  // P3-10 note: pin mode 不影响 document.title —— 如果未来 title 加上 pin 状态指示，
+  // 这里需要 refresh document.title（跟 onLocaleChange 一样）。
   listen<PinMode>("usticky://pin-mode-changed", (e) => {
     if (e.payload !== currentPinMode) {
       currentPinMode = e.payload;
@@ -408,7 +460,6 @@ async function init(): Promise<void> {
     .catch((e) => console.error("[usticky] listen pin-mode-changed failed", e));
 
   // 监听后端 shortcut-changed（来自 tray 子菜单 / 其他 webview 改快捷键）
-  let unlistenShortcut: UnlistenFn | null = null;
   listen<string>("usticky://shortcut-changed", (e) => {
     if (e.payload !== currentShortcut) {
       currentShortcut = e.payload;
@@ -422,11 +473,10 @@ async function init(): Promise<void> {
     .then((fn) => (unlistenShortcut = fn))
     .catch((e) => console.error("[usticky] listen shortcut-changed failed", e));
 
-  window.addEventListener("beforeunload", () => {
-    unlistenLocaleEvt?.();
-    unlistenPin?.();
-    unlistenShortcut?.();
-  });
+  // P3-11 note: settings 窗口由 commands::open_settings_window 动态创建，
+  // 关闭时由 Tauri 默认 destroy。webview destroy 自动触发 beforeunload，
+  // 上面的 listener 会清理 unlisten fn。
+  // 如果未来改成 prevent_close + hide，需要重写为 WindowEvent::CloseRequested handler。
 }
 
 init();

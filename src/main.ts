@@ -19,6 +19,12 @@ import Sortable from "sortablejs";
 import { t, initLocale, onLocaleChange, setLocale, getLocale } from "./i18n";
 import "./styles.css";
 
+// **P2-11 fix**：区分 Esc 来源。
+//   - 用户通过全局快捷键 / tray 唤起 quick-add → 浮窗本身就是"来加任务的"
+//   - 这种情况下 Esc 直接收浮窗；其它场景下 Esc 仅 blur input，保留窗口
+let isQuickAddActive = false;
+
+
 // ── 数据模型 ──
 type TodoStatus = "pending" | "done";
 type TodoPriority = "P0" | "P1" | "P2" | "P3";
@@ -459,6 +465,9 @@ function buildTodoRow(todo: Todo): HTMLElement {
 
   const copyBtn = document.createElement("button");
   copyBtn.className = "todo-copy";
+  // **P3-5 fix**：aria-label 让屏幕阅读器可读。SVG 内部去掉了
+  // aria-hidden（见 COPY_ICON_SVG 定义），让父按钮的 aria-label 生效。
+  copyBtn.setAttribute("aria-label", t("app.action.copy"));
   copyBtn.innerHTML = COPY_ICON_SVG;
   copyBtn.title = t("app.action.copy");
   copyBtn.addEventListener("click", (e) => {
@@ -469,6 +478,7 @@ function buildTodoRow(todo: Todo): HTMLElement {
 
   const del = document.createElement("button");
   del.className = "todo-delete";
+  del.setAttribute("aria-label", t("app.action.delete"));
   del.textContent = "×";
   del.title = t("app.action.delete");
   del.addEventListener("click", (e) => {
@@ -624,12 +634,19 @@ function unhoverCard(card: HTMLElement) {
 //   2. invoke set_cursor_pointer → macOS 端 NSCursor 切手型/箭头
 //      （Win 上悬停窗口自收 WM_SETCURSOR，CSS cursor 本就生效，no-op）
 let btnHoveredEl: HTMLElement | null = null;
+let lastPointerState: boolean | null = null;
 function setBtnHover(el: HTMLElement | null) {
   if (btnHoveredEl === el) return;
+  // **P3-6 fix**：invoke 频率限制 —— 同一 pointer 状态 (true/false) 短时间
+  // 内反复进入会重复发 IPC（hover-pos 命中测试一次 miss 紧接着又 hit）。
+  // lastPointerState 缓存布尔值，相等就短路 invoke 那一段。
+  const nextState = !!el;
   btnHoveredEl?.classList.remove("btn-hover");
   btnHoveredEl = el;
   el?.classList.add("btn-hover");
-  invoke("set_cursor_pointer", { pointer: !!el }).catch((e) =>
+  if (nextState === lastPointerState) return;
+  lastPointerState = nextState;
+  invoke("set_cursor_pointer", { pointer: nextState }).catch((e) =>
     console.debug("[usticky] set_cursor_pointer failed", e),
   );
 }
@@ -666,21 +683,33 @@ async function resizeWindowToContent(appEl: HTMLElement) {
 }
 
 // ── 操作 ──
-async function addTodo(title: string) {
+async function addTodo(title: string): Promise<boolean> {
   const trimmed = title.trim();
   if (!trimmed) {
     showMiniFlash(t("app.error.empty_title"));
-    return;
+    return false;
   }
   if (trimmed.length > 280) {
     showMiniFlash(t("app.error.too_long", { max: 280 }));
-    return;
+    return false;
   }
   try {
     await invoke("add_todo", { title: trimmed });
+    return true;
   } catch (e) {
     console.error("[usticky] add_todo failed", e);
     showMiniFlash(t("app.error.save_failed"));
+    return false;
+  }
+}
+
+/// 拉后端真相 —— 用于排序失败 / 跨 webview 漂移时回填 DOM。
+async function getTodos(): Promise<TodoSnapshot | null> {
+  try {
+    return await invoke<TodoSnapshot>("get_todos");
+  } catch (e) {
+    console.error("[usticky] get_todos failed", e);
+    return null;
   }
 }
 
@@ -731,7 +760,7 @@ async function toggleDone(todo: Todo) {
 // ── 复制按钮 ──
 /// 复制图标（两个叠放的圆角矩形，feather "copy" 风格），currentColor
 /// 跟随按钮文字色，跟 .todo-delete 的 "×" 一样是 inline 图标。
-const COPY_ICON_SVG = `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.2" y="4.2" width="6.8" height="6.8" rx="1.4"/><path d="M7.8 4.2V2.6A1.6 1.6 0 0 0 6.2 1H2.6A1.6 1.6 0 0 0 1 2.6v3.6a1.6 1.6 0 0 0 1.6 1.6h1.6"/></svg>`;
+const COPY_ICON_SVG = `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"><rect x="4.2" y="4.2" width="6.8" height="6.8" rx="1.4"/><path d="M7.8 4.2V2.6A1.6 1.6 0 0 0 6.2 1H2.6A1.6 1.6 0 0 0 1 2.6v3.6a1.6 1.6 0 0 0 1.6 1.6h1.6"/></svg>`;
 
 async function copyTodoText(todo: Todo) {
   try {
@@ -744,6 +773,7 @@ async function copyTodoText(todo: Todo) {
   // 兜底：隐藏 textarea + execCommand（未聚焦 webview / clipboard 权限受限时）
   try {
     const ta = document.createElement("textarea");
+
     ta.value = todo.title;
     ta.style.position = "fixed";
     ta.style.opacity = "0";
@@ -831,6 +861,12 @@ async function handleDragEnd(evt: Sortable.SortableEvent) {
     // onEnd 完 dragEl 可能还没被清除"的窗口期）。
   } catch (e) {
     console.error("[usticky] reorder_todos failed", e);
+    // **P2-10 fix**：SortableJS 已经把 DOM 搬到乐观位置，但 IPC 失败
+    // → 本地 DOM 跟后端持久化顺序对不上。重新拉一次后端真相覆盖本地
+    // mutation，并提示用户。
+    const fresh = await getTodos();
+    if (fresh) render(fresh);
+    showMiniFlash(t("app.error.reorder_failed"));
   }
 }
 
@@ -1521,6 +1557,9 @@ async function init() {
     // 即便 input 不在（极端情况下空 todo-list 渲染前 emit），仍激活视觉，
     // 让浮窗先用全强度显示
     setActive();
+    // **P2-11 fix**：标记"quick-add 模式"激活，让 Esc 走 hide 路径
+    // （而不是仅 blur input —— 用户预期按 Esc 把刚唤起的浮窗收回去）。
+    isQuickAddActive = true;
   })
     .then((fn) => (unlistenQuickAdd = fn))
     .catch((e) => console.error("[usticky] listen quick-add failed", e));
@@ -1535,8 +1574,18 @@ async function init() {
     todoInputEl.addEventListener("blur", () => {
       // 只在没 hover 时清 active —— 有 hover 的话视觉强度靠 data-hover
       if (document.body.dataset.hover !== "1") clearActive();
+      // **P2-11 fix**：用户离开输入 → 撤销 quick-add 标记，避免下一次
+      // （例如用户手动打开浮窗）按 Esc 被错误地 hide。
+      isQuickAddActive = false;
     });
   }
+  // **P2-11 fix**：用户切走（macOS hide / minimize）→ 撤销 quick-add 标记
+  // 防止 Esc 后续误触 hide。
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      isQuickAddActive = false;
+    }
+  });
   // 鼠标进入 → 跟 onBodyMouseEnter 同样语义但额外 clearActive。
   // **P2-8 fix**：原版用匿名函数 addEventListener，beforeunload removeEventListener
   // 找不到引用，listener 残留。提到具名函数 onBodyMouseEnterActive。
@@ -1552,14 +1601,6 @@ async function init() {
   }
   document.body.removeEventListener("mouseenter", onBodyMouseEnter);
   document.body.addEventListener("mouseenter", onBodyMouseEnterActive);
-
-  // ── 全局 Cmd+Z 撤销：v0.2 实现，先占位 ──
-  document.addEventListener("keydown", (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "z") {
-      // TODO: undo last action
-      console.debug("[usticky] undo 暂未实现");
-    }
-  });
 
   // ── 事件代理：empty state CTA / due label click ──
   app.addEventListener("click", async (e) => {
@@ -1695,13 +1736,27 @@ function ensureInputBar() {
         showMiniFlash(t("app.error.too_long", { max: 280 }));
         return;
       }
-      input.value = "";
-      await addTodo(trimmed);
+      // **P1-9 fix**：addTodo 失败时回填 input.value，保留用户输入。
+      // addTodo 自身已包含持久化 + 失败 mini-flash。返回值: true=成功
+      // 提交并清空，false=失败并保留 input 内容。
+      const ok = await addTodo(trimmed);
+      if (ok) {
+        input.value = "";
+      } else {
+        input.value = v;
+      }
     } else if (e.key === "Escape") {
-      input.blur();
-      // 走 hide_floating_window 命令 —— 跟 quick-add 状态联动：
-      // 若浮窗是 quick-add 唤起的，hide 时要还原 level + 切回原 app
-      invoke("hide_floating_window").catch((e) => console.error("[usticky] hide_floating_window failed", e));
+      // **P2-11 fix**：区分 Esc 来源。
+      //   - quick-add 模式：Esc 直接收浮窗（用户预期"刚唤起又能收起"）
+      //   - 其它场景：仅 blur input，保留窗口显示
+      if (isQuickAddActive) {
+        isQuickAddActive = false;
+        invoke("hide_floating_window").catch((e) =>
+          console.error("[usticky] hide_floating_window failed", e),
+        );
+      } else {
+        input.blur();
+      }
     }
   });
 }
