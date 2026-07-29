@@ -93,18 +93,60 @@ static FORCE_HOVER_EMIT_ONCE: AtomicBool = AtomicBool::new(false);
 /// 因为前端的 iOS 26 玻璃 hover 效果需要它，不分 pin mode。
 static LEVEL_SWITCHING_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// **P1-6 fix**：hover emitter 主循环里 `last_inside` 的对外可读镜像。
+///
+/// 用法：`set_window_pin_bottom` 在切 pin mode 前采样这个值，判断鼠标
+/// 当前是否在浮窗内。是的话走 deferred BELOW_NORMAL 路径，避免 main thread
+/// dispatch 队列按 [LOWER, RAISE] 顺序处理造成的 BELOW_NORMAL→FLOATING
+/// 闪一下。每当 emitter 主循环更新 `last_inside`（初始 / dispatch_failed
+/// 兜底 / adopt 路径），都同步更新本原子。
+static LAST_INSIDE: AtomicBool = AtomicBool::new(false);
+
 // ── 公开 API ──
 
 /// PinBottom 模式启动时调：把 level 切到 below-normal，并开启 hover 切 level。
 /// tracker 已由 [`start_hover_emitter`] 在 app 启动时拉起，这里只翻开关。
 pub fn set_window_pin_bottom<R: Runtime>(app: &AppHandle<R>) {
-    set_window_level(app, LEVEL_BELOW_NORMAL, false); // 不失焦隐藏，hover 临时置顶
     LEVEL_SWITCHING_ACTIVE.store(true, Ordering::SeqCst);
     // **P2-5 fix**：强制 emitter 下一 tick 重新评估 hover 状态。
     // 详见 FORCE_HOVER_EMIT_ONCE 注释 —— 切 pin mode 时如果鼠标已在
     // 浮窗内，last_inside=true 会让下一 tick 走 inside == last_inside
     // 短路，level 永远停在 -1。
     FORCE_HOVER_EMIT_ONCE.store(true, Ordering::SeqCst);
+
+    // **P1-6 fix**：切 PinBottom 时如果鼠标当前在浮窗内（emitter 上次
+    // 观测到的 last_inside==true），把 BELOW_NORMAL 推后 ~50ms，让 emitter
+    // 有机会先 re-raise 到 FLOATING。否则按现在的 race：
+    //   T+0   本函数把 set_window_level(BELOW_NORMAL) 排队 + FORCE_HOVER_EMIT_ONCE=true
+    //   T+30  main thread 跑 BELOW_NORMAL → 浮窗降到 -1
+    //   T+50  emitter tick 看到 force_emit，re-raise 到 FLOATING → 再排队
+    //   T+80  main thread 跑 FLOATING
+    // 主线程 dispatch queue 处理 [LOWER, RAISE]，浮窗可见地闪一下
+    // BELOW_NORMAL→FLOATING。
+    //
+    // 推后到下一 emitter tick 之后再 LOWER（且仅当鼠标已离开时），让
+    // main thread 序列变成 [RAISE, LOWER]（鼠标还在）或
+    // [LOWER, RAISE→LOWER]（鼠标已离开）—— 至少切到 PinBottom 时不会闪。
+    //
+    // 用 std::thread::spawn + sleep 模拟 dispatch_after —— 不引新 dep。
+    // 主线程 dispatch 队列是 FIFO，spawn 出来的线程 sleep 后再调用
+    // run_on_main_thread，自然排在 emitter tick 排的 RAISE 之后。
+    if TRACKER_RUNNING.load(Ordering::SeqCst) && LAST_INSIDE.load(Ordering::SeqCst) {
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            // 再次确认：50ms 期间鼠标可能已经移出浮窗，emitter 会把
+            // LAST_INSIDE 翻成 false。如果鼠标已经离开，正常 LOWER。
+            // 如果还在浮窗内（emitter 已 re-raise 到 FLOATING），跳过 LOWER
+            // 让 emitter 继续维持 FLOATING，避免把它再打回去。
+            if !LAST_INSIDE.load(Ordering::SeqCst) {
+                set_window_level(&app2, LEVEL_BELOW_NORMAL, false);
+            }
+        });
+    } else {
+        set_window_level(app, LEVEL_BELOW_NORMAL, false);
+    }
+
     start_hover_emitter(app.clone());
 }
 
@@ -305,168 +347,188 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
             // 注：catch_unwind 在 panic="abort" profile 下不会生效（abort 优先），
             // 那时本来就会杀进程，所以这是 debug profile 的专属防御。
             let result = catch_unwind(AssertUnwindSafe(|| {
-            tracing::debug!("hover emitter 启动");
-            let mut last_inside = false;
-            // dwell-time hysteresis（沿用 Musage 2026-07-03 fix）：
-            // - **enter**：inside=true 必须连续 ≥3 个 tick（150ms）才采纳，
-            //   抖动短脉冲被吞。
-            // - **exit**：inside=false 必须连续 ≥2 个 tick（100ms）才采纳，略快
-            //   因为用户离开时希望玻璃及时撤销（vs enter 多 1 tick 防误触发）。
-            // - **enter→exit 切换瞬间 reset 计数器**：避免在过渡中误累计。
-            let mut pending_ticks: u8 = 0;
-            let mut pending_value = false;
+                tracing::debug!("hover emitter 启动");
+                // **P1-6 fix**：把 local last_inside 镜像到全局原子，让
+                // set_window_pin_bottom 在切 pin mode 时能读到 hover 状态。
+                LAST_INSIDE.store(false, Ordering::SeqCst);
+                let mut last_inside = false;
+                // dwell-time hysteresis（沿用 Musage 2026-07-03 fix）：
+                // - **enter**：inside=true 必须连续 ≥3 个 tick（150ms）才采纳，
+                //   抖动短脉冲被吞。
+                // - **exit**：inside=false 必须连续 ≥2 个 tick（100ms）才采纳，略快
+                //   因为用户离开时希望玻璃及时撤销（vs enter 多 1 tick 防误触发）。
+                // - **enter→exit 切换瞬间 reset 计数器**：避免在过渡中误累计。
+                let mut pending_ticks: u8 = 0;
+                let mut pending_value = false;
 
-            // **2026-07-03 fix（玻璃 2 秒后丢失问题）**：
-            //
-            // Usticky v0.1 默认强玻璃（alpha 0.82 + blur 28px always-on），
-            // 持续 GPU 高负载。macOS 合成层持续重排 → main thread 持续忙
-            // → `is_floating_topmost_at` 的 `run_on_main_thread` 50ms 超时
-            // → 持续返 false → "假 exit" → 浮窗玻璃持续 1.5~3 秒丢失。
-            //
-            // 修复策略：dispatch timeout / 失败时**不立刻采纳 false**，
-            // 保留 last_inside。只有当连续 **3 个 tick（150ms）** 都是
-            // timeout/失败 才兜底采纳 false。这给 main thread "喘息窗口"，
-            // GPU 忙的 1.5~3 秒窗口期不会被假 exit 误触。
-            //
-            // 为什么 enter 阈值不增加（仍是 1 tick）：
-            // - 用户期望"短 hover 也要触发置顶"（2026-07-06 fix 调优过）
-            // - 进入浮窗时 GPU 不会突然忙起来（idle 状态低负载），dispatch
-            //   几乎一定能 < 50ms 拿到结果，timeout 极少见
-            // - 真要 enter timeout 多半是窗口未上屏等真异常，保留即采纳的
-            //   语义错误代价低（晚一个 tick 进入）
-            //
-            // 为什么 fix 在 hover emitter 而不是 is_floating_topmost_at：
-            // 改 is_floating_topmost_at 返"未知"会让调用方复杂化；改 emitter
-            // 状态机是最小改动，跟现有 dwell-time hysteresis 协同工作。
-            let mut consecutive_dispatch_failures: u8 = 0;
-            const DISPATCH_FAILURE_THRESHOLD: u8 = 3; // 3 × 50ms = 150ms
+                // **2026-07-03 fix（玻璃 2 秒后丢失问题）**：
+                //
+                // Usticky v0.1 默认强玻璃（alpha 0.82 + blur 28px always-on），
+                // 持续 GPU 高负载。macOS 合成层持续重排 → main thread 持续忙
+                // → `is_floating_topmost_at` 的 `run_on_main_thread` 50ms 超时
+                // → 持续返 false → "假 exit" → 浮窗玻璃持续 1.5~3 秒丢失。
+                //
+                // 修复策略：dispatch timeout / 失败时**不立刻采纳 false**，
+                // 保留 last_inside。只有当连续 **3 个 tick（150ms）** 都是
+                // timeout/失败 才兜底采纳 false。这给 main thread "喘息窗口"，
+                // GPU 忙的 1.5~3 秒窗口期不会被假 exit 误触。
+                //
+                // 为什么 enter 阈值不增加（仍是 1 tick）：
+                // - 用户期望"短 hover 也要触发置顶"（2026-07-06 fix 调优过）
+                // - 进入浮窗时 GPU 不会突然忙起来（idle 状态低负载），dispatch
+                //   几乎一定能 < 50ms 拿到结果，timeout 极少见
+                // - 真要 enter timeout 多半是窗口未上屏等真异常，保留即采纳的
+                //   语义错误代价低（晚一个 tick 进入）
+                //
+                // 为什么 fix 在 hover emitter 而不是 is_floating_topmost_at：
+                // 改 is_floating_topmost_at 返"未知"会让调用方复杂化；改 emitter
+                // 状态机是最小改动，跟现有 dwell-time hysteresis 协同工作。
+                let mut consecutive_dispatch_failures: u8 = 0;
+                const DISPATCH_FAILURE_THRESHOLD: u8 = 3; // 3 × 50ms = 150ms
 
-            loop {
-                thread::sleep(Duration::from_millis(50));
+                loop {
+                    thread::sleep(Duration::from_millis(50));
 
-                let mouse = NSEvent::mouseLocation();
+                    let mouse = NSEvent::mouseLocation();
 
-                // **P2-5 fix**：检查强制 emit flag。pin mode 切换后置 true，
-                // 我们重置 pending_ticks 并让当前 tick 跳过 inside == last_inside
-                // 短路 → 真实 inside 状态穿透 emit + level 切换。
-                let force_emit = FORCE_HOVER_EMIT_ONCE.swap(false, Ordering::SeqCst);
-                if force_emit {
-                    pending_ticks = 0;
-                    pending_value = false;
-                    tracing::debug!("FORCE_HOVER_EMIT_ONCE: 强制下一 tick 重新评估 hover 状态");
-                }
+                    // **P2-5 fix**：检查强制 emit flag。pin mode 切换后置 true，
+                    // 我们重置 pending_ticks 并让当前 tick 跳过 inside == last_inside
+                    // 短路 → 真实 inside 状态穿透 emit + level 切换。
+                    let force_emit = FORCE_HOVER_EMIT_ONCE.swap(false, Ordering::SeqCst);
+                    if force_emit {
+                        pending_ticks = 0;
+                        pending_value = false;
+                        tracing::debug!("FORCE_HOVER_EMIT_ONCE: 强制下一 tick 重新评估 hover 状态");
+                    }
 
-                // 关键：用 NSWindow.windowNumberAtPoint 做命中测试 ——
-                // 不光检查"鼠标在不在浮窗 frame 内"，还要确认浮窗在该点是**最上层**。
-                // **2026-07-03 fix**：当 inside=false 但**已知上次 inside=true 且
-                // 当前是 dispatch 失败**，保守认为"可能还在浮窗里" → 不采纳 false。
-                // 用 inside_unreliable 替代直接 inside 走下面的状态机。
-                let (inside, dispatch_failed, frame) = is_floating_topmost_at_with_status(&app, mouse);
+                    // 关键：用 NSWindow.windowNumberAtPoint 做命中测试 ——
+                    // 不光检查"鼠标在不在浮窗 frame 内"，还要确认浮窗在该点是**最上层**。
+                    // **2026-07-03 fix**：当 inside=false 但**已知上次 inside=true 且
+                    // 当前是 dispatch 失败**，保守认为"可能还在浮窗里" → 不采纳 false。
+                    // 用 inside_unreliable 替代直接 inside 走下面的状态机。
+                    let (inside, dispatch_failed, frame) =
+                        is_floating_topmost_at_with_status(&app, mouse);
 
-                // dispatch 失败时（main thread 忙 / 窗口未上屏 / MainThreadMarker 不可用），
-                // 走"未知"路径：保留 last_inside，不更新 pending_value
-                if dispatch_failed {
-                    consecutive_dispatch_failures =
-                        consecutive_dispatch_failures.saturating_add(1);
-                    if consecutive_dispatch_failures >= DISPATCH_FAILURE_THRESHOLD {
-                        // 连续 3 tick dispatch 都失败（150ms）→ 兜底采纳 false
-                        // （跟 EXIT_THRESHOLD 一致，避免阈值碎裂）
-                        if last_inside {
-                            last_inside = false;
-                            pending_ticks = 0;
-                            pending_value = false;
-                            if let Err(e) = app.emit("usticky://floating-hover", false) {
-                                tracing::trace!(error = %e, "emit hover 失败");
-                            }
-                            if LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst) {
-                                set_window_level(&app, LEVEL_BELOW_NORMAL, false);
-                            }
-                            tracing::debug!(
+                    // dispatch 失败时（main thread 忙 / 窗口未上屏 / MainThreadMarker 不可用），
+                    // 走"未知"路径：保留 last_inside，不更新 pending_value
+                    if dispatch_failed {
+                        consecutive_dispatch_failures =
+                            consecutive_dispatch_failures.saturating_add(1);
+                        if consecutive_dispatch_failures >= DISPATCH_FAILURE_THRESHOLD {
+                            // 连续 3 tick dispatch 都失败（150ms）→ 兜底采纳 false
+                            // （跟 EXIT_THRESHOLD 一致，避免阈值碎裂）
+                            if last_inside {
+                                last_inside = false;
+                                // **P1-6 fix**：镜像到全局原子。
+                                LAST_INSIDE.store(false, Ordering::SeqCst);
+                                pending_ticks = 0;
+                                pending_value = false;
+                                if let Err(e) = app.emit("usticky://floating-hover", false) {
+                                    tracing::trace!(error = %e, "emit hover 失败");
+                                }
+                                // **P2-4 fix**：不在 dispatch_failed 兜底里主动
+                                // queue BELOW_NORMAL。旧实现会导致 main thread
+                                // dispatch 序列出现 [LOWER, RAISE]：
+                                //   T0   dispatch_failed → 队列加 LOWER
+                                //   T+50 下一 tick dispatch 成功，inside 仍 true → 队列加 RAISE
+                                // 主线程跑 LOWER→RAISE，浮窗闪一下。
+                                //
+                                // 现在不主动切 level —— 下一成功 tick 会基于真实
+                                // inside 状态走正常的 edge-trigger 路径去切 level
+                                // （inside=true → RAISE，inside=false → LOWER）。
+                                // 兜底期间 level 保持上一次成功的状态，肉眼看就是
+                                // 短暂"维持"（最多 ~150ms = 3 tick × 50ms）。
+                                tracing::debug!(
                                 "dispatch 连续失败 {} 次，兜底采纳 false（防永久卡 hover=true）",
                                 DISPATCH_FAILURE_THRESHOLD
                             );
+                            }
                         }
+                        // dispatch 失败期间**不 emit hover-pos**（坐标可能 stale，且
+                        // 不希望前端在错误状态下继续切 .todo-card hover）
+                        continue;
                     }
-                    // dispatch 失败期间**不 emit hover-pos**（坐标可能 stale，且
-                    // 不希望前端在错误状态下继续切 .todo-card hover）
-                    continue;
-                }
 
-                consecutive_dispatch_failures = 0; // 重置失败计数
+                    consecutive_dispatch_failures = 0; // 重置失败计数
 
-                // **P2-5 fix**：force_emit 时跳过 inside == last_inside 短路，
-                // 让本 tick 真实状态穿透 emit + level 切换。一性次，下一 tick
-                // last_inside 已经同步回真实值，状态机恢复正常。
-                if inside == last_inside && !force_emit {
+                    // **P2-5 fix**：force_emit 时跳过 inside == last_inside 短路，
+                    // 让本 tick 真实状态穿透 emit + level 切换。一性次，下一 tick
+                    // last_inside 已经同步回真实值，状态机恢复正常。
+                    if inside == last_inside && !force_emit {
+                        pending_ticks = 0;
+                        // inside 没变（持续在浮窗内 or 持续在浮窗外），但若当前
+                        // 持续在浮窗内，鼠标坐标可能在卡 A→卡 B 之间移动 →
+                        // 每 tick 都发 hover-pos，让前端 elementFromPoint 跟踪命中
+                        // 的 todo-card。body[data-hover] 玻璃色只需要 edge trigger，
+                        // 不在每 tick emit 避免 CSS spring 反复重置起始点。
+                        if inside {
+                            if let Some(f) = frame {
+                                if let Err(e) = app.emit(
+                                    "usticky://floating-hover-pos",
+                                    viewport_hover_pos(mouse, f),
+                                ) {
+                                    tracing::trace!(error = %e, "emit hover-pos 失败");
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // inside 与 last_inside 不同 —— 是真切换还是抖动？
+                    if pending_value != inside {
+                        pending_value = inside;
+                        pending_ticks = 1;
+                    } else {
+                        pending_ticks = pending_ticks.saturating_add(1);
+                    }
+
+                    const ENTER_THRESHOLD: u8 = 1; // 50ms —— 短 hover 也要触发置顶
+                    const EXIT_THRESHOLD: u8 = 2; // 100ms —— 防 level 切换 stale 振荡
+                    let threshold = if pending_value {
+                        ENTER_THRESHOLD
+                    } else {
+                        EXIT_THRESHOLD
+                    };
+
+                    if pending_ticks < threshold {
+                        continue;
+                    }
+
+                    // 阈值达成 —— 采纳新状态，emit + 切 level
+                    last_inside = inside;
+                    // **P1-6 fix**：镜像到全局原子。
+                    LAST_INSIDE.store(inside, Ordering::SeqCst);
                     pending_ticks = 0;
-                    // inside 没变（持续在浮窗内 or 持续在浮窗外），但若当前
-                    // 持续在浮窗内，鼠标坐标可能在卡 A→卡 B 之间移动 →
-                    // 每 tick 都发 hover-pos，让前端 elementFromPoint 跟踪命中
-                    // 的 todo-card。body[data-hover] 玻璃色只需要 edge trigger，
-                    // 不在每 tick emit 避免 CSS spring 反复重置起始点。
+
+                    // (1) 永远 emit —— 驱动前端 body[data-hover]，让 CSS hover 生效
+                    if let Err(e) = app.emit("usticky://floating-hover", inside) {
+                        tracing::trace!(error = %e, "emit hover 失败");
+                    }
+
+                    // (2) 进入浮窗时（edge-trigger）补一发 hover-pos，让前端在
+                    // 未聚焦场景下第一帧就有坐标可喂 elementFromPoint。
+                    // 持续在浮窗内的卡间切换走上面 if inside { ... continue } 的
+                    // 每 tick emit。
                     if inside {
                         if let Some(f) = frame {
-                            if let Err(e) = app.emit(
-                                "usticky://floating-hover-pos",
-                                viewport_hover_pos(mouse, f),
-                            ) {
+                            if let Err(e) = app
+                                .emit("usticky://floating-hover-pos", viewport_hover_pos(mouse, f))
+                            {
                                 tracing::trace!(error = %e, "emit hover-pos 失败");
                             }
                         }
                     }
-                    continue;
-                }
 
-                // inside 与 last_inside 不同 —— 是真切换还是抖动？
-                if pending_value != inside {
-                    pending_value = inside;
-                    pending_ticks = 1;
-                } else {
-                    pending_ticks = pending_ticks.saturating_add(1);
-                }
-
-                const ENTER_THRESHOLD: u8 = 1; // 50ms —— 短 hover 也要触发置顶
-                const EXIT_THRESHOLD: u8 = 2;  // 100ms —— 防 level 切换 stale 振荡
-                let threshold = if pending_value { ENTER_THRESHOLD } else { EXIT_THRESHOLD };
-
-                if pending_ticks < threshold {
-                    continue;
-                }
-
-                // 阈值达成 —— 采纳新状态，emit + 切 level
-                last_inside = inside;
-                pending_ticks = 0;
-
-                // (1) 永远 emit —— 驱动前端 body[data-hover]，让 CSS hover 生效
-                if let Err(e) = app.emit("usticky://floating-hover", inside) {
-                    tracing::trace!(error = %e, "emit hover 失败");
-                }
-
-                // (2) 进入浮窗时（edge-trigger）补一发 hover-pos，让前端在
-                // 未聚焦场景下第一帧就有坐标可喂 elementFromPoint。
-                // 持续在浮窗内的卡间切换走上面 if inside { ... continue } 的
-                // 每 tick emit。
-                if inside {
-                    if let Some(f) = frame {
-                        if let Err(e) = app.emit(
-                            "usticky://floating-hover-pos",
-                            viewport_hover_pos(mouse, f),
-                        ) {
-                            tracing::trace!(error = %e, "emit hover-pos 失败");
-                        }
+                    // (3) PinBottom 模式：同步切 NSWindow level
+                    if LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst) {
+                        let level = if inside {
+                            LEVEL_FLOATING
+                        } else {
+                            LEVEL_BELOW_NORMAL
+                        };
+                        set_window_level(&app, level, false);
                     }
                 }
-
-                // (3) PinBottom 模式：同步切 NSWindow level
-                if LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst) {
-                    let level = if inside {
-                        LEVEL_FLOATING
-                    } else {
-                        LEVEL_BELOW_NORMAL
-                    };
-                    set_window_level(&app, level, false);
-                }
-            }
             })); // catch_unwind(inner closure) 收尾
             if let Err(panic_payload) = result {
                 let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
@@ -476,12 +538,15 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                 } else {
                     "unknown panic".to_string()
                 };
-                tracing::error!("hover emitter thread panic: {}，已 reset TRACKER_RUNNING", msg);
+                tracing::error!(
+                    "hover emitter thread panic: {}，已 reset TRACKER_RUNNING",
+                    msg
+                );
                 TRACKER_RUNNING.store(false, Ordering::SeqCst);
             }
         }); // spawn closure 收尾
-    // builder.spawn 自身失败（线程创建失败，如 OS 资源耗尽）也要 reset，
-    // 不让 start_hover_emitter 永远 no-op。
+            // builder.spawn 自身失败（线程创建失败，如 OS 资源耗尽）也要 reset，
+            // 不让 start_hover_emitter 永远 no-op。
     if let Err(e) = builder {
         tracing::error!(error = %e, "spawn hover emitter thread 失败，hover raise / glass 效果将失效");
         TRACKER_RUNNING.store(false, Ordering::SeqCst);

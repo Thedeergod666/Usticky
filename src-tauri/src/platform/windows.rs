@@ -59,7 +59,7 @@
 //!      - `inside` 切到 `false`（edge-trigger）→ drop 到 `HWND_BOTTOM`
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -68,9 +68,9 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::{HWND as WIN_HWND, POINT, RECT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowRect, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WindowFromPoint,
-    ASFW_ANY, GA_ROOT, GWL_EXSTYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
+    GetWindowRect, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WindowFromPoint, ASFW_ANY,
+    GA_ROOT, GWL_EXSTYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, WS_EX_TOPMOST,
 };
 
 use crate::todo::PinMode;
@@ -80,6 +80,24 @@ static TRACKER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// 鼠标 hover 时是否同步切 z-order：仅 PinBottom 模式置 true。
 static LEVEL_SWITCHING_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// **P1-7 fix**：串行化 apply_z_order 内部三调用序列
+/// (GetWindowLongPtrW → SetWindowLongPtrW → SetWindowPos) 的 lock。
+///
+/// 多调用方：hover emitter 后台线程每 500ms 一次 TopMost re-assert +
+/// pin mode 切换时 main-thread 调用的 PinBottom / PinTop / Normal 派发。
+/// 没 lock 时并发场景下：thread A 读 style、thread B 改 style + SetWindowPos、
+/// thread A 用 stale style 改写回 → WS_EX_TOPMOST 位丢失 → PinTop 偶发
+/// 被 demote。Mutex<()> 零开销同步，序列化对同一 hwnd 的并发 z-order 操作。
+static APPLY_Z_ORDER_LOCK: Mutex<()> = Mutex::new(());
+
+/// **P1-8 fix**：缓存 `WebviewWindow::scale_factor()` 的返回值。
+///
+/// 旧实现 spawn 时一次性缓存 → 用户切 DPI / 拖到不同缩放比的显示器时
+/// scale_cache stale，hover-pos 转视口坐标全错（elementFromPoint 命中错位）。
+/// 改成 `Mutex<Option<f64>>`：第一 tick 取一次缓存，后续每 60 tick（~3s）
+/// 刷新一次。refresh 路径复用 spawn 时取的 win_opt，不再 race 调 Tauri。
+static SCALE_CACHE: Mutex<Option<f64>> = Mutex::new(None);
 
 /// 浮窗的 z-order 模式。
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +124,13 @@ enum ZOrder {
 /// `SetWindowLongW` **必须 OR 不能替换** —— 直接 `0x0008` 会
 /// wipe 掉 `WS_EX_LAYERED` / `WS_EX_NOREDIRECTIONBITMAP` 等所有 bit。
 unsafe fn apply_z_order(hwnd: *mut core::ffi::c_void, z: ZOrder) {
+    // **P1-7 fix**：与所有调用方串行 —— 见 APPLY_Z_ORDER_LOCK 注释。
+    // 持有锁期间跑完整三调用序列（读 style → 改 style → SetWindowPos），
+    // 防止 hover emitter 后台线程和 pin-mode 派发的 main-thread 互踩
+    // （如 emitter 读 style → main-thread 改 style + SetWindowPos →
+    // emitter 用 stale style 覆盖回 → TOPMOST 位丢失）。
+    let _g = APPLY_Z_ORDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     let insert_after = match z {
         ZOrder::TopMost => HWND_TOPMOST,
         ZOrder::Bottom => HWND_BOTTOM,
@@ -126,7 +151,7 @@ unsafe fn apply_z_order(hwnd: *mut core::ffi::c_void, z: ZOrder) {
             // WebView2 会在自己的 message handler 里 re-assert WS_EX_TOPMOST，
             // 不显式清的话 Normal 模式在 Win10/11 上不可靠。
             let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let new_style: isize = ex_style & !((WS_EX_TOPMOST as isize));
+            let new_style: isize = ex_style & !(WS_EX_TOPMOST as isize);
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
         }
     }
@@ -295,13 +320,15 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
             // 如果拉不到（窗口未上屏等极端情况），fallback 默认值 + 跳过
             // hover-pos / z-order emit——避免误发坐标让前端 elementFromPoint
             // 命中错位。
-            let (hwnd_cache, scale_cache) = match app.get_webview_window("floating") {
-                Some(win) => {
-                    let h = win.hwnd().ok().map(|h| h.0).unwrap_or(std::ptr::null_mut());
-                    let s = win.scale_factor().unwrap_or(1.0);
-                    (h, s)
-                }
-                None => (std::ptr::null_mut(), 1.0),
+            // **P1-8 fix**：保留 win_opt（WebviewWindow 句柄）供 hover emitter
+            // 主循环刷新 scale_cache 用。`hwnd_cache` 仍走 spawn 时一次性取
+            // （hwnd 在线程生命周期内不变，省去每次调 win.hwnd() 的开销）。
+            // scale 不能缓存为 spawn-time 值 —— 用户改 DPI / 拖显示器后 stale
+            // 会让 hover-pos 转视口坐标错位。
+            let win_opt = app.get_webview_window("floating");
+            let hwnd_cache = match &win_opt {
+                Some(win) => win.hwnd().ok().map(|h| h.0).unwrap_or(std::ptr::null_mut()),
+                None => std::ptr::null_mut(),
             };
             if hwnd_cache.is_null() {
                 tracing::warn!("hover emitter: 无法获取浮窗 hwnd，hover raise / glass 效果将失效");
@@ -358,18 +385,37 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                     let _ = app.emit("usticky://floating-hover", inside);
                 }
 
+                // **P1-8 fix**：刷新 scale 缓存。第一 tick 或每 60 tick（~3s）
+                // 重新从 WebviewWindow 取一次 scale_factor，捕获 DPI 切换 /
+                // 拖显示器等场景。win_opt 是 spawn 时取的，复用避免每 tick
+                // 调 Tauri handle 表。
+                let scale = if let Some(win) = &win_opt {
+                    let mut cache = SCALE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                    if cache.is_none() || tick_count.is_multiple_of(60) {
+                        *cache = Some(win.scale_factor().unwrap_or(1.0));
+                    }
+                    *cache
+                } else {
+                    None
+                };
+                let scale = scale.unwrap_or(1.0);
+
                 // (2) inside=true 时**每 tick**发 hover-pos，让前端跟踪
                 // 鼠标在卡 A→卡 B 之间的切换。未聚焦时 WKWebView 不派
                 // mouseenter，title-expand 必须靠这条路径。
                 //
-                // **P2-1 fix**：用 spawn 时缓存的 scale_factor，不调 Tauri。
-                // 坐标 = 视口相对（cursor - window rect 左上角）/ scale。
+                // **P2-1 fix**：用 spawn 时缓存的 hwnd，不调 Tauri。
+                // **P1-8 fix**：scale 用 Mutex<Option> 缓存，第一 tick / 每 60 tick
+                // 刷新一次。坐标 = 视口相对（cursor - window rect 左上角）/ scale。
                 if inside && !hwnd_cache.is_null() {
-                    let logical_x = (pt.x - rect.left) as f64 / scale_cache;
-                    let logical_y = (pt.y - rect.top) as f64 / scale_cache;
+                    let logical_x = (pt.x - rect.left) as f64 / scale;
+                    let logical_y = (pt.y - rect.top) as f64 / scale;
                     let _ = app.emit(
                         "usticky://floating-hover-pos",
-                        HoverPos { x: logical_x, y: logical_y },
+                        HoverPos {
+                            x: logical_x,
+                            y: logical_y,
+                        },
                     );
                 }
 
@@ -392,11 +438,15 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                         // 不改 edge-trigger（last_inside false → inside true），
                         // 那一帧仍立即切 TopMost（用户进入浮窗时第一帧就该置顶）。
                         if tick_count.is_multiple_of(10) {
-                            unsafe { apply_z_order(hwnd_cache, ZOrder::TopMost); }
+                            unsafe {
+                                apply_z_order(hwnd_cache, ZOrder::TopMost);
+                            }
                         }
                     } else if last_inside {
                         // 刚离开: edge-trigger drop 到 BOTTOM
-                        unsafe { apply_z_order(hwnd_cache, ZOrder::Bottom); }
+                        unsafe {
+                            apply_z_order(hwnd_cache, ZOrder::Bottom);
+                        }
                     }
                 }
 

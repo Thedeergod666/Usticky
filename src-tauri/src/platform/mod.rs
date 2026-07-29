@@ -36,8 +36,8 @@ mod plat {
     // Linux stub —— 跟 Win 一样的形态，但是 no-op。
     // Tauri 的 set_always_on_top(true) 走 GTK Wayland/X11 走 WM_WINDOW_ROLE，
     // 没私有 API 可调，alwaysOnTop: true 已经是最实用的方案。
-    use tauri::{AppHandle, Runtime};
     use crate::todo::PinMode;
+    use tauri::{AppHandle, Runtime};
     pub fn set_window_pin_top<R: Runtime>(_app: &AppHandle<R>) {}
     pub fn set_window_pin_bottom<R: Runtime>(_app: &AppHandle<R>) {}
     pub fn set_window_normal<R: Runtime>(_app: &AppHandle<R>) {}
