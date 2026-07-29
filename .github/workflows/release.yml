@@ -10,7 +10,7 @@ name: Release
 # ──────────────────────────────────────────────────────────────
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+    tags: ["v*.*.*"]
   workflow_dispatch:
     inputs:
       version:
@@ -92,6 +92,9 @@ jobs:
         with:
           workspaces: src-tauri
           shared-key: ${{ matrix.target }}
+          # 不把失败的 cargo 构建产物写进 cache —— 避免 cache 被破坏的 build
+          # 污染下次构建（P2-25：cache-on-failure: false）
+          cache-on-failure: false
 
       # ── macOS objc2 需要明确最低部署版本 ──
       - name: Set macOS deployment target
@@ -111,32 +114,33 @@ jobs:
             patchelf \
             xdg-utils
 
-      # ── 注入版本号到 tauri.conf.json，再触发 sync-version.cjs 同步到另外两份 ──
-      - name: Sync version
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="${{ inputs.version }}"
-          fi
-          echo "Building Usticky v${VERSION} for ${{ matrix.target }}"
-
-          # 用 Node 而不是 sed，更可靠（tauri.conf.json 含嵌套 JSON）
-          node -e "
-            const fs = require('fs');
-            const p = 'src-tauri/tauri.conf.json';
-            const c = JSON.parse(fs.readFileSync(p, 'utf8'));
-            c.version = '${VERSION}';
-            fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');
-          "
-
-          # 同步到 package.json + Cargo.toml
-          pnpm sync-version
 
       # ── 前端依赖 ──
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
+
+      # ── 把版本号写到 package.json，再让 sync-version.cjs 传播到 tauri.conf.json + Cargo.toml ──
+      # 必须放在 pnpm install 之后：本 step 调 `pnpm sync-version` 需要 pnpm 已就绪
+      # 也必须放在 `tauri build` 之前：sync-version 改的 Cargo.toml / tauri.conf.json
+      # 会被 build 直接消费
+      - name: Sync version
+        env:
+          # tag 触发时 github.ref_name 是 "v0.2.0"；手动触发时取 inputs.version
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          echo "Building Usticky v${VERSION} for ${{ matrix.target }}"
+
+          # 写 package.json（不再直接写 tauri.conf.json —— 让 sync-version.cjs 成为
+          # 唯一传播路径，三处 version 永远一致）
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = process.env.VERSION.replace(/^v/, '');
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+          # 同步到 tauri.conf.json + Cargo.toml
+          pnpm sync-version
 
       # ── 打包 + release（tauri-action 接管）──
       #
@@ -175,8 +179,23 @@ jobs:
     if: success()
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Wait a moment for release
-        run: sleep 15
+      # 轮询等待 release assets 全部就位（tauri-action 第一个 job 完成后才建 release，
+      # 后续 job 完成后才追加 asset）—— 12 次 × 15s = 3 分钟上限，失败早返
+      - name: Wait for release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', inputs.version) }}
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            echo "Poll attempt $i (waiting for release $TAG to have all 5 assets)"
+            ASSETS=$(gh release view "$TAG" --json assets --jq '.assets | length' 2>/dev/null || echo "0")
+            echo "  → assets so far: $ASSETS"
+            if [ "$ASSETS" -ge 5 ]; then
+              echo "All 5 assets present"
+              break
+            fi
+            sleep 15
+          done
       - name: Verify release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

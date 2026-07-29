@@ -1,0 +1,2 @@
+# icon generation scripts only (no runtime deps)
+Pillow>=10.0.0
