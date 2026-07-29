@@ -93,7 +93,7 @@ frame-ancestors 'none'
 - `connect-src ipc:` 必加：Tauri IPC 走 `ipc://` scheme
 - 配套 Vite `assetsInlineLimit: 0`（<4KB 资源被内联 → CSP block → 裂图）
 
-### 3. 渲染：增量 DOM diff，绝不 `innerHTML = ...` 全量替换
+### 3. 渲染：当前为全量重建（v0.1.5 仍如此），未来迁移到增量 diff
 
 `innerHTML = ...` 会让整窗空白 1 帧 → "闪一下"。每张卡 / 每行用 `data-*` key 做增量 update。顺序变化：先按期望顺序插入 + reorder 循环搬已有卡，**快速路径：先比 expected/actual 字符串，相等就跳过整个循环**。
 
@@ -224,7 +224,7 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ✅ Vite 配置（port 1421 + assetsInlineLimit: 0）
 ✅ 前端骨架（main.ts / styles.css / i18n / index.html）
 ✅ 后端骨架（lib.rs / main.rs / todo.rs / commands / tray / platform）
-✅ i18n 字典（en + zh-CN，前端 dict 已覆盖空态 / 输入 / due 标签 / 设置面板 / tray 全文案）
+✅ i18n 字典（en + zh-CN，前端 dict 已覆盖空态 / 输入 / due 标签 / 设置面板 + 后端 locales 覆盖 tray 全文案）
 ✅ 占位 icon
 ✅ 全局快捷键接线（CmdOrCtrl+Shift+Space → quick-add → 聚焦 input）
 
@@ -268,6 +268,61 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ✅ **`acceptFirstMouse: true`（tauri.conf.json）**：未聚焦时点一次复制键即触发（旧行为第一击被 click-to-focus 吞掉，要点两次）
 ✅ 按钮压缩 + 不占位：`.todo-actions` 容器（gap 2px，按钮 22→18px），**默认 `display:none`**，`.card-hover` 才 `display:flex` —— 未 hover 时 title 不再被白挤 ~46px
 ✅ 实测（CGEvent warp + CGWindowList + 临时 IPC 信标）：穿梭 9 卡 × 3 往返 `.card-hover` 计数恒 ≤1，单击复制落剪贴板成功（`hasFocus:true` 说明 acceptFirstMouse 生效）
+
+### v0.1.5（2026-07-29，全量代码审查修复 + CI 流水线 + single-instance）
+
+✅ **`release.yml` tag pattern 修复**（P0-1）：原 `v[0-9]+.[0-9]+.[0-9]+*` 是 fnmatch glob，永不匹配 `v0.2.0`。改 `v*.*.*`，AGENTS.md 写的就是这个。
+✅ **`workflow_dispatch` 版本同步修复**（P0-2）：原 inline Node 脚本写 `tauri.conf.json` 后调 `pnpm sync-version`，后者读 `package.json.version` 反向覆盖 → dispatch 版本被吞。改写 `package.json` + sync 推 tauri.conf.json + Cargo.toml。
+✅ **`reorder` 防御性 guard**（P1-1）：front-end 发送 proper subset 时不静默错序，改 `Result<()>` + 拒绝非整段 section。
+✅ **`persist_to_path` 释放 RwLock**（P1-2）：原 `&self` 持锁跨 fsync。重构为 free function `persist_to_disk(path, data)` + process-level `OnceLock<Mutex<()>>`，3 个调用点全改；新加 5 个 regression test。
+✅ **`register_quick_add_shortcut` 顺序修复**（P1-3）：原 `unregister_all` 在 parse/on_shortcut 之前 → 失败时旧快捷键永久丢失。改：parse → on_shortcut 成功才 unregister；失败 best-effort 重新注册 previous。
+✅ **`set_quick_add_shortcut` 持久化失败回滚**（P1-4）：原内存先写、磁盘后写 → persist 失败时用户以为改了。改：snapshot previous → 写 → persist 失败 → 回滚 + emit `persist-failed` + 不 re-register。
+✅ **快捷键必须带 modifier**（P1-5）：原接受 `"F12"`、`"A"` 等单键 → 任何 app 按 F12 都触发 quick-add。改：parse 后 `mods.intersects(CONTROL|ALT|META|SUPER)` 否则 Err。
+✅ **Quick-add 原子化**（P1-9 / P2-5）：原 check-then-act + 后置 `store(true)`，双击双跑。改 `compare_exchange(false, true, SeqCst, SeqCst)`。
+✅ **macOS PinBottom hover 切换不闪烁**（P1-6）：原 FIFO 主线程队列先 LOWER 再 RAISE。改：悬停时 BELOW_NORMAL 延 50ms + 条件 skip（`LAST_INSIDE` 仍 true → 跳过 LOWER）。
+✅ **Win z-order 锁**（P1-7）：emitter 线程与 main-thread pin-mode 切换可交错。改 `static APPLY_Z_ORDER_LOCK: Mutex<()>` 包 3 步 Win32 序列。
+✅ **Win scale_cache 跨 DPI 屏刷新**（P1-8）：原 spawn 时取一次 scale forever。改 `Mutex<Option<f64>>` + 每 60 tick lazy refresh。
+✅ **macOS dispatch_failed recovery 不无条件 LOWER**（P2-4）：原同 BUG-001 闪烁。改：只 emit `hover(false)`，下一 tick 自然恢复。
+✅ **tauri-plugin-single-instance 集成**（P2-6）：双开 dock icon / 终端运行不再二次启动。`Cargo.toml:23` + `lib.rs:217-228` `.plugin(tauri_plugin_single_instance::init(...))`。
+✅ **Tray menu 打开时跳过 rebuild**（P2-7）：原 detach 活跃 NSMenu。改 `MENU_OPEN_FLAG: AtomicBool` + Right Down/Up + on_menu_event 双向检测。
+✅ **Moved/Resized 200ms trailing debounce**（P2-8）：原每像素 spawn 持久化。改 `GEOM_NOTIFY: OnceLock<Notify>` + 后台 `geom_persist_loop` select 模式。
+✅ **tray::build_tray 改 `try_state`**（P2-9）：原 `app.state()` 可在退出时 panic。
+✅ **`reset_floating_window` 用持久化 (w,h)**（P2-12）：原用 `outer_size()` live 尺寸，多屏切换后尺寸漂移。
+✅ **`reset_floating_window` 检查 `is_visible()`**（P2-16）：隐藏时不要 `set_position`（macOS 会顺带浮起）。
+✅ **`reset_floating_window` 持久化后 emit `usticky://window-pos-changed`**（P2-19）。
+✅ **`set_app_locale` 白名单**（P2-3 / P2-20 / 多域同根）：`["en", "zh-CN"]` 否则 Err。新 i18n key `commands.error.unsupported_locale`。
+✅ **`update_todo` no-op 短路**（P2-4）：`title=None && status=None` 早返 `Ok(None)`，跳过 persist + `updated_at` bump。
+✅ **`persist_to_disk` 用 `OpenOptions::mode(0o600)`**（P2-5）：不再 chmod 失败后世界可读 tmp。
+✅ **`persist_to_disk` rename 后 fsync 父目录**（P2-6）：断电后 rename 不丢。
+✅ **Quick-add Enter 输入失败回填**（P1-9，前端）：原 `input.value = ""` 在 await 之前 → 失败时用户输入丢失。改 await 成功后才清空。
+✅ **Settings locale double-render 修复**（P1-10）：原 `onLocaleChange` + Tauri listener 双 render。改：只靠 Tauri listener 路径。
+✅ **Settings invoke 失败给 flash + retry**（P1-11）：原只 `console.error` 静默回退硬编码默认值。
+✅ **快捷键录制 button blur 退出 recording**（P1-12）：原只能等 10s timer 或 Esc。
+✅ **Format shortcut Win 显示 Ctrl 而非 Cmd**（P2-13）。
+✅ **Click handler `e.button !== 0` skip 中右键**（P2-14）。
+✅ **`closest` selector scope 到 `[data-pin]` / `[data-locale]` 容器**（P2-15）。
+✅ **Locale 切换 render 保留 recording 状态**（P2-17）。
+✅ **Locale listener 总是 setLocale**（P2-18）：不再 gate 在 `getLocale()` 缓存上。
+✅ **beforeunload 提到 init() 顶部**（P2-19）。
+✅ **语言按钮走 i18n**（P3-13）：`settings.language.option_en` / `option_zh-CN`。
+✅ **`sortable onEnd` 失败 re-fetch + flash**（P2-10，前端）。
+✅ **Esc 只在 quick-add 唤起时 hide 窗**（P2-11，前端）：tray 唤起窗按 Esc 仅 `input.blur()`。
+✅ **`Cmd+Z` 占位 handler 删除**（P3-7，前端）：v0.2 再加。
+✅ **icon-only copy/delete 按钮加 `aria-label`**（P3-5，前端）。
+✅ **`setBtnHover` 缓存 `lastPointerState`**（P3-6，前端）：不变就不 invoke。
+✅ **i18n 死 key 清理**（P3-16/17/18）：删后端 `error.empty_title` / `error.not_found` / `error.too_long`；前端 `tray.show` / `tray.hide` / `app.action.edit` / `app.empty.done`。
+✅ **`commands.error.too_long` 用 `{max}` 占位**（P2-23）：`app.error.too_long` 同步。
+✅ **`due.future` 改小写对齐 `due.days`**（P3-19）。
+✅ **CI 改 `cargo check`（去 `--locked`）**（P1-13）：`prebuild` 改 `Cargo.toml` 后 lockfile 同步失败误导。
+✅ **release.yml Sync version 移到 `pnpm install` 之后**（P1-14）。
+✅ **rust-cache 配 `cache-on-failure: false`**（P2-25）。
+✅ **Verify job 改 polling 循环**（P2-26）：取代 `sleep 15`。
+✅ **`pnpm icons` script 补回**（P2-27）+ `requirements.txt` 加 Pillow 依赖声明。
+✅ **删未用 `plugin-notification` / `plugin-autostart` JS 依赖**（P3-1）。
+✅ **capabilities 裁剪到最小集**（P3-2/3）：删冗余 `opener:default` + 7 个未调用的 `core:window:allow-*`。
+✅ **`staticlib` crate-type 删**（P3-4）：CI 是 MSVC，desktop 用 rlib 足够。
+✅ **`Cargo.toml:14` 改 `crate-type = ["rlib"]` 并加注释**。
+✅ **AGENTS.md 文档修正**：v0.1.2 的 "P3-4 fix 不持锁 I/O" 描述是 stale claim（实际仍持锁；v0.1.5 才真正释放）；`render()` 实际是全量重建（非 "incremental DOM diff" 描述）；前端 `tray 全文案` claim 过期（实际 `tray.show`/`tray.hide` 是死 key，由后端 locales 覆盖）。
 
 ### 仍未做
 
