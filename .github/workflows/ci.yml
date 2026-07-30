@@ -76,25 +76,10 @@ jobs:
       # 触发难定位的 cargo 错误。
       - name: Sync version early
         run: pnpm sync-version
-      # 跨平台版本一致性检查 —— 用 Node 跑（bash 语法在 Windows PowerShell 上炸）
+      # 跨平台版本一致性检查 —— 独立 Node 脚本（inline node -e 会被 yaml
+      # 重写为 .sh / .ps1 后破坏内层引号，三个 runner 全炸）
       - name: Verify versions consistent
-        run: |
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('package.json','utf8')).version;
-            const cargo = fs.readFileSync('src-tauri/Cargo.toml','utf8').match(/^version\s*=\s*"([^"]+)"/m);
-            const tauri = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json','utf8')).version;
-            const ok = cargo && cargo[1] === pkg && tauri === pkg;
-            const cargoVer = cargo ? cargo[1] : '(not found)';
-            console.log('package.json  =', pkg);
-            console.log('Cargo.toml    =', cargoVer);
-            console.log('tauri.conf    =', tauri);
-            if (!ok) {
-              console.error('::error::version mismatch: package.json=' + pkg + ' Cargo.toml=' + cargoVer + ' tauri.conf=' + tauri);
-              process.exit(1);
-            }
-            console.log('\u2713 package.json = Cargo.toml = tauri.conf.json = ' + pkg);
-          "
+        run: node scripts/verify-versions.cjs
       - name: cargo check
         working-directory: src-tauri
         # --locked 必加：防 fresh cargo 在不同平台重解析依赖树
