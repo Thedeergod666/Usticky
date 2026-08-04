@@ -5,6 +5,7 @@
   "type": "module",
   "packageManager": "pnpm@9.15.4",
   "description": "Always-on-top floating sticky note for desktop — single-task, glass aesthetic, no bloat",
+  "license": "MIT",
   "scripts": {
     "sync-version": "node scripts/sync-version.cjs",
     "predev": "pnpm sync-version",

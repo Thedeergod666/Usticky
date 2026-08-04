@@ -90,4 +90,4 @@ Usticky 直接借用 [Musage](~/Project/Musage) 的浮窗经验（详见 [AGENTS
 
 ## License
 
-个人项目，未指定。
+[MIT](./LICENSE) © 2026 Thedeergod666
