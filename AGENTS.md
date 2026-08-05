@@ -328,7 +328,7 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 
 ✅ **粘贴按钮**（输入行最右侧，`.todo-paste-btn`）：`paste_from_clipboard` 命令统一入口 —— 剪贴板是文本 → 整段作为一个 pending todo（多行保留，长文靠预览窗看全文）；是图片 → 落盘 `<data_dir>/attachments/<uuid>.<ext>` + 带 attachment 的 todo；空 → Err("empty") 前端 flash。Rust 端读剪贴板（tauri-plugin-clipboard-manager）无焦点要求，**不走**前端 `navigator.clipboard.read()`（非 key window 不可靠）。
 ✅ **GIF / 图片支持**（[clipboard.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/clipboard.rs) 三条路径）：① macOS NSPasteboard 原始字节 —— `public.gif` 原数据**保动画**，`public.file-url` 支持 Finder 复制图片文件，`public.tiff` 走 image crate 转 PNG；② 插件 `read_image` RGBA → PNG 跨平台兜底（Win/Linux 主路径，**GIF 退化首帧**，已知限制）；③ 文本。体积上限 25MB。
-✅ **Todo.attachment 字段**（`TodoAttachment { file, mime, width, height }`，serde default 向后兼容）：只存相对文件名，绝对路径运行时拼（`Store::attachments_dir()`）。delete_todo 连带删附件文件（NotFound 不算错）。
+✅ **Todo.attachment 字段**（`TodoAttachment { file, mime, width, height }`，serde default 向后兼容）：只存相对文件名，绝对路径运行时拼（`Store::attachments_dir()`）。delete_todo **不**立即删附件文件（v0.2.5 改延迟删除）：前端 undo 栈超时（8s）调 `purge_attachment` 真删 + 启动孤儿扫描（`Store::purge_orphan_attachments`）兜底崩溃残留，撤销窗口内图片完整可恢复。
 ✅ **asset 协议显示**：tauri.conf.json `assetProtocol.scope = ["$APPDATA/attachments/**"]` + CSP `img-src` 加 `asset: http://asset.localhost`（Tauri 2 没有 core:asset 权限，纯 scope 配置驱动）。前端 `convertFileSrc(attachmentsDir + "/" + file)`，GIF 在 `<img>` 里原生动画。
 ✅ **QuickLook 预览窗**（[preview.html](file:///Users/wyh/Project/Usticky/preview.html) + [preview.ts](file:///Users/wyh/Project/Usticky/src/preview.ts) + [preview.css](file:///Users/wyh/Project/Usticky/src/preview.css)）：独立动态 webview（抄 open_settings_window 模式），无边框透明 + always-on-top + acceptFirstMouse，定位浮窗左侧优先（放不下放右侧），尺寸按附件宽高比算。**hover 长文不再变长（hover-expand 整套退役，scheduleHoverResize/.title-expanded 已删）**：截断 title dwell 600ms / 图片卡 350ms → `open_preview_window(pinned=false)` 非聚焦面板；点击缩略图 → `pinned=true` 聚焦编辑态。
 ✅ **预览窗可编辑**：textarea 防抖 700ms 自动保存（update_todo），空标题不保存；切 todo / 关窗前 flushPendingSave 强制落盘；外部 todos-changed 在 textarea 未聚焦时回填，todo 被删 → 自关。
@@ -395,6 +395,16 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ✅ **删除按钮全 App 统一垃圾桶**（②-4）：卡内 `.todo-delete` 从 "×" 文字换 lucide trash-2 SVG（main.ts `TRASH_ICON_SVG`），预览窗删除按钮同图标（preview.ts 自带一份 13px 版）。顺手删了卡内 copy/delete 按钮残留的 `title=`（又是原生 tooltip，v0.2.1 规则的漏网之鱼）。
 
 **经验沉淀**：④ pin/锁定类状态必须挂在**有可靠释放信号的状态**上（焦点：blur 必释放；鼠标位置：hover-pos 每 tick 上报），不能挂在"进入事件"上（离开事件可能因聚焦态/窗口层级永远发不出）；⑤ macOS 悬浮面板显示窗口永远用 `orderFrontRegardless`，`show()`/`makeKeyAndOrderFront:` 只给"用户明确要交互"的窗口；⑥ 屏幕边界 clamp 永远用 work_area 不用 monitor size（Dock/任务栏/菜单栏都在 size 里不在 work_area 里）。
+
+### v0.2.5（2026-08-05，删除撤销 + 附件延迟删除）
+
+✅ **删除 todo 后 8s 内可撤销**：删除仍是硬删除，但附件文件不再随 delete_todo 立即删。前端单条 undo 栈（8s 窗口）暂存被删的完整 Todo + 显示带「撤销」按钮的 action flash（`.mini-flash.has-action`，复用 `--c-data-info` 强调色）。点撤销调 `restore_todo` 恢复（图片完整可恢复）；超时调 `purge_attachment` 真删附件文件。
+✅ **事件驱动统一入口**：delete_todo emit `usticky://todo-deleted`（被删完整 Todo），主浮窗 listen 后统一管 undoEntry + flash。预览窗 deleteSelf 直接调 delete_todo 也走这条路径 -> 预览窗删除也有撤销入口，不再需要各调用点各自管 undo。
+✅ **附件延迟删除 + 启动孤儿扫描**：delete_todo 不删附件文件；前端 undo 栈超时调 `purge_attachment`（含路径穿越校验，禁 `/ \ ..`）真删；启动 `Store::purge_orphan_attachments` 扫 `attachments/` 目录兜底崩溃/异常退出残留。
+✅ **后端**：`Store::restore`（原位塞回，防御重复 id）+ `purge_orphan_attachments`；`load_or_init` 启动调一次；新增 `restore_todo` / `purge_attachment` 命令。
+✅ **前端**：`showActionFlash`（可点 toast，复用 `.mini-flash`）+ `hideMiniFlash` + 单条 undo 栈（`DELETE_UNDO_MS = 8000`）+ `undoDelete` / `clearUndoEntry`；`deleteTodo` 简化（vanishing 动画 + invoke，undo 由 listener 统一）；beforeunload 清理 `unlistenTodoDeleted`。
+✅ i18n 复用现有 `app.delete.flash` / `app.action.undo` / `app.undo.flash`，无新增 key。
+✅ 构建验证：`cargo check` ✓、`tsc --noEmit` 干净 ✓、`vite build` ✓。
 
 ### 仍未做
 
