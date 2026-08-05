@@ -122,10 +122,14 @@ mod macos_native {
         ] {
             let t = NSString::from_str(uti);
             if let Some(data) = pb.dataForType(&t) {
-                let bytes = nsdata_to_vec(&data);
-                if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+                // **P2 fix（review v0.2.6）**：先 data.len() 预检，零分配地拒绝
+                // 超大 pasteboard 载荷（NSPasteboard 可持有 GB 级，原始 Vec<u8>
+                // 镜像会 OOM app 才能在下行 skip）。
+                let len = data.len();
+                if len == 0 || len > MAX_IMAGE_BYTES {
                     continue;
                 }
+                let bytes = nsdata_to_vec(&data);
                 let (width, height) = super::probe_dims(&bytes);
                 return Some(ClipboardImage {
                     data: bytes,
@@ -150,8 +154,12 @@ mod macos_native {
         // 1c. TIFF（macOS 截图 / Preview 复制的经典格式）：解码 → PNG。
         let tiff_t = NSString::from_str(UTI_TIFF);
         if let Some(data) = pb.dataForType(&tiff_t) {
-            let bytes = nsdata_to_vec(&data);
-            if !bytes.is_empty() && bytes.len() <= MAX_IMAGE_BYTES {
+            // **P2 fix（review v0.2.6）**：同 1a —— 先 data.len() 预检再 alloc。
+            let len = data.len();
+            if len == 0 || len > MAX_IMAGE_BYTES {
+                // fall through to None
+            } else {
+                let bytes = nsdata_to_vec(&data);
                 if let Some(img) = transcode_tiff_to_png(&bytes) {
                     return Some(img);
                 }
@@ -182,10 +190,13 @@ mod macos_native {
             "jpg" | "jpeg" => ("jpg", "image/jpeg"),
             _ => return None,
         };
-        let bytes = std::fs::read(p).ok()?;
-        if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+        // **P2 fix（review v0.2.6）**：先 fs::metadata 检 size，再 std::fs::read。
+        // 用户从 Finder 误粘了 GB 级 .gif/.png，std::fs::read 会整文件 slurp 进内存。
+        let meta = std::fs::metadata(p).ok()?;
+        if meta.len() == 0 || meta.len() > MAX_IMAGE_BYTES as u64 {
             return None;
         }
+        let bytes = std::fs::read(p).ok()?;
         let (width, height) = super::probe_dims(&bytes);
         let name = p.file_stem()?.to_str().map(|s| s.to_string());
         Some(ClipboardImage {
