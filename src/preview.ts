@@ -277,7 +277,17 @@ function closeSelf() {
   // 先广播再关窗 —— 浮窗状态机（previewTodoId/previewPinnedId）靠它复位。
   // 后端主动 close 的路径（浮窗 grace close / hide）走 beforeunload 补发。
   emit("usticky://preview-closed", {}).catch(() => {});
-  win.close().catch((e) => console.debug("[preview] close failed", e));
+  // win.close 失败时复位 closing + 走后端 force close 兜底 -- 否则 closing
+  // 永远 true，后续 Esc / blur 全被 `if (closing) return` 吞掉，窗口卡死
+  // 常驻置顶（v0.2.4 用户实测：预览常驻、Esc 无效）。后端 close_preview_window
+  // 走 Rust w.close()，不经过本 JS closing 标志，是最后的兜底。
+  win.close().catch((e) => {
+    console.debug("[preview] close failed, 走后端 force close 兜底", e);
+    closing = false;
+    invoke("close_preview_window", { force: true }).catch((e2) =>
+      console.debug("[preview] backend force close also failed", e2),
+    );
+  });
 }
 
 // ── 加载指定 todo ──

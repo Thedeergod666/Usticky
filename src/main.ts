@@ -1654,9 +1654,19 @@ async function init() {
         );
         if (old) unhoverCard(old);
       }
+      previewWasOver = true;
       return;
     }
     previewMouseInside = false;
+    // over_preview true->false 边沿：鼠标刚从预览窗滑回浮窗。此时
+    // rustHoveredCardId 仍是 null（over_preview 期间被清空），若落在空白区
+    // newId===rustHoveredCardId（都 null）会命中下面 line ~1686 的短路
+    // return -> schedulePreviewClose 永不重排 -> 预览常驻（v0.2.4 回归根因）。
+    // 置 justLeftPreview 跳过该短路一次，让卡->空白分支的 schedulePreviewClose
+    // 得以执行；下一 tick previewWasOver 已复位，稳态 null===null 仍短路（防
+    // 每 tick 重排 timer 永不触发）。
+    const justLeftPreview = previewWasOver;
+    previewWasOver = false;
 
     // payload 已是视口相对坐标（Rust 端换算），直接喂 elementFromPoint
     const relX = e.payload.x;
@@ -1683,7 +1693,7 @@ async function init() {
     setBtnHover(btnHit);
     const card = el?.closest<HTMLElement>(".todo-card") ?? null;
     const newId = card?.dataset.todoId ?? null;
-    if (newId === rustHoveredCardId) return; // 还在同一张卡上
+    if (newId === rustHoveredCardId && !justLeftPreview) return; // 还在同一张卡上
 
     // 卡切换 / 卡→空白：收起上一张，展开新一张（如果有）
     if (rustHoveredCardId !== null) {
@@ -1845,9 +1855,18 @@ async function init() {
     .catch((e) => console.error("[usticky] listen preview-focused failed", e));
   listen<{ id: string }>("usticky://preview-left", (e) => {
     const id = e.payload.id;
-    if (previewPinnedId !== id) return;
-    previewPinnedId = null;
     if (previewTodoId !== id) return;
+    // preview-left 只在预览窗**未聚焦**时发出（preview.ts mouseleave 守卫
+    // `!focused` 才 emit），即 hover 面板被鼠标离开。pinned（聚焦）的预览
+    // 不发 preview-left -- 它的关闭归 blur / Esc（preview.ts onFocusChanged）。
+    //
+    // v0.2.4 回归：旧实现 `if (previewPinnedId !== id) return` 对 hover 面板
+    // 恒命中（previewPinnedId 始终 null）-> 直接 return -> 鼠标离开预览窗后
+    // grace close 永不重排 -> 预览常驻。这里改为：只要还是当前预览就重排
+    // grace close（schedulePreviewClose 内部守卫仍挡 pinned / mouseInside）。
+    // 与 hover-pos 的 justLeftPreview 边沿互为双保险（preview-left 走 mouseleave
+    // 事件、hover-pos 走 50ms tick，任一先到都能兜住）。
+    if (previewPinnedId === id) previewPinnedId = null;
     schedulePreviewClose();
   })
     .then((fn) => (unlistenPreviewLeft = fn))
