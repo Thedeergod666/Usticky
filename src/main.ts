@@ -1082,26 +1082,8 @@ async function deleteTodo(todo: Todo) {
     setTimeout(async () => {
       try {
         await invoke("delete_todo", { id: todo.id });
-        // 新删顶掉旧 undo 条目（旧的真删附件）-> 存新条目 -> 显示
-        // 带撤销按钮的 action flash。8s 超时后真删附件 + 关 flash。
-        clearUndoEntry(true);
-        const entry: UndoEntry = {
-          todo,
-          file: todo.attachment?.file ?? null,
-          timer: null,
-        };
-        entry.timer = setTimeout(() => {
-          clearUndoEntry(true);
-          hideMiniFlash();
-        }, DELETE_UNDO_MS);
-        undoEntry = entry;
-        showActionFlash(
-          t("app.delete.flash", { title: todo.title }),
-          t("app.action.undo"),
-          () => {
-            void undoDelete();
-          },
-        );
+        // undo flash 由 `todo-deleted` 事件 listener 统一显示 -- 这样
+        // 预览窗删除（不走本函数）也有撤销入口。
       } catch (e) {
         console.error("[usticky] delete_todo failed", e);
         row.classList.remove("vanishing");
@@ -1514,6 +1496,36 @@ async function init() {
   })
     .then((fn) => (unlistenTodos = fn))
     .catch((e) => console.error("[usticky] listen todos-changed failed", e));
+
+  // ── 删除撤销：后端 emit 被删 Todo，据此显示 action flash ──
+  // 统一入口 -- 主浮窗删除按钮 + 预览窗删除按钮都走 delete_todo -> 后端
+  // emit todo-deleted -> 这里存 undoEntry + 显示带撤销的 flash。
+  let unlistenTodoDeleted: UnlistenFn | null = null;
+  listen<Todo>("usticky://todo-deleted", (e) => {
+    const todo = e.payload;
+    // 新删顶掉旧 undo 条目（旧的真删附件）-> 存新条目 -> 显示带撤销
+    // 按钮 action flash。8s 超时后真删附件 + 关 flash。
+    clearUndoEntry(true);
+    const entry: UndoEntry = {
+      todo,
+      file: todo.attachment?.file ?? null,
+      timer: null,
+    };
+    entry.timer = setTimeout(() => {
+      clearUndoEntry(true);
+      hideMiniFlash();
+    }, DELETE_UNDO_MS);
+    undoEntry = entry;
+    showActionFlash(
+      t("app.delete.flash", { title: todo.title }),
+      t("app.action.undo"),
+      () => {
+        void undoDelete();
+      },
+    );
+  })
+    .then((fn) => (unlistenTodoDeleted = fn))
+    .catch((e) => console.error("[usticky] listen todo-deleted failed", e));
 
   // **P1-4 fix**：监听 persist-failed 事件。
   //
@@ -2045,6 +2057,7 @@ async function init() {
   // ── beforeunload 清理 ──
   window.addEventListener("beforeunload", () => {
     unlistenTodos?.();
+    unlistenTodoDeleted?.();
     unlistenPersistFailed?.();
     unlistenQuickAdd?.();
     unlistenPinMode?.();

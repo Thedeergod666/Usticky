@@ -191,6 +191,9 @@ pub async fn delete_todo(
     // 8s 内可点「撤销」调 `restore_todo` 恢复（图片完整可恢复）；超时后前端
     // 调 `purge_attachment` 真删文件。崩溃/异常退出留下的孤儿由启动孤儿扫描
     // 兜底（`Store::purge_orphan_attachments`）。
+    // emit 被删的完整 Todo -- 主浮窗据此显示「撤销」action flash。统一走
+    // 事件（而非由各调用点自己管 undo）让预览窗删除也有撤销入口。
+    let _ = app.emit("usticky://todo-deleted", &deleted);
     persist_and_emit(&app, &store).await;
     Ok(deleted)
 }
