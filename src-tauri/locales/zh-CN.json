@@ -7,10 +7,14 @@
       "no_primary_monitor": "未检测到主显示器",
       "unsupported_locale": "不支持的语言",
       "shortcut_no_modifier": "快捷键必须包含至少一个修饰键（Ctrl / Alt / Shift / Cmd）"
+    },
+    "paste": {
+      "image_title": "📎 图片"
     }
   },
   "window": {
-    "settings": "设置"
+    "settings": "设置",
+    "preview": "预览"
   },
   "tray": {
     "toggle": "切换浮窗显隐",

@@ -66,6 +66,21 @@ pub enum TodoPriority {
     P3,
 }
 
+/// 图片附件元数据（v0.2 剪贴板粘贴）。
+///
+/// 只存**相对文件名**（`<uuid>.<ext>`），绝对路径由 `Store::attachments_dir()`
+/// 在运行时拼 —— 数据目录被搬走 / 跨机器拷贝 todos.json 时路径不失效。
+/// `width/height` 用于预览窗口按图片比例定初始尺寸，None = 探测失败。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoAttachment {
+    pub file: String,
+    pub mime: String,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Todo {
     pub id: String, // UUID v4
@@ -77,6 +92,9 @@ pub struct Todo {
     pub due_at: Option<i64>,
     pub tags: Vec<String>,
     pub order: i32,
+    /// v0.2 新增：剪贴板图片附件。旧版 todos.json 没有此字段 → serde default None。
+    #[serde(default)]
+    pub attachment: Option<TodoAttachment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -190,6 +208,16 @@ impl Store {
     }
 
     pub fn add(&mut self, title: String) -> Todo {
+        self.add_with_attachment(title, None)
+    }
+
+    /// v0.2 剪贴板图片粘贴：带附件的 add。order 逻辑跟纯文本 add 完全一致
+    /// （append 到 pending 段末尾，max_order + 1）。
+    pub fn add_with_attachment(
+        &mut self,
+        title: String,
+        attachment: Option<TodoAttachment>,
+    ) -> Todo {
         let now = chrono::Utc::now().timestamp_millis();
         let max_order = self
             .data
@@ -209,6 +237,7 @@ impl Store {
             due_at: None,
             tags: vec![],
             order: max_order + 1,
+            attachment,
         };
         self.data.todos.push(todo.clone());
         todo
@@ -556,6 +585,13 @@ impl Store {
             .clone()
     }
 
+    /// 附件目录（`<data_dir>/attachments/`）。剪贴板图片落盘 + 前端缩略图 /
+    /// 预览窗口拼绝对路径都用它。调用方负责 create_dir_all（写路径自然会建）。
+    pub fn attachments_dir(&self) -> Option<PathBuf> {
+        self.data_path_clone()
+            .and_then(|p| p.parent().map(|d| d.join("attachments")))
+    }
+
     /// 拿 data_path（不可变引用版本）。给 [`persist`] 内部用。
     fn data_path(&self) -> Result<PathBuf> {
         self.data_path
@@ -712,6 +748,7 @@ mod reorder_tests {
             due_at: None,
             tags: vec![],
             order,
+            attachment: None,
         }
     }
 

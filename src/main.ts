@@ -12,7 +12,7 @@
 //   - lastGoodSnap + TRANSIENT_ERROR_KINDS（todo 没有瞬态错误）
 //   - 多 provider 调度（todo 就一个 list）
 //   - 撤销栈（v0.2 候选）
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import Sortable from "sortablejs";
@@ -29,6 +29,15 @@ let isQuickAddActive = false;
 type TodoStatus = "pending" | "done";
 type TodoPriority = "P0" | "P1" | "P2" | "P3";
 
+/// v0.2 剪贴板图片附件。file 是相对 attachments/ 的文件名，
+/// 绝对路径 = attachmentsDir + "/" + file，显示走 convertFileSrc（asset 协议）。
+interface TodoAttachment {
+  file: string;
+  mime: string;
+  width?: number | null;
+  height?: number | null;
+}
+
 interface Todo {
   id: string;          // UUID v4 (stable key for diff / drag)
   title: string;
@@ -39,6 +48,7 @@ interface Todo {
   due_at: number | null;
   tags: string[];
   order: number;       // 同 status 内独立排序
+  attachment?: TodoAttachment | null;
 }
 
 interface TodoSnapshot {
@@ -48,6 +58,15 @@ interface TodoSnapshot {
 
 // ── 全局状态 ──
 const app = document.getElementById("app")!;
+/// 附件目录绝对路径（init 时从后端 get_attachments_dir 拉一次，运行期不变）。
+let attachmentsDir: string | null = null;
+
+/// 附件文件名 → <img> 可用 URL。拉不到目录时返 null（缩略图退化隐藏）。
+function attachmentUrl(file: string): string | null {
+  if (!attachmentsDir) return null;
+  const sep = attachmentsDir.endsWith("/") || attachmentsDir.endsWith("\\") ? "" : "/";
+  return convertFileSrc(attachmentsDir + sep + file);
+}
 let lastRenderedSnap: TodoSnapshot | null = null;
 let lastFitFingerprint: string | null = null;
 let sortableInstances: Sortable[] = [];  // 保存实例，cleanup 用
@@ -78,7 +97,7 @@ let rustHoveredCardId: string | null = null;
 ///
 /// 未来新增"不应被 SortableJS 当作拖拽起点"的卡内控件（如优先级 chip、
 /// 标签按钮），只需把选择器追加到这条常量里。
-const NON_DRAGGABLE_SELECTORS = ".todo-check, .todo-delete, .todo-copy, .todo-edit-input";
+const NON_DRAGGABLE_SELECTORS = ".todo-check, .todo-delete, .todo-copy, .todo-edit-input, .todo-thumb";
 
 // 浮窗层级模式（pin_top / pin_bottom / normal）
 // 启动时从后端 get_pin_mode 拉，跟 usticky://pin-mode-changed 事件同步
@@ -158,13 +177,16 @@ type NarrowTier = 0 | 1;
 ///  - tier 1（图标，w < NARROW_THRESHOLD）：
 ///          hint = 9px + 无背景 + '⌘⇧'（去 'Space' 文字，再省 ~20px）
 ///
-/// 两档而不是三档的原因：用户实测 240-279px 区间 compact 版
-/// '⌘⇧Space' 仍被推出浮窗 —— 中文 13px 字号下 input 占位符
-/// '要做的事？回车保存' 实际渲染 ~135px（比英文 'What needs doing?
-/// Press Enter' 宽 ~25px），加上 hint '⌘⇧Space' (~46px) + gap + padding
-/// 在 260px 就开始裁字。tier 1 阈值取 minWidth 240 + 40px = 280，
-/// 280 以下 hint 直接 '⌘⇧' 图标版，足够 fit。
-const NARROW_THRESHOLD = 280;
+/// **v0.2.3 阈值 280 → 240**：旧实现 hint 被裁的根因是 flex item 的
+/// `min-width:auto` —— input 不肯缩到 placeholder 内容宽以下，hint
+/// （flex 0 0 auto）被推出瓦片右缘。v0.2.3 给 `.todo-input input` 加
+/// `min-width:0`（input 可缩，placeholder 自然截断显示），完整 hint
+/// '⌘⇧Space'（~46px）+ 独立粘贴框（~34px）在 minWidth 240 也能放下：
+/// 240 - app padding 10 - 粘贴框 34 - 行 gap 8 = 输入瓦片 ~188px，
+/// 内部 188 - 26(padding) - 8(gap) - 46(hint) ≈ 108px 留给 input。
+/// tier 1（图标版 '⌘⇧'）只剩 <240 的防御区间（minWidth 240 之下正常
+/// 不可达，手动拖窗 clamp 前的一瞬可能路过）。
+const NARROW_THRESHOLD = 240;
 
 /// 算当前宽度的档位。
 function computeNarrowTier(): NarrowTier {
@@ -311,11 +333,15 @@ function render(snap: TodoSnapshot) {
   //   1. Rust 路径激活，hover 卡 A → rustHoveredCardId = "A"
   //   2. 外部 todos-changed 触发 render，DOM 重建
   //   3. 下一个 hover-pos 事件：`newId === rustHoveredCardId`（都是 "A"）→
-  //      短路 return，不调 scheduleHoverResize
-  //   4. 新建卡 A 没有 .title-expanded，卡片永久不展开，直到鼠标移到别的卡
+  //      短路 return，不调 hoverCard
+  //   4. 新建卡 A 永远进不了 hover 态（按钮不显 / 预览 dwell 不起），
+  //      直到鼠标移到别的卡
   //
   // 类似地（次要）isDragging 已由 cleanupSortables 清，这里不必重做。
   rustHoveredCardId = null;
+  // render 重建后卡在 DOM 里的 hover 态丢失，dwell 中的预览若仍指向
+  // 旧卡 id 也无害（open_preview_window 按 id 工作，与 DOM 节点无关）。
+  cancelPreviewDwell();
 
   // 清掉旧内容（保留 input / foot）
   cleanupSortables();
@@ -439,10 +465,31 @@ function buildTodoRow(todo: Todo): HTMLElement {
   });
   row.appendChild(check);
 
+  // v0.2 图片附件缩略图：GIF 在 <img> 里原生动画。点击 → 聚焦预览窗
+  // （pinned 模式）。加载失败（附件文件丢了）→ 隐藏缩略图，不留裂图。
+  if (todo.attachment) {
+    const thumb = document.createElement("img");
+    thumb.className = "todo-thumb";
+    thumb.alt = "";
+    thumb.draggable = false;
+    const url = attachmentUrl(todo.attachment.file);
+    if (url) thumb.src = url;
+    thumb.title = t("app.action.preview");
+    thumb.setAttribute("aria-label", t("app.action.preview"));
+    thumb.addEventListener("error", () => thumb.remove());
+    thumb.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void openPreviewPinned(todo.id);
+    });
+    row.appendChild(thumb);
+  }
+
   const title = document.createElement("div");
   title.className = "todo-title";
   title.textContent = todo.title;
-  title.title = todo.title;  // hover tooltip for truncated
+  // 注意：不挂原生 title= tooltip —— hover 停留 ~1-2s 后 macOS 弹白色
+  // 小条，跟 QuickLook 预览窗视觉打架（用户误报"有时显示小弹窗"）。
+  // 长文预览统一走 dwell → open_preview_window。
   // 点击 title 区域进入编辑态（不要影响 .todo-check / .todo-delete 上的
   // 完成/删除按钮 —— 它们各自 stopPropagation 已在上面挂好）。
   // 单击即触发；不用 dblclick，避免"先点没反应"的体感。
@@ -467,9 +514,9 @@ function buildTodoRow(todo: Todo): HTMLElement {
   copyBtn.className = "todo-copy";
   // **P3-5 fix**：aria-label 让屏幕阅读器可读。SVG 内部去掉了
   // aria-hidden（见 COPY_ICON_SVG 定义），让父按钮的 aria-label 生效。
+  // 注意：不挂 title= —— v0.2.1 规则：浮窗内不准用原生 tooltip。
   copyBtn.setAttribute("aria-label", t("app.action.copy"));
   copyBtn.innerHTML = COPY_ICON_SVG;
-  copyBtn.title = t("app.action.copy");
   copyBtn.addEventListener("click", (e) => {
     e.stopPropagation();
     void copyTodoText(todo);
@@ -479,8 +526,7 @@ function buildTodoRow(todo: Todo): HTMLElement {
   const del = document.createElement("button");
   del.className = "todo-delete";
   del.setAttribute("aria-label", t("app.action.delete"));
-  del.textContent = "×";
-  del.title = t("app.action.delete");
+  del.innerHTML = TRASH_ICON_SVG;  // v0.2.4：垃圾桶图标（原 "×" 文字）
   del.addEventListener("click", (e) => {
     e.stopPropagation();
     // 二次确认：第一次点击只进入确认态（按钮变红），3s 内第二次点击
@@ -501,12 +547,11 @@ function buildTodoRow(todo: Todo): HTMLElement {
     btn.addEventListener("mouseleave", () => setBtnHover(null));
   }
 
-  // 卡片 hover：挂 .card-hover（操作按钮显隐）+ 展开截断的 title，
-  // 离开时收回。聚焦走这里的 mouseenter/leave，未聚焦走 Rust hover-pos
-  // （同一对 hoverCard/unhoverCard，单一状态机，不依赖 CSS :hover ——
-  // 非 key window 的 WKWebView :hover 不可靠且会 stuck 残留）。
-  // scheduleHoverResize 复用 rAF coalescing + delta 检测，同帧跨卡切换
-  // 只触发一次 resize IPC，视觉无抖动。
+  // 卡片 hover：挂 .card-hover（操作按钮显隐）+ 启动 QuickLook 预览 dwell
+  // （截断长文 / 图片卡），离开时收回。聚焦走这里的 mouseenter/leave，
+  // 未聚焦走 Rust hover-pos（同一对 hoverCard/unhoverCard，单一状态机，
+  // 不依赖 CSS :hover —— 非 key window 的 WKWebView :hover 不可靠且会
+  // stuck 残留）。
   row.addEventListener("mouseenter", () => {
     hoverCard(row);
   });
@@ -558,61 +603,133 @@ function renderEmptyState() {
 
 // ── 自适应高度 ──
 
-/// hover-expand：截断的 title 在卡片 hover 时换行展开（独立路径，绕开
-/// autoResizeWindow 的 contentFingerprint 去重 —— 文本变化不该触发结构
-/// resize，但 hover 是用户主动意图，每次都要按需 fit）。
-const TITLE_EXPAND_CLASS = "title-expanded";
 /// 卡片级 hover 态 class：Rust hover-pos 路径（未聚焦窗口收不到 CSS :hover）
 /// 命中的卡片挂上它，CSS 据此显示卡内操作按钮（复制 / 删除）。
 const CARD_HOVER_CLASS = "card-hover";
-// delta < 4px 视为不变化，跳过 resize（避免 1px 抖动触发 IPC）
-const HOVER_RESIZE_DELTA_PX = 4;
-// rAF coalescing：同一帧内多次 mouseenter/mouseleave 只触发一次 resize
-let hoverResizePending = false;
 
-/// 把卡片切到 expanded/collapsed 态，rAF 后测 delta 决定是否 resize。
-///
-/// 不在 input 打字时调用（typing 检测跟 render 一致 line 266-270），
-/// 不在 vanish 动画中调用，幂等切换（已是目标态直接返回）。
-///
-/// 未截断的 title 也走这条路径 —— toggle class 后视觉不变，
-/// scrollHeight delta = 0，delta 检测自然 skip resize，零副作用。
-function scheduleHoverResize(card: HTMLElement, expanding: boolean) {
-  const appEl = document.getElementById("app");
-  if (!appEl) return;
+// ── QuickLook 预览状态机（v0.2.1+ 即时跟手版） ──
+//
+// 旧行为：hover 截断 title → dwell 350-600ms → 弹预览窗，定位固定浮窗左侧。
+// 新行为（用户 2026-08-05 需求）：**hover 任意卡 ~80ms 微防抖后立即出**
+// （prewarm 已藏建，show 即显）；预览开着时 hover 别的卡 → **0ms 立即切换**
+// 内容 + 窗口跟到那张卡旁边（默认卡左、y 对齐卡顶，左不够放右）；文本卡
+// 高度前端预测量，窗口一次开到位 —— show 后再 resize 是闪的根源之一。
+//
+// 状态：
+//   previewTodoId      — 当前预览的 todo
+//   previewPinnedId    — 显式 pin：点击缩略图聚焦 / 预览窗内真实 mouseenter
+//                        （= 用户在编辑）。pinned 期间 hover 不换内容、不关窗。
+//   previewMouseInside — 鼠标在预览窗上（Rust hit-test over_preview），仅
+//                        阻止自动关闭，**不**阻塞 hover 换卡（路过预览窗
+//                        不该把内容锁死 —— 跟显式 pin 区分）。
+// 关闭：unhover / hover(false) / 浮窗空白区停留 → 统一 schedulePreviewClose
+// （450ms grace；鼠标从卡片穿缝进预览窗会短暂"两个窗口都不在"，v0.2.1 的
+// 立即关会把跟手体验闪断）。
+const PREVIEW_DWELL_FIRST_MS = 80;
+const PREVIEW_CLOSE_GRACE_MS = 450;
+/// 预览窗文本宽度（逻辑 px）—— 与 Rust preview_logical_size 的 TEXT_W 对齐。
+const PREVIEW_TEXT_W = 460;
 
-  // 防御：节点已在 vanish 动画中（被删 / 即将被删）
-  if (card.classList.contains("vanishing")) return;
-  if (!card.isConnected) return;
+let previewTodoId: string | null = null;
+let previewPinnedId: string | null = null;
+let previewMouseInside = false;
+let previewDwellTimer: ReturnType<typeof setTimeout> | null = null;
+let previewCloseTimer: ReturnType<typeof setTimeout> | null = null;
+/// 预览窗是否已预热（隐藏创建过一次）。首次 floating-hover(true) 触发。
+let previewPrewarmed = false;
 
-  // 输入中禁止 resize —— 跟 line 266-270 的 typing 检测保持一致
-  // **P2-2 fix**：用 isUserTyping() helper，涵盖 .todo-edit-input。
-  if (isUserTyping()) return;
+function cancelPreviewDwell() {
+  if (previewDwellTimer !== null) {
+    clearTimeout(previewDwellTimer);
+    previewDwellTimer = null;
+  }
+}
 
-  // 已经是目标态 → 跳过（鼠标快速进出同一卡 / 重复 enter）
-  const wasExpanded = card.classList.contains(TITLE_EXPAND_CLASS);
-  if (expanding === wasExpanded) return;
+function cancelPreviewClose() {
+  if (previewCloseTimer !== null) {
+    clearTimeout(previewCloseTimer);
+    previewCloseTimer = null;
+  }
+}
 
-  const beforeH = appEl.scrollHeight;
-  card.classList.toggle(TITLE_EXPAND_CLASS, expanding);
+/// 文本卡内容高度预测量：offscreen div 与 preview.css 的 .preview-text
+/// 同宽同字体（宽 432 = 460 - panel padding 14×2；font 13px/1.5，
+/// padding 10/12，border-box）。量准了 Rust 才能一次把窗口开到位。
+let previewMeasurer: HTMLDivElement | null = null;
+function measurePreviewTextHeight(text: string): number {
+  if (!previewMeasurer) {
+    previewMeasurer = document.createElement("div");
+    previewMeasurer.setAttribute(
+      "style",
+      "position:absolute;left:-10000px;top:0;visibility:hidden;pointer-events:none;" +
+        "box-sizing:border-box;white-space:pre-wrap;word-break:break-word;" +
+        "font-size:13px;line-height:1.5;padding:10px 12px;border:1px solid transparent;" +
+        'font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",' +
+        '"Segoe UI","Microsoft YaHei",sans-serif;',
+    );
+    document.body.appendChild(previewMeasurer);
+  }
+  previewMeasurer.style.width = `${PREVIEW_TEXT_W - 28}px`;
+  previewMeasurer.textContent = text;
+  return previewMeasurer.scrollHeight;
+}
 
-  // rAF coalescing：同一帧内多次调用只测一次 / resize 一次
-  if (hoverResizePending) return;
-  hoverResizePending = true;
-  requestAnimationFrame(() => {
-    hoverResizePending = false;
-    const afterH = appEl.scrollHeight;
-    const delta = afterH - beforeH;
-    if (Math.abs(delta) < HOVER_RESIZE_DELTA_PX) return;
-    void resizeWindowToContent(appEl);
+/// 打开 / 切换预览。anchorY = 卡片视口顶（Rust 换算屏幕坐标做跟手定位）；
+/// 文本卡附预测量高度 textH（图片卡由 Rust 按附件宽高比算）。
+/// invoke 失败回滚 previewTodoId/previewPinnedId，防状态卡死。
+function openPreviewFor(id: string, card: HTMLElement | null, pinned: boolean) {
+  previewTodoId = id;
+  const args: Record<string, unknown> = { todoId: id, pinned };
+  if (card) args.anchorY = card.getBoundingClientRect().top;
+  const todo = lastRenderedSnap?.todos.find((t) => t.id === id);
+  if (todo && !todo.attachment) args.textH = measurePreviewTextHeight(todo.title);
+  invoke("open_preview_window", args).catch((e) => {
+    if (previewTodoId === id) previewTodoId = null;
+    if (previewPinnedId === id) previewPinnedId = null;
+    console.debug("[usticky] open_preview_window failed", e);
   });
 }
 
-/// Rust hover-pos 路径：把卡片切到 hover 态（操作按钮显隐 + 长文展开）。
-/// 聚焦窗口的 CSS :hover / mouseenter 路径不走这里。
+/// 统一 grace close：450ms 内鼠标进预览窗（over_preview）/ 回卡片 /
+/// 回浮窗都会 cancel。显式 pin（编辑态）/ 鼠标在预览窗上 → 直接不排。
+function schedulePreviewClose() {
+  if (previewTodoId === null || previewPinnedId !== null || previewMouseInside) return;
+  cancelPreviewClose();
+  const id = previewTodoId;
+  previewCloseTimer = setTimeout(() => {
+    previewCloseTimer = null;
+    if (previewTodoId !== id || previewPinnedId) return;
+    previewTodoId = null;
+    invoke("close_preview_window", { force: false }).catch((e) =>
+      console.debug("[usticky] close_preview_window failed", e),
+    );
+  }, PREVIEW_CLOSE_GRACE_MS);
+}
+
+/// 进入卡片 hover：挂 .card-hover（操作按钮显隐）+ 立即出/切预览。
+/// 聚焦窗口走 mouseenter，未聚焦走 Rust hover-pos（同一状态机）。
 function hoverCard(card: HTMLElement) {
   card.classList.add(CARD_HOVER_CLASS);
-  scheduleHoverResize(card, true);
+  const id = card.dataset.todoId;
+  if (!id) return;
+  // 显式 pin（用户进了预览窗编辑）→ hover 不抢内容。想换预览的唯一
+  // 路径是显式点击别的缩略图（openPreviewPinned）。
+  if (previewPinnedId !== null) return;
+  // 回到任意卡 = 关闭意图取消（必须在 previewTodoId===id 短路之前，
+  // 否则 unhover 排的 grace close 会在"回同一张卡"时照样炸）。
+  cancelPreviewClose();
+  // 已在预览这张 → 不动
+  if (previewTodoId === id) return;
+  cancelPreviewDwell();
+  // 预览已开 → 0ms 立即切换（跟手）；未开 → 80ms 微防抖（横扫列表防误触发）
+  if (previewTodoId !== null) {
+    openPreviewFor(id, card, false);
+    return;
+  }
+  previewDwellTimer = setTimeout(() => {
+    previewDwellTimer = null;
+    openPreviewFor(id, card, false);
+  }, PREVIEW_DWELL_FIRST_MS);
 }
 
 /// hoverCard 的逆操作 —— 卡间切换 / 离开浮窗 / 坐标出界时调用。
@@ -620,8 +737,23 @@ function hoverCard(card: HTMLElement) {
 /// 在看不到按钮的情况下第二次点击直接删除）。
 function unhoverCard(card: HTMLElement) {
   card.classList.remove(CARD_HOVER_CLASS);
-  if (card.dataset.todoId) resetDeleteConfirm(card.dataset.todoId);
-  scheduleHoverResize(card, false);
+  cancelPreviewDwell();
+  const id = card.dataset.todoId;
+  if (id) resetDeleteConfirm(id);
+  if (!id || previewTodoId !== id) return;
+  schedulePreviewClose();
+}
+
+/// 点击缩略图 → 聚焦预览窗（编辑入口）。pinned 后浮窗侧不再自动关窗，
+/// 窗口生命周期归 preview.ts（Esc / blur 自关，emit preview-closed 同步）。
+function openPreviewPinned(todoId: string) {
+  cancelPreviewDwell();
+  cancelPreviewClose();
+  previewPinnedId = todoId;
+  const card = app.querySelector<HTMLElement>(
+    `.todo-card[data-todo-id="${cssEscape(todoId)}"]`,
+  );
+  openPreviewFor(todoId, card, true);
 }
 
 // ── 按钮 hover 反馈（.btn-hover + 手型光标） ──
@@ -689,8 +821,8 @@ async function addTodo(title: string): Promise<boolean> {
     showMiniFlash(t("app.error.empty_title"));
     return false;
   }
-  if (trimmed.length > 280) {
-    showMiniFlash(t("app.error.too_long", { max: 280 }));
+  if (trimmed.length > 114514) {
+    showMiniFlash(t("app.error.too_long", { max: 114514 }));
     return false;
   }
   try {
@@ -759,8 +891,34 @@ async function toggleDone(todo: Todo) {
 
 // ── 复制按钮 ──
 /// 复制图标（两个叠放的圆角矩形，feather "copy" 风格），currentColor
-/// 跟随按钮文字色，跟 .todo-delete 的 "×" 一样是 inline 图标。
+/// 跟随按钮文字色，inline 图标。
 const COPY_ICON_SVG = `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"><rect x="4.2" y="4.2" width="6.8" height="6.8" rx="1.4"/><path d="M7.8 4.2V2.6A1.6 1.6 0 0 0 6.2 1H2.6A1.6 1.6 0 0 0 1 2.6v3.6a1.6 1.6 0 0 0 1.6 1.6h1.6"/></svg>`;
+/// 垃圾桶图标（lucide trash-2 风格，v0.2.4 起替代 "×" 文字 —— 用户要求
+/// 删除按钮全 App 统一成垃圾桶：todo 卡 + 预览窗同图标）。24 网格 12px
+/// 显示，stroke-width 2 ≈ 视觉 1px。
+const TRASH_ICON_SVG = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>`;
+
+/// 粘贴图标（剪贴板 + 下方横线，lucide "clipboard-paste" 风格）。
+const PASTE_ICON_SVG = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H9a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1Z"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M12 11v6"/><path d="m9 14 3 3 3-3"/></svg>`;
+
+/// v0.2 粘贴按钮：后端读 OS 剪贴板（文本 / 图片 / 空）→ 直接落 pending。
+/// Rust 端读剪贴板无焦点要求 —— 未聚焦浮窗也能粘（前端
+/// navigator.clipboard.read() 在非 key window 下不可靠，同 copyTodoText
+/// 的 writeText 失败同理，所以不走前端 Clipboard API）。
+async function pasteFromClipboard() {
+  try {
+    const res = await invoke<{ kind: string; title: string }>("paste_from_clipboard");
+    showMiniFlash(res.kind === "image" ? t("app.paste.flash_image") : t("app.paste.flash"));
+  } catch (e) {
+    // 后端 Err("empty") = 剪贴板为空（或只有空白文本）
+    if (String(e).includes("empty")) {
+      showMiniFlash(t("app.paste.empty"));
+    } else {
+      console.error("[usticky] paste_from_clipboard failed", e);
+      showMiniFlash(t("app.paste.failed"));
+    }
+  }
+}
 
 async function copyTodoText(todo: Todo) {
   try {
@@ -890,8 +1048,8 @@ function cleanupSortables() {
 //   4. 提交：Enter / blur；空内容 / 未改动 → 视为取消。
 //   5. 取消：Escape 键。
 //   6. 错误处理：保存失败回滚 input value（保留用户已输入文字），不闪退。
-//   7. 与 hover-expand 协作：编辑态期间关闭该卡的 title-expanded，避免
-//      input 框被外层 .title-expanded 的 white-space: normal 干扰。
+//   7. 与 QuickLook 预览协作：编辑期间浮窗重建被 isEditing 跳过，
+//      预览窗（如果开着）不受影响，两者正交。
 //
 // 不需要的数据模型改动：后端 update_todo 早就有 title: Option<String>
 // 参数，commands/mod.rs line 81-100 直接复用。
@@ -905,9 +1063,6 @@ function enterEditMode(card: HTMLElement, todo: Todo) {
   // **P1-1 fix**：进入编辑模式 → render 跳过整窗重建
   isEditing = true;
 
-  // 关闭 hover-expand 态（如果正展开中）—— input 编辑不应该被外层换行影响
-  card.classList.remove("title-expanded");
-
   // 禁用所在 section 的 SortableJS —— 否则 mousedown 到 input 上
   // Sortable 会启动一个无效拖拽（input 没有 draggable 元素 + 拖动会被
   // input 的 focus 行为打断）。
@@ -920,7 +1075,7 @@ function enterEditMode(card: HTMLElement, todo: Todo) {
   const input = document.createElement("input");
   input.type = "text";
   input.className = "todo-edit-input";
-  input.maxLength = 280;
+  input.maxLength = 114514;
   input.value = todo.title;
   input.spellcheck = false;
   input.autocomplete = "off";
@@ -950,8 +1105,8 @@ function enterEditMode(card: HTMLElement, todo: Todo) {
       return;
     }
     // 字符上限校验（跟 addTodo 一致）
-    if (next.length > 280) {
-      showMiniFlash(t("app.error.too_long", { max: 280 }));
+    if (next.length > 114514) {
+      showMiniFlash(t("app.error.too_long", { max: 114514 }));
       settled = false;  // 允许重新提交
       // **P1-1 fix**：isEditing 已经是 true（enterEditMode 头置了），
       // 继续保留。这里不调 exitEditMode，input 仍在编辑态。
@@ -1037,7 +1192,7 @@ function exitEditMode(card: HTMLElement, newTitle: string) {
   const titleEl = document.createElement("div");
   titleEl.className = "todo-title";
   titleEl.textContent = newTitle;
-  titleEl.title = newTitle;
+  // 同 buildTodoRow：不挂原生 title= tooltip（跟预览窗打架）。
   // 重建 title 上的点击监听 —— 跟 buildTodoRow 行为一致
   // 重新 query 拿 todo（从 card.dataset.todoId 反查 lastRenderedSnap）
   const id = card.dataset.todoId;
@@ -1306,15 +1461,33 @@ async function init() {
       hoverEnterTimer = null;
     }
     setHoverAttr(e.payload);
+    // 回到浮窗 → 取消任何进行中的预览 grace close（穿缝/折返不闪断）
+    if (e.payload) cancelPreviewClose();
+    // 首次 hover 预热预览窗（隐藏创建，webview 提前加载完）→ 后续 dwell
+    // open 只剩定位+show，砍掉首次创建 300-500ms 的白屏延迟。
+    if (e.payload && !previewPrewarmed) {
+      previewPrewarmed = true;
+      invoke("prewarm_preview_window").catch((err) => {
+        previewPrewarmed = false; // 失败允许下次 hover 重试
+        console.debug("[usticky] prewarm_preview_window failed", err);
+      });
+    }
     // hover 收尾：收起 Rust 路径当前 hover 的卡（激活判定见 hover-pos 注释）
     if (!e.payload) {
       setBtnHover(null);
+      previewMouseInside = false;
       if (rustHoveredCardId !== null) {
         const oldId = rustHoveredCardId;
         rustHoveredCardId = null;
         const old = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(oldId)}"]`);
         if (old) unhoverCard(old);
       }
+      // 能收到 false 说明鼠标既不在浮窗也不在预览窗（Rust 端把
+      // over_preview 也算 inside）→ 预览收尾。统一走 grace close：
+      // 450ms 内穿缝进预览窗 / 折返浮窗都会 cancel；显式 pin（编辑中）
+      // 时 schedule 内部守卫直接不排，窗口归 preview.ts 自治。
+      cancelPreviewDwell();
+      schedulePreviewClose();
     }
   })
     .then((fn) => (unlistenHover = fn))
@@ -1322,12 +1495,12 @@ async function init() {
 
   // ── 未聚焦时 per-card hover：Rust 50ms tick emit 视口相对鼠标坐标 ──
   //
-  // 聚焦时 WebView 自己派 mouseenter/leave，已经驱动 scheduleHoverResize +
-  // CSS :hover（操作按钮显隐）。未聚焦时 WKWebView 不派 mouseenter 也不
-  // 激活 :hover，必须靠这条路径：Rust 发视口相对坐标（macOS/Windows 端
-  // 各自在同坐标系下相减完成换算，见 platform/*/HoverPos 注释）→
-  // document.elementFromPoint → 命中哪张 .todo-card → 挂 .card-hover
-  // （按钮显隐）+ scheduleHoverResize(true)（长文展开）。
+  // 聚焦时 WebView 自己派 mouseenter/leave，已经驱动 hoverCard 状态机
+  // （.card-hover 按钮显隐 + 预览 dwell）。未聚焦时 WKWebView 不派
+  // mouseenter 也不激活 :hover，必须靠这条路径：Rust 发视口相对坐标
+  // （macOS/Windows 端各自在同坐标系下相减完成换算，见
+  // platform/*/HoverPos 注释）→ document.elementFromPoint → 命中哪张
+  // .todo-card → hoverCard（按钮显隐 + QuickLook 预览 dwell）。
   //
   // 跟 body[data-hover] 玻璃色的关系：
   //   - body[data-hover] 用 usticky://floating-hover（edge-trigger，每 tick 不发）
@@ -1342,10 +1515,34 @@ async function init() {
   // （vite HMR 刷新后即便状态丢失，靠这里也能自愈，不用等鼠标重新进出）。
   let unlistenHoverPos: UnlistenFn | null = null;
 
-  listen<{ x: number; y: number }>("usticky://floating-hover-pos", (e) => {
+  listen<{ x: number; y: number; over_preview?: boolean }>(
+    "usticky://floating-hover-pos",
+    (e) => {
     if (!pageVisible) return;
     const appEl = document.getElementById("app");
     if (!appEl) return;
+
+    // 鼠标在预览窗上（Rust hit-test 命中 preview 窗口）→ 驻留态：
+    // 坐标相对浮窗无意义，不能跑 elementFromPoint；取消 dwell / grace
+    // close，浮窗卡片 unhover（藏按钮）。注意这里**只**置
+    // previewMouseInside（阻止自动关闭），不置 previewPinnedId ——
+    // 路过预览窗不该把内容锁死，回到浮窗 hover 别的卡仍要跟上。
+    if (e.payload.over_preview) {
+      previewMouseInside = true;
+      cancelPreviewDwell();
+      cancelPreviewClose();
+      setBtnHover(null);
+      if (rustHoveredCardId !== null) {
+        const oldId = rustHoveredCardId;
+        rustHoveredCardId = null;
+        const old = appEl.querySelector<HTMLElement>(
+          `.todo-card[data-todo-id="${cssEscape(oldId)}"]`,
+        );
+        if (old) unhoverCard(old);
+      }
+      return;
+    }
+    previewMouseInside = false;
 
     // payload 已是视口相对坐标（Rust 端换算），直接喂 elementFromPoint
     const relX = e.payload.x;
@@ -1368,7 +1565,7 @@ async function init() {
     const el = document.elementFromPoint(relX, relY);
     // 命中操作按钮 → 挂 .btn-hover + 切手型光标（未聚焦时 WKWebView 不
     // 更新 :hover / cursor，这条路径是唯一的 hover 反馈来源）
-    const btnHit = el?.closest<HTMLElement>(".todo-copy, .todo-delete") ?? null;
+    const btnHit = el?.closest<HTMLElement>(".todo-copy, .todo-delete, .todo-paste-btn") ?? null;
     setBtnHover(btnHit);
     const card = el?.closest<HTMLElement>(".todo-card") ?? null;
     const newId = card?.dataset.todoId ?? null;
@@ -1384,6 +1581,10 @@ async function init() {
     }
     rustHoveredCardId = newId;
     if (card && newId) hoverCard(card);
+    // 卡→空白（卡片缝隙 / 输入区 / 底部留白）：预览中的卡已无人 hover，
+    // 排 grace close（pinned / 鼠标在预览窗上时 schedule 内部守卫跳过；
+    // 450ms 内 hover 到新卡会被 hoverCard cancel —— 跟手切换不闪断）。
+    if (!newId) schedulePreviewClose();
   })
     .then((fn) => (unlistenHoverPos = fn))
     .catch((e) => console.error("[usticky] listen floating-hover-pos failed", e));
@@ -1407,11 +1608,11 @@ async function init() {
   let unlistenBackdropRefresh: UnlistenFn | null = null;
   listen("usticky://backdrop-refresh", () => {
     if (backdropRefreshTimer !== null) clearTimeout(backdropRefreshTimer);
-    const targets = app.querySelectorAll<HTMLElement>(".todo-card, .todo-input");
+    const targets = app.querySelectorAll<HTMLElement>(".todo-card, .todo-input, .todo-paste-btn");
     targets.forEach((el) => el.classList.add("force-reflow"));
     backdropRefreshTimer = setTimeout(() => {
       backdropRefreshTimer = null;
-      app.querySelectorAll<HTMLElement>(".todo-card.force-reflow, .todo-input.force-reflow")
+      app.querySelectorAll<HTMLElement>(".todo-card.force-reflow, .todo-input.force-reflow, .todo-paste-btn.force-reflow")
         .forEach((el) => el.classList.remove("force-reflow"));
     }, 100);
   })
@@ -1495,6 +1696,57 @@ async function init() {
   })
     .then((fn) => (unlistenShortcut = fn))
     .catch((e) => console.error("[usticky] listen shortcut-changed failed", e));
+
+  // ── v0.2 附件目录：缩略图 / convertFileSrc 拼 URL 用，拉一次即可 ──
+  try {
+    attachmentsDir = await invoke<string>("get_attachments_dir");
+  } catch (e) {
+    console.error("[usticky] get_attachments_dir failed", e);
+  }
+
+  // ── v0.2 预览窗 ↔ 浮窗同步（QuickLook 生命周期） ──
+  //   preview-entered：鼠标进了预览窗 → 只取消 grace close（v0.2.3 起**不
+  //                     pin** —— 预览窗一旦拿到焦点（acceptFirstMouse 点击 /
+  //                     show 抢 key），mouseenter 恢复派发就会误 pin，且聚焦
+  //                     时 preview-left 永不发出 → pin 锁死、hover 换卡失效）
+  //   preview-focused：预览窗真正拿到键盘焦点（= 用户点进去编辑）→ pin。
+  //                     焦点语义可靠：blur 必触发 closeSelf → preview-closed
+  //                     释放，不存在锁死路径
+  //   preview-left   ：鼠标离开预览窗（未聚焦）→ 解除 pin，重启 grace close
+  //   preview-closed ：预览窗关闭（Esc / blur 自关）→ 清两侧状态
+  let unlistenPreviewEntered: UnlistenFn | null = null;
+  let unlistenPreviewFocused: UnlistenFn | null = null;
+  let unlistenPreviewLeft: UnlistenFn | null = null;
+  let unlistenPreviewClosed: UnlistenFn | null = null;
+  listen<{ id: string }>("usticky://preview-entered", () => {
+    cancelPreviewClose();
+  })
+    .then((fn) => (unlistenPreviewEntered = fn))
+    .catch((e) => console.error("[usticky] listen preview-entered failed", e));
+  listen<{ id: string }>("usticky://preview-focused", (e) => {
+    previewPinnedId = e.payload.id;
+    cancelPreviewClose();
+  })
+    .then((fn) => (unlistenPreviewFocused = fn))
+    .catch((e) => console.error("[usticky] listen preview-focused failed", e));
+  listen<{ id: string }>("usticky://preview-left", (e) => {
+    const id = e.payload.id;
+    if (previewPinnedId !== id) return;
+    previewPinnedId = null;
+    if (previewTodoId !== id) return;
+    schedulePreviewClose();
+  })
+    .then((fn) => (unlistenPreviewLeft = fn))
+    .catch((e) => console.error("[usticky] listen preview-left failed", e));
+  listen("usticky://preview-closed", () => {
+    previewTodoId = null;
+    previewPinnedId = null;
+    previewMouseInside = false;
+    cancelPreviewDwell();
+    cancelPreviewClose();
+  })
+    .then((fn) => (unlistenPreviewClosed = fn))
+    .catch((e) => console.error("[usticky] listen preview-closed failed", e));
 
   // ── 浮窗拖动：左键 mousedown 但 target 是 .todo-card 或 button 时跳过 ──
   // 输入区（.todo-input / input）也允许拖窗，但要走阈值法：
@@ -1667,6 +1919,10 @@ async function init() {
     unlistenHover?.();
     unlistenHoverPos?.();
     unlistenShortcut?.();
+    unlistenPreviewEntered?.();
+    unlistenPreviewFocused?.();
+    unlistenPreviewLeft?.();
+    unlistenPreviewClosed?.();
     unlistenBackdropRefresh?.();
     unlistenBottomed?.();
     unlistenFocusChanged?.();
@@ -1710,16 +1966,38 @@ function onPinBottomHoverLeave() {
 }
 
 function ensureInputBar() {
-  if (app.querySelector(".todo-input")) return;
+  if (app.querySelector(".todo-input-row")) return;
+  // v0.2.3：粘贴按钮从 .todo-input 里拆出来，独立玻璃瓦片（参考用户
+  // 截图：左输入框右粘贴框，中间留缝）。行容器 .todo-input-row 做
+  // flex 布局；.todo-input 仍是输入瓦片（input + hint）。
   const bar = document.createElement("div");
-  bar.className = "todo-input";
+  bar.className = "todo-input-row";
   bar.innerHTML = `
-    <input type="text" maxlength="280" autocomplete="off" spellcheck="false"
-           placeholder="${escapeHtml(t("app.input.placeholder"))}" />
-    <span class="todo-input-hint">${escapeHtml(formatShortcutForDisplay(currentShortcut))}</span>
+    <div class="todo-input">
+      <input type="text" maxlength="114514" autocomplete="off" spellcheck="false"
+             placeholder="${escapeHtml(t("app.input.placeholder"))}" />
+      <span class="todo-input-hint">${escapeHtml(formatShortcutForDisplay(currentShortcut))}</span>
+    </div>
+    <button class="todo-paste-btn" type="button"
+            aria-label="${escapeHtml(t("app.action.paste"))}">${PASTE_ICON_SVG}</button>
   `;
-  // 插到最前（render 会保留）
+  // 插到最前（render 会保留）。注意：粘贴按钮**不挂 title=** ——
+  // v0.2.1 规则：浮窗内不准用原生 tooltip（跟预览窗视觉打架）。
   app.insertBefore(bar, app.firstChild);
+
+  // v0.2 粘贴按钮：读剪贴板 → 文本/图片直接落成 pending todo。
+  // 跟 input 内 Cmd+V 的区别：后者只粘纯文本进输入框，这里能粘图片。
+  const pasteBtn = bar.querySelector<HTMLButtonElement>(".todo-paste-btn")!;
+  pasteBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    void pasteFromClipboard();
+  });
+  // 手型光标 + hover 反馈：聚焦路径走这里的 mouseenter/leave（未聚焦路径
+  // 由 hover-pos 的 btnHit 命中驱动 —— 选择器已含 .todo-paste-btn）。
+  // 非聚焦 WKWebView 不更新 CSS cursor，setBtnHover → set_cursor_pointer
+  // 是唯一的指针切换通道（v0.2.4 修复"直接 hover 粘贴键不变手型"）。
+  pasteBtn.addEventListener("mouseenter", () => setBtnHover(pasteBtn));
+  pasteBtn.addEventListener("mouseleave", () => setBtnHover(null));
 
   const input = bar.querySelector<HTMLInputElement>("input")!;
   input.addEventListener("keydown", async (e) => {
@@ -1732,8 +2010,8 @@ function ensureInputBar() {
         showMiniFlash(t("app.error.empty_title"));
         return;
       }
-      if (trimmed.length > 280) {
-        showMiniFlash(t("app.error.too_long", { max: 280 }));
+      if (trimmed.length > 114514) {
+        showMiniFlash(t("app.error.too_long", { max: 114514 }));
         return;
       }
       // **P1-9 fix**：addTodo 失败时回填 input.value，保留用户输入。

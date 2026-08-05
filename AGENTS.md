@@ -1,6 +1,6 @@
 # Usticky 项目说明
 
-> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.1 骨架 + 设置面板 + 三档 pin mode** / 2026-07-06。
+> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.2.4 剪贴板粘贴 + QuickLook 预览（消闪收尾 + pin 焦点语义 + 预览 footer 日期/按钮）** / 2026-08-05。
 
 ## 这是什么
 
@@ -324,6 +324,78 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ✅ **`Cargo.toml:14` 改 `crate-type = ["rlib"]` 并加注释**。
 ✅ **AGENTS.md 文档修正**：v0.1.2 的 "P3-4 fix 不持锁 I/O" 描述是 stale claim（实际仍持锁；v0.1.5 才真正释放）；`render()` 实际是全量重建（非 "incremental DOM diff" 描述）；前端 `tray 全文案` claim 过期（实际 `tray.show`/`tray.hide` 是死 key，由后端 locales 覆盖）。
 
+### v0.2.0（2026-08-04，剪贴板粘贴 + QuickLook 预览窗）
+
+✅ **粘贴按钮**（输入行最右侧，`.todo-paste-btn`）：`paste_from_clipboard` 命令统一入口 —— 剪贴板是文本 → 整段作为一个 pending todo（多行保留，长文靠预览窗看全文）；是图片 → 落盘 `<data_dir>/attachments/<uuid>.<ext>` + 带 attachment 的 todo；空 → Err("empty") 前端 flash。Rust 端读剪贴板（tauri-plugin-clipboard-manager）无焦点要求，**不走**前端 `navigator.clipboard.read()`（非 key window 不可靠）。
+✅ **GIF / 图片支持**（[clipboard.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/clipboard.rs) 三条路径）：① macOS NSPasteboard 原始字节 —— `public.gif` 原数据**保动画**，`public.file-url` 支持 Finder 复制图片文件，`public.tiff` 走 image crate 转 PNG；② 插件 `read_image` RGBA → PNG 跨平台兜底（Win/Linux 主路径，**GIF 退化首帧**，已知限制）；③ 文本。体积上限 25MB。
+✅ **Todo.attachment 字段**（`TodoAttachment { file, mime, width, height }`，serde default 向后兼容）：只存相对文件名，绝对路径运行时拼（`Store::attachments_dir()`）。delete_todo 连带删附件文件（NotFound 不算错）。
+✅ **asset 协议显示**：tauri.conf.json `assetProtocol.scope = ["$APPDATA/attachments/**"]` + CSP `img-src` 加 `asset: http://asset.localhost`（Tauri 2 没有 core:asset 权限，纯 scope 配置驱动）。前端 `convertFileSrc(attachmentsDir + "/" + file)`，GIF 在 `<img>` 里原生动画。
+✅ **QuickLook 预览窗**（[preview.html](file:///Users/wyh/Project/Usticky/preview.html) + [preview.ts](file:///Users/wyh/Project/Usticky/src/preview.ts) + [preview.css](file:///Users/wyh/Project/Usticky/src/preview.css)）：独立动态 webview（抄 open_settings_window 模式），无边框透明 + always-on-top + acceptFirstMouse，定位浮窗左侧优先（放不下放右侧），尺寸按附件宽高比算。**hover 长文不再变长（hover-expand 整套退役，scheduleHoverResize/.title-expanded 已删）**：截断 title dwell 600ms / 图片卡 350ms → `open_preview_window(pinned=false)` 非聚焦面板；点击缩略图 → `pinned=true` 聚焦编辑态。
+✅ **预览窗可编辑**：textarea 防抖 700ms 自动保存（update_todo），空标题不保存；切 todo / 关窗前 flushPendingSave 强制落盘；外部 todos-changed 在 textarea 未聚焦时回填，todo 被删 → 自关。
+✅ **跨 webview 生命周期**（浮窗 main.ts 预览状态机 + preview.ts 配对）：`previewTodoId` / `previewPinnedId` / dwell timer / 450ms grace close timer。鼠标从卡片滑向预览窗时 preview.ts emit `preview-entered` → 浮窗取消自动关（pinned）；离开未聚焦 → `preview-left` 重启 grace close；Esc / 窗口 blur 自关 + emit `preview-closed` 双端复位。**pinned 期间 hover 其他卡不换预览内容**（防编辑被抢）。浮窗 hide（hide_dismiss + CloseRequested 两条路径）连带关预览窗。
+✅ **窗口复用**：open_preview_window 检测已开 → 不重建（避免 reload 丢编辑内容），emit `usticky://preview-todo` 原地换内容 + resize/移窗。position 是逻辑坐标（除 scale），set_position 是物理坐标 —— 别混。
+✅ 新增 i18n key：前端 `app.action.paste/preview` + `app.paste.*` + `preview.*`；后端 `commands.paste.image_title` + `window.preview`。
+✅ 构建验证：`pnpm build`（tsc + vite）✓、`cargo check --all-targets` 零警告 ✓、`cargo test --lib` 20/20 ✓。
+
+**已知限制**：Windows 剪贴板读图只有 RGBA（GIF 变首帧 PNG）；Finder 文件粘贴仅 macOS 支持；预览窗 blur 自关 = 编辑中切走 app 会关窗（内容已自动保存，可接受）。
+
+### v0.2.1（2026-08-05，hover 预览四问题修复）
+
+用户实测反馈四个问题，根因 + 修法：
+
+✅ **① hover 显示慢**：dwell 600/350ms 太长 + 首次创建 webview 300-500ms 白屏。修：dwell 砍到 **文本 350ms / 图片 250ms**（main.ts `PREVIEW_DWELL_TEXT/IMAGE_MS`）；首次 floating-hover(true) 时 `prewarm_preview_window` **隐藏创建**预览窗（webview 提前加载完），后续 dwell open 只剩定位+show。
+✅ **② 有时显示"小弹窗"**：不是预览窗，是 `.todo-title` 的原生 `title=` tooltip（macOS hover 停留 ~1-2s 弹白色小条）。修：buildTodoRow / exitEditMode 两处 `title.title = ...` **已删**，长文预览统一走 QuickLook 预览窗。**规则：浮窗/预览窗内不准用原生 title= tooltip**。
+✅ **③ 预览出现 ~2s 后丢毛玻璃**（gif 证实，连浮窗玻璃一起丢）：macOS WKWebView backdrop-filter sample 在新 always-on-top 窗口上屏后失效的旧病（v0.1.2 起浮窗靠 level 切换后 emit backdrop-refresh 救；预览窗开着期间没有 level 切换可搭车）。修：a) open/close preview 两条路径末尾 emit `usticky://backdrop-refresh` 救浮窗；b) preview.ts **heartbeat**（每 1200ms 给 .preview-panel 挂 100ms `.force-reflow`（`filter: drop-shadow(0 0 0 transparent)`，浮窗 styles.css 同款 paint invalidation），`visibilityState === "hidden"` 跳过 —— prewarm 隐藏态不耗 GPU）。
+✅ **④ 鼠标停在大卡片上预览会消失**（振荡）：根因双层 —— a) 预览窗定位可能盖住浮窗/鼠标 → `windowNumberAtPoint` 命中预览窗而非浮窗 → hover emitter 报 inside=false → unhoverCard → 450ms grace close → 关窗 → 又 inside → 循环；b) 预览窗非聚焦态 WKWebView 不派 mouseenter → `preview-entered` 发不出 → pinned 机制失效。修：
+  - **over_preview-inside**（macOS + Win 双端 hit test）：emitter 命中测试先看最上层是不是预览窗 —— 是 → `inside=true` + payload 加 `over_preview: true`（macOS 取 preview `windowNumber()` 比对 topmost；Win `WindowFromPoint` + `GetAncestor(GA_ROOT)` 比对 preview hwnd，**hwnd 每次现取不缓存** —— 窗口动态销毁重建会变）。前端 hover-pos listener 收到 `over_preview` → 预览 pinned + 取消 dwell/grace close + 浮窗卡片 unhover（先置 pinned 再 unhover，unhoverCard 的 pinned 守卫跳过关窗），**不跑 elementFromPoint**（坐标相对浮窗无意义）。
+  - **floating-hover(false) 才关预览**：能收到 false 说明鼠标既不在浮窗也不在预览窗 → 清 previewTodoId/previewPinnedId + `close_preview_window({force:false})`。`force:false` = 预览窗正聚焦（编辑中）则不关，blur 后自治关闭。
+  - **四向定位**（commands/mod.rs `preview_position()`）：左→右→上→下，第一个不与浮窗 rect 相交且在显示器内的方向胜出；兜底右侧 clamp 允许重叠（over_preview-inside 已兜住振荡）。坐标系全物理像素 top-left origin，"上方" = y 减小。
+✅ **prewarm 竞态防线**：prewarm 隐藏创建的 webview 可能没加载完，open_preview_window reuse 路径 emit 的 preview-todo 会丢 → 后端 emit 前先存 `PENDING_PREVIEW_TODO`，preview.ts init 末尾 listeners 就位后 `take_pending_preview_todo` 主动取一次。
+✅ 构建验证：`pnpm build` ✓、`cargo check --all-targets` 零警告 ✓、`cargo test --lib` 20/20 ✓。
+
+**经验沉淀**：多窗口 hover 状态机的铁律 —— **hit test 必须把自家所有窗口视为 inside**（否则窗口 B 盖住窗口 A 时 hover emitter 振荡）；**任何 hover 驱动的显隐/反馈不准用 CSS :hover 和原生 title=**（非 key window WKWebView 都不靠谱）。
+
+### v0.2.2（2026-08-05，预览窗即时跟手 + 消闪）
+
+用户实测再反馈：还闪、要更快（hover 即出 / 换卡即切）、要跟手（卡左边优先、高度自适应）。根因 + 修法：
+
+✅ **去 dwell 即时化**（main.ts 状态机重写）：去掉"截断/图片卡才预览"门控（`isTitleTruncated` 已删）—— **hover 任意卡 80ms 微防抖后立即出**（防横扫列表误触发）；**预览已开时 hover 换卡 = 0ms 立即切换**（`openPreviewFor` 直调，不走 dwell）。
+✅ **跟手定位**（`preview_position` 重写）：前端传 `anchorY = card.getBoundingClientRect().top`（视口相对逻辑 px），Rust 换算 `fpos.y + anchor_y × scale`（物理屏坐标）→ **预览顶对齐被 hover 卡片顶**；左右策略：**默认卡左，左边空间不足放右边**（上/下两向砍掉），y clamp 进显示器。hover 在列表里上下移动时预览窗垂直跟手。
+✅ **高度自适应一次开到位**：文本卡前端 **offscreen measurer div 预测量**（与 `.preview-text` 同宽 432px 同字体 13px/1.5 同 padding，box-sizing border-box）→ `textH` 传给 Rust → `preview_logical_size` 高 = textH + CHROME_H(66) clamp 130-720。**show 之后不再 resize**（show 后 resize 是闪的根源之一）。图片卡仍按附件宽高比。
+✅ **消闪三板斧**：
+  - `backdrop-refresh` 只在**隐藏→上屏**（prewarm 首显 / 全新创建）和关闭时 emit；**可见窗口换内容/跟手移动不再刷** —— v0.2.1 每次 hover 换卡都刷 → 浮窗整窗 filter repaint → 用户看到的"闪"主要来源。
+  - **hover(false) 从立即关改 450ms grace close**（`schedulePreviewClose` 统一入口：unhover / hover(false) / 浮窗空白区 / preview-left 四处共用）—— 鼠标从卡片穿过缝隙进预览窗会短暂"两个窗口都不在"，立即关会把跟手体验闪断；hover(true) / over_preview / hoverCard 都会 cancel。
+  - **over_preview 不再置 previewPinnedId**，改置独立的 `previewMouseInside`（仅阻止自动关闭 + 跳过 elementFromPoint）—— 路过预览窗不该把内容锁死，回浮窗 hover 别的卡仍立即切换。显式 pin 只剩两条路：点击缩略图（`openPreviewPinned`）/ 预览窗聚焦后的真实 mouseenter（`preview-entered`）。
+✅ **状态机 bug 修掉**：`cancelPreviewClose()` 提到 `previewTodoId === id` 短路**之前** —— 旧代码 unhover 排的 grace close 在"快速回同一张卡"时照样炸（预览 hovering 中被关）。
+✅ 构建验证：`pnpm build` ✓、`cargo check --all-targets` 零警告 ✓、`cargo test --lib` 20/20 ✓。
+
+**经验沉淀**：① 窗口 show 前必须完成定位+尺寸（measurer 预测量 > show 后修正）；② 整窗 repaint 类修复手段（backdrop-refresh）不能挂在高频路径（hover 换卡）上，只在状态边沿（hide↔show）触发；③ 自动驻留（鼠标在某窗上）和显式 pin（用户在编辑）必须是两个状态，混用会把"路过"误判成"锁定"。
+
+### v0.2.3（2026-08-05，预览 1Hz 闪根修 + 粘贴按钮独立框 + hint 截断修复）
+
+✅ **预览窗 ~1Hz 闪烁根修**：元凶是 v0.2.1 加的 JS heartbeat（`setInterval` 1200ms 给 .preview-panel toggle `.force-reflow` filter 类）—— 每次 toggle 强制 backdrop 重采样，视觉上就是 ~1Hz 整窗闪（cadence 与用户实测"每秒闪一次"完全吻合）。**换成浮窗同款连续心跳动画**（preview.css `pv-backdrop-heartbeat`：rotate 0.001°/opacity 0.001 亚像素微动、compositor-only、linear 4s infinite —— 永远在动 → layer 不进 ~2s 节流窗口，且无 toggle 边沿不可见）。JS heartbeat 三处全删。**教训：backdrop 保活只能用"永远在动"的连续动画，任何周期性 class/属性 toggle 都是可见闪烁**。
+✅ **粘贴按钮独立玻璃框**（用户截图布局）：`ensureInputBar` 重构 —— 新增 `.todo-input-row` flex 行容器，左 `.todo-input`（输入框+hint）右 `.todo-paste-btn`（独立瓦片，`align-self:stretch + aspect-ratio:1` 与输入框等高方形，同一套 tile 玻璃变量，`:active` 蓝色反馈）。心跳动画 / force-reflow / backdrop-refresh 三个选择器都补 `.todo-paste-btn`（它现在是带 backdrop-filter 的瓦片）。顺手删了按钮上的 `title=`（违反 v0.2.1 "不准原生 tooltip" 规则）。
+✅ **hint 截断（"Press ⌘" 后半截消失）根修**：根因是 flex item 默认 `min-width:auto` —— input 不肯缩到 placeholder 内容宽以下，hint 被推出瓦片右缘。修：`.todo-input input { min-width: 0 }`（input 可缩，placeholder 框内自然截断，hint 永远完整）。`NARROW_THRESHOLD` 280 → 240（= minWidth）：完整 '⌘⇧Space' 在 240 宽也算得过来（输入瓦片 ~188px，hint 46px 稳放），tier 1 图标版只剩 <240 防御区间。
+✅ 构建验证：`pnpm build` ✓（本轮无 Rust 改动）。
+
+### v0.2.4（2026-08-05，预览黑边 + 粘贴框正方形 + hover 锁死 bug）
+
+✅ **预览窗外圈黑边去掉**：元凶是 macOS 原生窗口阴影（builder `.shadow(true)`）—— 透明无边框窗的 NSWindow shadow 紧贴 panel 外形画一圈硬黑边。prewarm + open 两个 builder 改 `.shadow(false)`，柔和投影由 preview.css `--pv-shadow` 负责（settings 窗是 decorated 正常窗，shadow 保留）。
+✅ **粘贴框正方形**：`aspect-ratio:1` 在 WKWebView 的 flex stretch 布局里 height→width 传递失效，宽度塌成 fit-content ~17px 窄条（用户截图实证）。改**固定 `width:34px`**（输入瓦片高 ≈ padding 16 + 13px 字 17px 行高 + border ≈ 34px，天然正方形）。**教训：WKWebView flex 布局别依赖 aspect-ratio 的尺寸传递，固定值最稳**。
+✅ **hover 锁死 bug（鼠标进预览窗再回列表，预览不更新）**：根因链 —— 预览窗一旦拿到焦点（acceptFirstMouse 点击 / **tao `show()` 在 macOS 底层是 `makeKeyAndOrderFront:` 直接抢 key**），WKWebView 恢复派发 mouseenter → `preview-entered` 把 `previewPinnedId` 置上 → 而 `preview-left` 只在**未聚焦**时发出 → pin 永不释放 → hoverCard 的 pinned 守卫把换卡整个挡死。修法三连：
+  - **pin 改焦点语义**：preview-entered 不再 pin（只 cancelPreviewClose）；新增 `preview-focused` 事件（preview.ts `onFocusChanged(focused=true)` 时 emit）才置 pin。焦点语义可靠：blur 必触发 closeSelf → preview-closed 释放，**不存在锁死路径**。
+  - **show 不抢 key**：新增 `platform::show_window_no_activate`（macOS `NSWindow.orderFrontRegardless`，Win/Linux 直接 show）—— hover 路径（pinned=false）的复用 show 改走它，hover 面板永不偷焦点。
+  - unlisten 清理同步补 `unlistenPreviewFocused`。
+✅ 构建验证：`pnpm build` ✓、`cargo check --all-targets` 零警告 ✓、`cargo test --lib` 20/20 ✓。
+
+✅ **输入行间隙对齐卡片节奏**（用户要求②-1）：`.todo-input-row` gap 8→6px，与 #app 卡片间 gap 一致。
+✅ **直接 hover 粘贴键不变手型 bug**（②-2）：两条路径都漏了粘贴按钮 —— hover-pos 命中选择器 `.todo-copy, .todo-delete` 加 `.todo-paste-btn`（未聚焦路径），ensureInputBar 补 `mouseenter/leave → setBtnHover`（聚焦路径）。非聚焦 WKWebView 不更新 CSS cursor，set_cursor_pointer 是唯一指针通道。
+✅ **预览窗被 Dock 遮挡**（②-3）：定位 clamp 用 `monitor.size()`（全屏物理分辨率）→ 改 **`monitor.work_area()`**（macOS visible frame，扣菜单栏+Dock；Win 扣任务栏）。贴底 hover 长卡时预览底边不再滑进 Dock。
+✅ **预览窗 footer**（②-4）：左下 创建日期（`created_at`，epoch ms → locale 短日期）｜中 hint（flex:1 可缩省略号）｜右下 [完成日期（done 任务，取 `updated_at` —— 翻 status 时后端刷新；注意近似：done 后再改标题也会刷它）] + 复制按钮 + 垃圾桶删除按钮（二次确认实红同卡内语义，delete_todo 后 todos-changed → closeSelf 幂等双保险）。新增 i18n key `preview.created` / `preview.completed`；CHROME_H 66→74、CAPTION_AREA_H 170→178 同步。
+✅ **删除按钮全 App 统一垃圾桶**（②-4）：卡内 `.todo-delete` 从 "×" 文字换 lucide trash-2 SVG（main.ts `TRASH_ICON_SVG`），预览窗删除按钮同图标（preview.ts 自带一份 13px 版）。顺手删了卡内 copy/delete 按钮残留的 `title=`（又是原生 tooltip，v0.2.1 规则的漏网之鱼）。
+
+**经验沉淀**：④ pin/锁定类状态必须挂在**有可靠释放信号的状态**上（焦点：blur 必释放；鼠标位置：hover-pos 每 tick 上报），不能挂在"进入事件"上（离开事件可能因聚焦态/窗口层级永远发不出）；⑤ macOS 悬浮面板显示窗口永远用 `orderFrontRegardless`，`show()`/`makeKeyAndOrderFront:` 只给"用户明确要交互"的窗口；⑥ 屏幕边界 clamp 永远用 work_area 不用 monitor size（Dock/任务栏/菜单栏都在 size 里不在 work_area 里）。
+
 ### 仍未做
 
 ⏳ **Cmd+Z 撤销栈**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 已占位 keydown listener，TODO 未实现，v0.2 候选）
@@ -371,9 +443,12 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 │   └── generate_icons.py     ← U 字母 icon 生成（PNG/ICO/ICNS + tray-base.png）
 ├── index.html                ← 浮窗入口
 ├── settings.html             ← 设置面板入口（动态创建 webview，非常驻）
+├── preview.html              ← QuickLook 预览窗入口（动态创建 webview，v0.2）
 ├── src/
-│   ├── main.ts               ← 浮窗：渲染 + 拖拽 + 输入 + 快捷键 + hover 双路径
+│   ├── main.ts               ← 浮窗：渲染 + 拖拽 + 输入 + 快捷键 + hover 双路径 + 粘贴按钮 + 预览状态机
 │   ├── styles.css            ← iOS 26 玻璃质感（沿用 Musage）
+│   ├── preview.ts            ← 预览窗：图片/长文展示 + textarea 自动保存编辑（v0.2）
+│   ├── preview.css           ← 预览窗样式（v0.2）
 │   ├── settings.ts           ← 设置面板：pin mode + 语言 + 归位 + 关于
 │   ├── settings.css          ← 设置面板样式
 │   ├── assets.d.ts
@@ -394,10 +469,11 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
     └── src/
         ├── main.rs           ← Windows / Linux 入口
         ├── lib.rs            ← Tauri Builder + 快捷键 + 窗口事件持久化 + locale/pin mode listener
-        ├── todo.rs           ← Todo + PinMode + StoreData + JSON storage（原子写 + 0600 + .bak）
+        ├── todo.rs           ← Todo + TodoAttachment + PinMode + StoreData + JSON storage（原子写 + 0600 + .bak）
+        ├── clipboard.rs      ← 剪贴板读取三路径（macOS NSPasteboard 原字节保 GIF / 插件 RGBA 兜底 / 文本，v0.2）
         ├── tray.rs           ← 系统托盘（Settings 子菜单 + pin mode checkmark + rebuild_tray）
         ├── commands/
-        │   └── mod.rs        ← CRUD + 浮窗控制 + i18n + pin mode + open_settings_window
+        │   └── mod.rs        ← CRUD + 浮窗控制 + i18n + pin mode + open_settings_window + 剪贴板粘贴/预览窗（v0.2）
         └── platform/
             ├── mod.rs        ← 跨平台统一 API（pub use plat::*）
             ├── macos.rs      ← PinBottom/PinTop/Normal + hover emitter（已实现）

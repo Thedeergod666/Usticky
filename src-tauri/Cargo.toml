@@ -20,12 +20,18 @@ crate-type = ["rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
 # **P2-6 fix**：single-instance 插件 —— 第二次启动 Usticky 时聚焦已有浮窗
 # 而不是新开一个进程（macOS 上 dock 图标重复 + 各持一份 store 会触发并发写）。
 tauri-plugin-single-instance = "2"
+# v0.2 剪贴板粘贴：读文本 + 读图（RGBA fallback）。macOS 原生 GIF 走
+# platform/clipboard 的 NSPasteboard 原始字节路径，插件只是跨平台兜底。
+tauri-plugin-clipboard-manager = "2"
+# 剪贴板图片编码/探测：RGBA → PNG 编码 + tiff 解码 + gif/jpeg 尺寸探测。
+# 默认特性全关，只开用到的 codec，控制二进制体积。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "tiff"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
@@ -40,9 +46,9 @@ rust-i18n = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSEvent", "NSWorkspace", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSEvent", "NSWorkspace", "NSRunningApplication", "NSPasteboard"] }
 objc2-core-graphics = { version = "0.3", features = ["CGWindowLevel", "CGGeometry"] }
-objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSData", "NSArray", "NSURL", "objc2-core-foundation"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = [

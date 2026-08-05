@@ -1,0 +1,183 @@
+/* QuickLook 预览窗样式（v0.2）
+ *
+ * 独立 webview，不复用 styles.css（那里变量挂在 #app 且带浮窗专用的
+ * idle/hover 双态玻璃）。这里常显"hover 态"强度的深色玻璃：
+ * 半透深底 + backdrop blur + 白字，对齐浮窗 hover 时的观感。
+ *
+ * 布局（column）：
+ *   .preview-image   — 图片附件（GIF 原生动画），object-fit contain
+ *   .preview-text    — 标题全文 textarea（可编辑，防抖自动保存）
+ *   .preview-hint    — 底部提示行（Esc 关闭 / 自动保存）
+ */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --pv-bg: rgba(22, 24, 30, 0.62);
+  --pv-border: rgba(255, 255, 255, 0.14);
+  --pv-shadow: 0 18px 50px rgba(0, 0, 0, 0.55),
+               0 0 0 0.5px rgba(255, 255, 255, 0.06) inset;
+  --pv-text: rgba(255, 255, 255, 0.96);
+  --pv-text-mute: rgba(255, 255, 255, 0.55);
+  --pv-accent: #0a84ff;
+}
+
+html, body {
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+#preview-app { height: 100%; padding: 6px; }
+
+.preview-panel {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  background: var(--pv-bg);
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  border: 1px solid var(--pv-border);
+  border-radius: 16px;
+  box-shadow: var(--pv-shadow);
+  /* 顶部 14px padding 区 + 间隙是拖窗把手（preview.ts mousedown →
+   * startDragging，textarea 区域除外） */
+}
+
+/* 玻璃保活：连续心跳动画（浮窗 styles.css 的 usticky-backdrop-heartbeat
+ * 同款思路）—— rotate 0.001° / opacity 0.001 亚像素微动，compositor-only
+ * 属性不触发 layout/paint，但 WebKit 任何时刻都判定 layer "活着" →
+ * backdrop sample 不进 ~2s 节流失效窗口。linear 4s 与浮窗同参数。
+ *
+ * 别用 JS 定时器周期性 toggle filter 类（v0.2.1 的 heartbeat）—— 每次
+ * toggle 都强制 backdrop 重采样，视觉上就是 ~1Hz 的整窗闪烁（用户实测
+ * 抓包"每秒闪一次"，cadence 与定时器完全吻合）。连续动画没有 toggle
+ * 边沿，肉眼不可见。隐藏窗（prewarm）WebKit 整体节流，不耗 GPU。 */
+@keyframes pv-backdrop-heartbeat {
+  0%, 100% { transform: rotate(0deg);     opacity: 1; }
+  50%      { transform: rotate(0.001deg); opacity: 0.999; }
+}
+.preview-panel {
+  animation: pv-backdrop-heartbeat 4s linear infinite;
+}
+
+/* 图片附件：等比缩放居中，GIF 原生动画。flex 0 1 auto —— 图片大时压缩
+ * 给 textarea 留位，小时保持原尺寸不拉伸。 */
+.preview-image {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  display: block;
+  margin: 0 auto;
+  border-radius: 10px;
+  /* 拖图 = 拖窗（图片本身无交互），preview.ts 的 mousedown 放行 */
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+/* 标题全文编辑区：无图时占满（flex 1），有图时最小 64px caption 区 */
+.preview-text {
+  flex: 1 1 auto;
+  min-height: 64px;
+  width: 100%;
+  resize: none;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--pv-text);
+  outline: none;
+  caret-color: var(--pv-accent);
+  overflow-y: auto;
+  word-break: break-word;
+  transition: border-color 0.18s ease-out, background-color 0.18s ease-out;
+}
+.preview-text:focus {
+  border-color: rgba(10, 132, 255, 0.45);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* 底部 footer（v0.2.4）：左创建日期 · 中 hint · 右[完成日期]+复制/删除 */
+.preview-footer {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.preview-date {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--pv-text-mute);
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+  user-select: none;
+}
+.preview-hint {
+  flex: 1 1 auto;
+  min-width: 0;  /* 中间区可缩，超长省略号，不挤两侧日期/按钮 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--pv-text-mute);
+  text-align: center;
+  letter-spacing: 0.2px;
+  user-select: none;
+}
+.preview-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.preview-action-btn {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--pv-text-mute);
+  cursor: pointer;
+  transition: background-color 0.15s ease-out, color 0.15s ease-out;
+}
+/* 预览窗未聚焦时 :hover 不激活（WKWebView 非 key window）——首次点击
+ * 经 acceptFirstMouse 落窗即聚焦，之后 hover 反馈正常。聚焦前按钮保持
+ * 可见可点，反馈缺失可接受（同浮窗卡内按钮的 trade-off）。 */
+.preview-action-btn:hover {
+  color: var(--pv-text);
+  background: rgba(255, 255, 255, 0.10);
+}
+/* 删除二次确认态：实红（同卡内 .todo-delete[data-confirm] 语义） */
+.preview-action-btn.preview-delete[data-confirm="1"] {
+  color: #fff;
+  background: #ff453a;
+}
+
+/* 保存状态反馈（自动保存 debounce 触发时短暂切换文案） */
+.preview-hint.saving { color: var(--pv-accent); }
+.preview-hint.error { color: #ff453a; }
+
+/* todo 已被删除 / 找不到的占位（理论上 preview.ts 会直接关窗，防御） */
+.preview-missing {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  color: var(--pv-text-mute);
+}

@@ -281,17 +281,23 @@ pub fn restore_level_after_quick_add<R: Runtime>(app: &AppHandle<R>, mode: PinMo
 struct HoverPos {
     x: f64,
     y: f64,
+    /// v0.2.1：鼠标当前在**预览窗**上（命中测试把预览窗也算 inside）。
+    /// 此时 x/y 是相对浮窗 frame 算的（对预览窗无意义），前端只据此
+    /// 把 hover 预览转 pinned，不做 elementFromPoint。
+    over_preview: bool,
 }
 
 /// 由屏幕坐标（bottom-left origin）+ 窗口 content rect 算视口相对坐标。
 /// `frame` = (x, y, w, h)，跟 `NSEvent.mouseLocation` 同坐标系。
-fn viewport_hover_pos(mouse: NSPoint, frame: (f64, f64, f64, f64)) -> HoverPos {
+/// `over_preview` 透传到 payload（前端区分"鼠标在浮窗"和"鼠标在预览窗"）。
+fn viewport_hover_pos(mouse: NSPoint, frame: (f64, f64, f64, f64), over_preview: bool) -> HoverPos {
     let (fx, fy, _w, fh) = frame;
     HoverPos {
         x: mouse.x - fx,
         // bottom-left origin → top-left origin 翻转，用窗口自身高度，
         // 不依赖任何"屏幕高度"假设。
         y: fh - (mouse.y - fy),
+        over_preview,
     }
 }
 
@@ -406,7 +412,7 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                     // **2026-07-03 fix**：当 inside=false 但**已知上次 inside=true 且
                     // 当前是 dispatch 失败**，保守认为"可能还在浮窗里" → 不采纳 false。
                     // 用 inside_unreliable 替代直接 inside 走下面的状态机。
-                    let (inside, dispatch_failed, frame) =
+                    let (inside, dispatch_failed, frame, over_preview) =
                         is_floating_topmost_at_with_status(&app, mouse);
 
                     // dispatch 失败时（main thread 忙 / 窗口未上屏 / MainThreadMarker 不可用），
@@ -465,7 +471,7 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                             if let Some(f) = frame {
                                 if let Err(e) = app.emit(
                                     "usticky://floating-hover-pos",
-                                    viewport_hover_pos(mouse, f),
+                                    viewport_hover_pos(mouse, f, over_preview),
                                 ) {
                                     tracing::trace!(error = %e, "emit hover-pos 失败");
                                 }
@@ -511,9 +517,10 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                     // 每 tick emit。
                     if inside {
                         if let Some(f) = frame {
-                            if let Err(e) = app
-                                .emit("usticky://floating-hover-pos", viewport_hover_pos(mouse, f))
-                            {
+                            if let Err(e) = app.emit(
+                                "usticky://floating-hover-pos",
+                                viewport_hover_pos(mouse, f, over_preview),
+                            ) {
                                 tracing::trace!(error = %e, "emit hover-pos 失败");
                             }
                         }
@@ -596,6 +603,28 @@ pub fn set_window_level<R: Runtime>(
     });
 }
 
+/// 显示窗口但**不抢 key**（hover 预览专用）：Tauri `show()` 在 macOS 上
+/// 底层走 `makeKeyAndOrderFront:` —— 会把窗口变 key（抢键盘焦点）。
+/// hover 预览一旦变 key：WKWebView 恢复派发 mouseenter → preview-entered
+/// 误 pin → 且窗口聚焦时 preview-left 永不发出 → pin 锁死，hover 换卡
+/// 整个失效（v0.2.3 用户实测 bug 的根源之一）。`orderFrontRegardless`
+/// 只把窗口提到层级前面上屏，**不动 key window**，悬浮面板的标准做法。
+pub fn show_window_no_activate<R: Runtime>(app: &AppHandle<R>, label: &str) {
+    let app2 = app.clone();
+    let label2 = label.to_string();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(win) = app2.get_webview_window(&label2) {
+            if let Ok(ptr) = win.ns_window() {
+                if !ptr.is_null() {
+                    // SAFETY: `ptr` 来自 webview_window 的 NSWindow，窗口存活期间有效。
+                    let window: &NSWindow = unsafe { &*ptr.cast::<NSWindow>() };
+                    window.orderFrontRegardless();
+                }
+            }
+        }
+    });
+}
+
 /// 命中测试：鼠标在 `point` 处时，浮窗是否是**最上层**窗口。
 ///
 /// 用 `+[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:]` 传 0
@@ -617,8 +646,11 @@ pub fn set_window_level<R: Runtime>(
 ///
 /// dispatch 到 main thread（NSWindow API 强制要求）。channel 同步等待。
 ///
-/// 返回 `(inside, dispatch_failed, frame)`：
-/// - `inside`：浮窗是否是该点 topmost 窗口
+/// 返回 `(inside, dispatch_failed, frame, over_preview)`：
+/// - `inside`：浮窗**或预览窗**是否是该点 topmost 窗口。
+///   v0.2.1 起预览窗也算 inside —— 鼠标从浮窗卡片滑进预览窗是
+///   QuickLook 交互的连续动作，不该触发 unhover → grace close 把预览
+///   关掉（v0.2.0 实测"鼠标停留卡片预览却消失"的根因之一）。
 /// - `dispatch_failed`：区分"真实判定 false"和"未知"（dispatch 失败/超时/
 ///   未上屏/MainThreadMarker 不可用）—— 调用方（hover emitter）看到后者
 ///   按"未知"处理，保留 last_known_inside。
@@ -626,14 +658,16 @@ pub fn set_window_level<R: Runtime>(
 ///   同坐标系（global screen，bottom-left origin，logical points）。
 ///   hover-pos 的视口相对坐标换算就靠它（见 `viewport_hover_pos`）。
 ///   dispatch 失败时为 None。
+/// - `over_preview`：命中的是预览窗（此时 frame 仍是浮窗的，x/y 对前端
+///   elementFromPoint 无意义，前端只看这个 flag 做 pinned 转换）。
 fn is_floating_topmost_at_with_status<R: Runtime>(
     app: &AppHandle<R>,
     point: NSPoint,
-) -> (bool, bool, Option<(f64, f64, f64, f64)>) {
+) -> (bool, bool, Option<(f64, f64, f64, f64)>, bool) {
     use std::sync::{Arc, Condvar, Mutex};
 
     struct OneSlot {
-        slot: Mutex<Option<(bool, bool, Option<(f64, f64, f64, f64)>)>>, // (inside, dispatch_failed, frame)
+        slot: Mutex<Option<(bool, bool, Option<(f64, f64, f64, f64)>, bool)>>, // (inside, dispatch_failed, frame, over_preview)
         cvar: Condvar,
     }
     static SLOT: OnceLock<Arc<OneSlot>> = OnceLock::new();
@@ -667,7 +701,7 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
         *g = None;
     }
     let dispatch_result = app.run_on_main_thread(move || {
-        let result = (|| -> Option<(bool, (f64, f64, f64, f64))> {
+        let result = (|| -> Option<(bool, bool, (f64, f64, f64, f64))> {
             let win = app2.get_webview_window("floating")?;
             let ptr = win.ns_window().ok()?;
             if ptr.is_null() {
@@ -680,6 +714,13 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
                 // 窗口还没上屏（极少见，初始化竞态）→ 当作 dispatch 失败
                 return None;
             }
+            // v0.2.1：预览窗（如果开着）的 window number 也取来比对。
+            let preview_id = app2
+                .get_webview_window("preview")
+                .and_then(|w| w.ns_window().ok())
+                .filter(|p| !p.is_null())
+                .map(|p| unsafe { (*p.cast::<NSWindow>()).windowNumber() })
+                .unwrap_or(0);
             let Some(mtm) = MainThreadMarker::new() else {
                 tracing::trace!("is_floating_topmost_at: MainThreadMarker 不可用，跳过本 tick");
                 return None;
@@ -694,14 +735,16 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
                 content.size.width,
                 content.size.height,
             );
-            Some((topmost == our_id, frame))
+            let over_preview = preview_id != 0 && topmost == preview_id;
+            let inside = topmost == our_id || over_preview;
+            Some((inside, over_preview, frame))
         })();
-        // (inside, dispatch_failed, frame) 区分"真实判定"和"未知"：
-        //   - Some((inside, frame))     → (inside, false, Some(frame))
-        //   - None（窗口未上屏 / MTM 不可用）→ (false, true, None)
+        // (inside, dispatch_failed, frame, over_preview) 区分"真实判定"和"未知"：
+        //   - Some((inside, over_preview, frame)) → (inside, false, Some(frame), over_preview)
+        //   - None（窗口未上屏 / MTM 不可用）→ (false, true, None, false)
         let payload = match result {
-            Some((inside, frame)) => (inside, false, Some(frame)),
-            None => (false, true, None),
+            Some((inside, over_preview, frame)) => (inside, false, Some(frame), over_preview),
+            None => (false, true, None, false),
         };
         {
             let mut g = slot2.slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -712,12 +755,12 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
     if let Err(e) = dispatch_result {
         tracing::trace!(
             error = %e,
-            "is_floating_topmost_at: dispatch to main thread 失败，立即返 (false, true, None)"
+            "is_floating_topmost_at: dispatch to main thread 失败，立即返 (false, true, None, false)"
         );
         {
             let mut g = slot.slot.lock().unwrap_or_else(|e| e.into_inner());
             if g.is_none() {
-                *g = Some((false, true, None));
+                *g = Some((false, true, None, false));
             }
         }
         slot.cvar.notify_all();
@@ -738,6 +781,6 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
             .unwrap_or_else(|e| e.into_inner());
         guard = g;
     }
-    // 超时仍 None → (false, true, None) 兜底（dispatch 失败的语义，让 hover emitter 走"未知"路径）
-    guard.unwrap_or((false, true, None))
+    // 超时仍 None → (false, true, None, false) 兜底（dispatch 失败的语义，让 hover emitter 走"未知"路径）
+    guard.unwrap_or((false, true, None, false))
 }

@@ -225,6 +225,15 @@ pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) 
 /// 不需要 macOS 那样的 NSCursor 手动兜底。
 pub fn set_cursor_pointer_shape<R: Runtime>(_app: &AppHandle<R>, _pointer: bool) {}
 
+/// 显示窗口不抢激活：Win 上 tao `show()` 底层是 ShowWindow(SW_SHOWNOACTIVATE)
+/// 系（无边框 always-on-top 工具窗默认不抢前台），直接 show 即可。
+/// 保留与 macOS 统一的 API 形态（那边必须 orderFrontRegardless）。
+pub fn show_window_no_activate<R: Runtime>(app: &AppHandle<R>, label: &str) {
+    if let Some(w) = app.get_webview_window(label) {
+        let _ = w.show();
+    }
+}
+
 // ── Quick-add 临时置顶 + 切回原应用 ──
 //
 // 跟 macOS 同套接口（详见 platform/macos.rs 顶部 doc）。Win 实现要点：
@@ -299,6 +308,9 @@ pub fn restore_level_after_quick_add<R: Runtime>(app: &AppHandle<R>, mode: PinMo
 struct HoverPos {
     x: f64,
     y: f64,
+    /// v0.2.1：鼠标当前在**预览窗**上（hit test 把预览窗也算 inside）。
+    /// 前端只据此把 hover 预览转 pinned，不做 elementFromPoint。
+    over_preview: bool,
 }
 
 /// 启动 hover emitter 线程。idempotent —— 第二次调用立即返回。
@@ -356,7 +368,7 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
             loop {
                 thread::sleep(Duration::from_millis(50));
 
-                let Some((raw_inside, pt, rect)) = is_cursor_inside_floating(&app) else {
+                let Some((raw_inside, over_preview, pt, rect)) = is_cursor_inside_floating(&app) else {
                     continue;
                 };
 
@@ -415,6 +427,7 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                         HoverPos {
                             x: logical_x,
                             y: logical_y,
+                            over_preview,
                         },
                     );
                 }
@@ -462,24 +475,41 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 
 // ── 内部 ──
 
-/// Hit test：鼠标位置是否在浮窗**未遮挡**区域内，返回 (inside, 物理屏幕坐标)。
+/// Hit test：鼠标位置是否在浮窗**或预览窗**的未遮挡区域内。
+/// 返回 `(inside, over_preview, 物理屏幕坐标, 浮窗物理外框)`。
 ///
 /// 严格判定两步（macOS-parity，对应 `windowNumberAtPoint`）：
 /// 1. 鼠标在浮窗 rect 内（`GetWindowRect` → `point_in_rect`）
+///    —— v0.2.1 起或预览窗 rect 内（鼠标从卡片滑进预览窗是 QuickLook
+///    交互的连续动作，不算"离开浮窗"，否则 hover 预览会被 grace close
+///    关掉，跟 macOS 端修复对齐）
 /// 2. 鼠标该点 topmost window 沿 parent 链爬到顶层根（`GetAncestor(_, GA_ROOT)`）
-///    后必须等于浮窗自己 —— 防止"被另一个 app 窗口盖住时误触发 raise"
+///    后必须等于浮窗自己（或预览窗）—— 防止"被另一个 app 窗口盖住时误触发 raise"
+///
+/// 预览窗 hwnd 每次调用现取（`get_webview_window("preview")`）—— 预览窗
+/// 是动态创建/销毁的，缓存 hwnd 会在窗口重建后 stale。浮窗 hwnd 也是
+/// 本函数现取（既有模式，见上方代码），一致。
 ///
 /// 返回 `None` 表示本轮无法判定（窗口未上屏 / Win API 失败），caller
 /// continue 即可。`POINT` 是物理像素光标位置，`RECT` 是浮窗物理像素
 /// 外框（同一坐标系），emit hover-pos 时 caller 相减 + 除 scale 转
-/// 视口相对 logical 坐标。
-fn is_cursor_inside_floating<R: Runtime>(app: &AppHandle<R>) -> Option<(bool, POINT, RECT)> {
+/// 视口相对 logical 坐标。over_preview=true 时坐标对预览窗无意义，
+/// 前端只看 flag。
+fn is_cursor_inside_floating<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Option<(bool, bool, POINT, RECT)> {
     let win = app.get_webview_window("floating")?;
     let hwnd_t = win.hwnd().ok()?;
     if hwnd_t.0.is_null() {
         return None;
     }
     let our_hwnd: *mut core::ffi::c_void = hwnd_t.0;
+    // v0.2.1：预览窗 hwnd（开着的话）
+    let preview_hwnd: *mut core::ffi::c_void = app
+        .get_webview_window("preview")
+        .and_then(|w| w.hwnd().ok())
+        .map(|h| h.0)
+        .unwrap_or(std::ptr::null_mut());
 
     // SAFETY: GetCursorPos / GetWindowRect / WindowFromPoint / GetAncestor /
     // GetLastError 都是 Win32 kernel call，文档明确 thread-safe。
@@ -502,20 +532,22 @@ fn is_cursor_inside_floating<R: Runtime>(app: &AppHandle<R>) -> Option<(bool, PO
             );
             return None;
         }
-        if !point_in_rect(pt, &rect) {
-            return Some((false, pt, rect));
-        }
         // WindowFromPoint 成功 → topmost non-null = 真实命中窗口。
         // 失败 → null = 当作"未被浮窗遮挡",返 false (保守不 raise)。
         let topmost: WIN_HWND = WindowFromPoint(pt);
         if topmost.is_null() {
-            return Some((false, pt, rect));
+            return Some((false, false, pt, rect));
         }
         let root = GetAncestor(topmost, GA_ROOT);
-        if root.is_null() {
-            return Some((topmost == our_hwnd, pt, rect));
+        let hit = if root.is_null() { topmost } else { root };
+        // 预览窗优先判定：命中预览 → inside + over_preview
+        if !preview_hwnd.is_null() && hit == preview_hwnd {
+            return Some((true, true, pt, rect));
         }
-        Some((root == our_hwnd, pt, rect))
+        if !point_in_rect(pt, &rect) {
+            return Some((false, false, pt, rect));
+        }
+        Some((hit == our_hwnd, false, pt, rect))
     }
 }
 

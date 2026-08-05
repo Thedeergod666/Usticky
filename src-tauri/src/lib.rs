@@ -28,6 +28,7 @@ use tokio::sync::Notify;
 // 解耦（rust_i18n 不支持嵌套 dotted key，跟前端 dict 分开维护）。
 rust_i18n::i18n!("locales");
 
+mod clipboard;
 mod commands;
 mod platform;
 mod todo;
@@ -308,6 +309,11 @@ pub fn hide_dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore)
     if let Some(w) = app.get_webview_window("floating") {
         let _ = w.hide();
     }
+    // v0.2：浮窗 hide 时预览窗口一并收掉 —— always-on-top 的预览留在
+    // 屏幕上而宿主浮窗消失，是无依孤儿窗。
+    if let Some(p) = app.get_webview_window("preview") {
+        let _ = p.close();
+    }
     if was_active {
         let mode = store.blocking_read().pin_mode();
         platform::restore_level_after_quick_add(app, mode);
@@ -366,6 +372,9 @@ pub fn run() {
         // 减少二进制体积 + 启动时间。v0.2 真要做再添加。
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
+        // v0.2 剪贴板粘贴：Rust 端 read_text / read_image（RGBA 兜底路径，
+        // macOS GIF 原字节走 clipboard.rs 的 NSPasteboard 路径）。
+        .plugin(tauri_plugin_clipboard_manager::init())
         // **P2-6 fix**：single-instance 插件。第二次启动（用户双击图标 / 命令行
         // 唤起）时，**不**新开进程 —— 而是回调第一次的 app.handle()，让我们
         // 找到浮窗 + show + focus，让用户看到已有窗口而不是被新进程抢焦点。
@@ -509,6 +518,10 @@ pub fn run() {
                         // 这是有意设计，不是 bug。
                         api.prevent_close();
                         let _ = window_for_close.hide();
+                        // v0.2：同 hide_dismiss —— 浮窗 hide 时收掉预览窗（孤儿窗）。
+                        if let Some(p) = app_handle_geom.get_webview_window("preview") {
+                            let _ = p.close();
+                        }
                     }
                     tauri::WindowEvent::Focused(false) => {
                         // 浮窗失焦 —— 若处于 quick-add 临时置顶状态，还原 level
@@ -579,6 +592,12 @@ pub fn run() {
             commands::open_settings_window,
             commands::get_quick_add_shortcut,
             commands::set_quick_add_shortcut,
+            commands::get_attachments_dir,
+            commands::paste_from_clipboard,
+            commands::open_preview_window,
+            commands::close_preview_window,
+            commands::prewarm_preview_window,
+            commands::take_pending_preview_todo,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Usticky");

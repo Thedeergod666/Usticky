@@ -88,17 +88,21 @@ fn parse_status(s: &str) -> Result<TodoStatus, String> {
     }
 }
 
-/// todo title 校验：trim + 非空 + ≤ 280 字符。
+/// todo title 校验：trim + 非空 + ≤ 114514 字符(彩蛋上限)。
 ///
 /// **P2-7 fix**：add_todo 已有这套校验，update_todo 之前**完全跳过**，
 /// 用户（或前端 bug）可以把 title 改成空串 / 纯空格 / 超长串。
 /// 抽到独立函数让 add/update 共用，避免校验规则分叉。
+///
+/// 114514 的来历：彩蛋。把 280 → 114514,纪念经典的「1919810」同款
+/// 数字梗。原本上限来自早期推特 280 字符,视口窄 + 标题超长会强制换行
+/// 破坏 hover-expand 手势;改大后基本可视为「不限制」,纯当彩蛋来玩。
 fn validate_title(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim().to_string();
     if trimmed.is_empty() {
         return Err(rust_i18n::t!("commands.error.empty_title").into());
     }
-    if trimmed.chars().count() > 280 {
+    if trimmed.chars().count() > 114514 {
         return Err(rust_i18n::t!("commands.error.too_long").into());
     }
     Ok(trimmed)
@@ -178,11 +182,24 @@ pub async fn delete_todo(
     store: State<'_, SharedStore>,
     id: String,
 ) -> Result<Todo, String> {
-    let deleted = {
+    let (deleted, attachments_dir) = {
         let mut s = store.write().await;
-        s.delete(&id)
-            .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?
+        let d = s
+            .delete(&id)
+            .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?;
+        (d, s.attachments_dir())
     };
+    // v0.2：删除 todo 连带清理附件文件。失败只 log 不阻塞 —— 孤儿文件
+    // 下次启动无害（磁盘上几 KB），比"删 todo 失败"好。
+    if let (Some(att), Some(dir)) = (&deleted.attachment, &attachments_dir) {
+        let path = dir.join(&att.file);
+        if let Err(e) = std::fs::remove_file(&path) {
+            // NotFound 不算错（用户手动清过 / 跨设备拷贝丢了附件）
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("delete attachment {:?} failed: {}", path, e);
+            }
+        }
+    }
     persist_and_emit(&app, &store).await;
     Ok(deleted)
 }
@@ -581,5 +598,361 @@ pub async fn open_settings_window(app: AppHandle) -> Result<(), String> {
         .center()
         .build()
         .map_err(|e| format!("create settings window: {e}"))?;
+    Ok(())
+}
+
+// ── 剪贴板粘贴（v0.2）──
+
+/// 粘贴结果分类 —— 前端据此选 mini-flash 文案。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasteOutcome {
+    pub kind: String, // "text" | "image"
+    pub title: String,
+}
+
+/// 附件目录绝对路径（前端 convertFileSrc 拼缩略图 / 预览图 URL 用）。
+/// 顺带 create_dir_all —— 首次粘贴前目录可能不存在。
+#[tauri::command]
+pub async fn get_attachments_dir(store: State<'_, SharedStore>) -> Result<String, String> {
+    let dir = store
+        .read()
+        .await
+        .attachments_dir()
+        .ok_or_else(|| rust_i18n::t!("commands.error.no_primary_monitor").to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create attachments dir: {e}"))?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
+/// 读取剪贴板并创建 pending todo（粘贴按钮的唯一入口）。
+///
+///   - 剪贴板是图片 → 落盘 `attachments/<uuid>.<ext>` + 创建带 attachment 的 todo
+///   - 剪贴板是文本 → 整段文本作为一个 todo（多行保留，预览窗口负责展示全文）
+///   - 空剪贴板 → Err("empty")，前端 flash 提示
+///
+/// 图片落盘失败（磁盘满 / 权限）→ Err 上抛，**不**创建半成品 todo。
+#[tauri::command]
+pub async fn paste_from_clipboard(
+    app: AppHandle,
+    store: State<'_, SharedStore>,
+) -> Result<PasteOutcome, String> {
+    match crate::clipboard::read(&app) {
+        crate::clipboard::ClipboardContent::Text(text) => {
+            let title = validate_title(&text)?;
+            let todo = {
+                let mut s = store.write().await;
+                s.add(title.clone())
+            };
+            persist_and_emit(&app, &store).await;
+            Ok(PasteOutcome {
+                kind: "text".into(),
+                title: todo.title,
+            })
+        }
+        crate::clipboard::ClipboardContent::Image(img) => {
+            let dir = store
+                .read()
+                .await
+                .attachments_dir()
+                .ok_or_else(|| "attachments dir unavailable".to_string())?;
+            std::fs::create_dir_all(&dir).map_err(|e| format!("create attachments dir: {e}"))?;
+            let file = format!("{}.{}", uuid::Uuid::new_v4(), img.ext);
+            let path = dir.join(&file);
+            std::fs::write(&path, &img.data).map_err(|e| format!("write attachment: {e}"))?;
+
+            let title = match img.name.as_deref().map(str::trim) {
+                Some(n) if !n.is_empty() => validate_title(n)?,
+                _ => rust_i18n::t!("commands.paste.image_title").to_string(),
+            };
+            let attachment = crate::todo::TodoAttachment {
+                file,
+                mime: img.mime.to_string(),
+                width: img.width,
+                height: img.height,
+            };
+            let todo = {
+                let mut s = store.write().await;
+                s.add_with_attachment(title.clone(), Some(attachment))
+            };
+            persist_and_emit(&app, &store).await;
+            Ok(PasteOutcome {
+                kind: "image".into(),
+                title: todo.title,
+            })
+        }
+        crate::clipboard::ClipboardContent::Empty => Err("empty".into()),
+    }
+}
+
+// ── QuickLook 式预览窗口（v0.2）──
+
+/// v0.2.1 prewarm 竞态防线：预览窗已建但 webview 还没加载完时，
+/// open_preview_window 的 `usticky://preview-todo` emit 会丢（listener
+/// 还没注册）。reuse 路径先把 id 存这里，preview.ts init 末尾主动
+/// `take_pending_preview_todo` 取走 —— emit 丢了也能自愈。
+static PENDING_PREVIEW_TODO: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+fn pending_preview_todo() -> &'static std::sync::Mutex<Option<String>> {
+    PENDING_PREVIEW_TODO.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[tauri::command]
+pub async fn take_pending_preview_todo() -> Result<Option<String>, String> {
+    Ok(pending_preview_todo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take())
+}
+
+/// 预热：首次 hover 浮窗时**隐藏**创建预览窗，webview 加载开销提前付掉，
+/// 第一次 dwell 打开不再等 300-500ms 白屏。已存在则 no-op。
+/// 隐藏窗口不抢焦点、不上屏（visible(false)），open_preview_window 复用时
+/// show + 归位。
+#[tauri::command]
+pub async fn prewarm_preview_window(app: AppHandle) -> Result<(), String> {
+    if app.get_webview_window("preview").is_some() {
+        return Ok(());
+    }
+    let title = rust_i18n::t!("window.preview").to_string();
+    let _win = WebviewWindowBuilder::new(&app, "preview", WebviewUrl::App("preview.html".into()))
+        .title(title)
+        .inner_size(460.0, 340.0)
+        .resizable(true)
+        .decorations(false)
+        .transparent(true)
+        // v0.2.3：去原生窗口阴影 —— 透明无边框窗的 NSWindow shadow 会紧贴
+        // panel 外形画一圈硬黑边（用户实测"太丑"）。投影由 preview.css 的
+        // --pv-shadow（柔和 50px blur）负责。
+        .shadow(false)
+        .always_on_top(true)
+        .accept_first_mouse(true)
+        .focused(false)
+        .visible(false)
+        .build()
+        .map_err(|e| format!("prewarm preview window: {e}"))?;
+    Ok(())
+}
+
+/// 预览窗口逻辑尺寸：
+/// - 文本卡：宽 460；高 = 前端预测量内容高（main.ts measurer，与
+///   .preview-text 同宽同字体）+ CHROME_H（app padding 6×2 + panel
+///   padding 14×2 + gap 10 + footer ~24（v0.2.4 起含日期+按钮，比纯
+///   hint 行高 ~8px）≈ 74），clamp 130-720。未带测量值（竞态 / 老前端）
+///   兜底 340。**一次开到位 —— show 后再 resize 是预览窗闪烁的根源之一**。
+/// - 图片卡：按附件宽高比缩放（宽 240-640，下方留 ~178px caption+footer
+///   编辑区），高 clamp 200-720。
+fn preview_logical_size(todo: &Todo, text_h: Option<f64>) -> (f64, f64) {
+    const TEXT_W: f64 = 460.0;
+    const TEXT_FALLBACK_H: f64 = 340.0;
+    const CHROME_H: f64 = 74.0;
+    const CAPTION_AREA_H: f64 = 178.0;
+    match &todo.attachment {
+        Some(att) => {
+            let (aw, ah) = match (att.width, att.height) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => (w as f64, h as f64),
+                _ => return (TEXT_W, TEXT_FALLBACK_H),
+            };
+            let w = aw.clamp(240.0, 640.0);
+            let img_h = w * ah / aw;
+            let h = (img_h + CAPTION_AREA_H).clamp(200.0, 720.0);
+            (w, h)
+        }
+        None => {
+            let h = text_h.map_or(TEXT_FALLBACK_H, |t| (t + CHROME_H).clamp(130.0, 720.0));
+            (TEXT_W, h)
+        }
+    }
+}
+
+/// 跟手定位（v0.2.1+）：**默认浮窗左边、y 对齐被 hover 卡片的屏幕顶**
+/// （`anchor_sy`，物理像素）；左边空间不足 → 右边；两边都放不下 → 右侧
+/// clamp 兜底（允许重叠 —— hover emitter 把预览窗算作 inside，重叠不会
+/// 再触发 unhover→close 循环）。y clamp 进显示器边界。
+///
+/// 坐标系：tao `outer_position`/`outer_size`/`monitor` 全是**物理像素**、
+/// top-left origin（y 向下）。
+#[allow(clippy::too_many_arguments)]
+fn preview_position(
+    fx: i32,
+    fw: i32,
+    pw: i32,
+    ph: i32,
+    mx: i32,
+    my: i32,
+    mw: i32,
+    mh: i32,
+    anchor_sy: i32,
+) -> (i32, i32) {
+    const GAP: i32 = 12;
+    let y = anchor_sy.clamp(my, (my + mh - ph).max(my));
+    // 左（默认）
+    let left_x = fx - pw - GAP;
+    if left_x >= mx {
+        return (left_x, y);
+    }
+    // 右（左边空间不足）
+    let right_x = fx + fw + GAP;
+    if right_x + pw <= mx + mw {
+        return (right_x, y);
+    }
+    // 兜底：右侧 clamp 进显示器（可能重叠浮窗，由 over_preview-inside 兜底）
+    (right_x.clamp(mx, (mx + mw - pw).max(mx)), y)
+}
+
+/// 打开 / 复用预览窗口。
+///
+///   - `pinned = false`：hover 触发的非聚焦预览（QuickLook 面板语义，
+///     不抢焦点，鼠标离开后由浮窗前端发起关闭）。
+///   - `pinned = true`：用户点击缩略图 / 卡片触发的聚焦预览（编辑态入口）。
+///   - `anchor_y`：被 hover 卡片的**视口相对**顶边（逻辑 px，前端
+///     `getBoundingClientRect().top`）。换算成屏幕物理坐标后做跟手
+///     定位（预览顶对齐卡片顶）；缺省 = 浮窗顶。
+///   - `text_h`：前端预测量的文本内容高（逻辑 px），文本卡一次开到位，
+///     避免 show 后再 resize 闪烁。
+///
+/// 窗口已存在时**不重建**：更新 URL query 会让 webview reload 丢编辑内容，
+/// 改为 emit `usticky://preview-todo` 让 preview.ts 原地换内容 + resize/移窗。
+/// emit 前先存 PENDING_PREVIEW_TODO —— webview 未加载完时 emit 会丢，
+/// preview.ts init 末尾主动取（prewarm 竞态防线）。
+///
+/// backdrop-refresh 只在**隐藏→上屏**（prewarm 首显 / 全新创建）和关闭时
+/// emit：新 always-on-top 窗口上屏/离屏会触发 macOS 合成层重排，浮窗
+/// WKWebView backdrop sample 随之失效。**可见窗口的换内容/跟手移动不刷**
+/// —— 每次 hover 换卡都刷会让浮窗整窗 repaint，那才是用户看到的"闪"。
+#[tauri::command]
+pub async fn open_preview_window(
+    app: AppHandle,
+    store: State<'_, SharedStore>,
+    todo_id: String,
+    pinned: bool,
+    anchor_y: Option<f64>,
+    text_h: Option<f64>,
+) -> Result<(), String> {
+    let todo = store
+        .read()
+        .await
+        .todos()
+        .iter()
+        .find(|t| t.id == todo_id)
+        .cloned()
+        .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?;
+
+    let (w_logical, h_logical) = preview_logical_size(&todo, text_h);
+
+    // outer_position/outer_size 是物理像素，inner_size 是逻辑像素 —— 用
+    // scale_factor 换算，Retina 上否则窗口只有预期一半大（同 resize_floating_window）。
+    let (pos_x, pos_y, w_phys, h_phys, scale) = {
+        let fw = app
+            .get_webview_window("floating")
+            .ok_or_else(|| "floating window missing".to_string())?;
+        let scale = fw.scale_factor().unwrap_or(1.0);
+        let fpos = fw.outer_position().map_err(|e| e.to_string())?;
+        let fsize = fw.outer_size().map_err(|e| e.to_string())?;
+        let w_phys = (w_logical * scale).round() as i32;
+        let h_phys = (h_logical * scale).round() as i32;
+        let mon = fw.current_monitor().ok().flatten();
+        // **v0.2.4 Dock 修复**：用 work_area（macOS visible frame —— 扣除
+        // 菜单栏 + Dock 占用区）而不是 monitor.size()（全屏物理分辨率）。
+        // 用全屏高 clamp 时，贴底 hover 长卡的预览窗底边会滑进 Dock 下面
+        // 被遮挡（用户截图实证）。Win 上 work_area 同样扣任务栏。
+        let (mx, my, mw, mh) = mon
+            .map(|m| {
+                let wa = m.work_area();
+                (
+                    wa.position.x,
+                    wa.position.y,
+                    wa.size.width as i32,
+                    wa.size.height as i32,
+                )
+            })
+            .unwrap_or((0, 0, 1920, 1080));
+        // 卡片视口顶（逻辑）→ 屏幕物理 y：浮窗物理顶 + anchor_y × scale。
+        // 无边框窗口内容原点 ≈ 窗口原点（无 titlebar 偏移）。
+        let anchor_sy = anchor_y
+            .map(|ay| fpos.y + (ay * scale).round() as i32)
+            .unwrap_or(fpos.y);
+        let (x, y) = preview_position(
+            fpos.x,
+            fsize.width as i32,
+            w_phys,
+            h_phys,
+            mx,
+            my,
+            mw,
+            mh,
+            anchor_sy,
+        );
+        (x, y, w_phys, h_phys, scale)
+    };
+
+    if let Some(w) = app.get_webview_window("preview") {
+        // 复用：换内容 + 跟手归位。pinned 才抢焦点（hover 预览不抢）。
+        let was_visible = w.is_visible().unwrap_or(true);
+        let _ = w.set_size(tauri::PhysicalSize::new(w_phys as u32, h_phys as u32));
+        let _ = w.set_position(tauri::PhysicalPosition::new(pos_x, pos_y));
+        if pinned {
+            let _ = w.show();
+            let _ = w.set_focus();
+        } else {
+            // hover 面板：show 不抢 key（macOS 上 tao show() 底层
+            // makeKeyAndOrderFront 会偷焦点 → WKWebView 恢复 mouseenter
+            // → preview-entered 误 pin 锁死 hover 换卡，v0.2.3 bug）
+            crate::platform::show_window_no_activate(&app, "preview");
+        }
+        {
+            let mut pending = pending_preview_todo().lock().unwrap_or_else(|e| e.into_inner());
+            *pending = Some(todo_id.clone());
+        }
+        w.emit("usticky://preview-todo", serde_json::json!({ "id": todo_id }))
+            .map_err(|e| e.to_string())?;
+        // 只在隐藏→上屏时刷新浮窗玻璃（见 doc comment）
+        if !was_visible {
+            let _ = app.emit("usticky://backdrop-refresh", ());
+        }
+        return Ok(());
+    }
+
+    let title = rust_i18n::t!("window.preview").to_string();
+    let url = WebviewUrl::App(format!("preview.html?id={}", todo_id).into());
+    let _win = WebviewWindowBuilder::new(&app, "preview", url)
+        .title(title)
+        .inner_size(w_logical, h_logical)
+        // builder position 是逻辑坐标（x/y 两个 f64），pos_x/pos_y 算的是
+        // 物理像素 —— 除 scale 换回逻辑，Retina 上否则偏一倍。
+        .position(pos_x as f64 / scale, pos_y as f64 / scale)
+        .resizable(true)
+        .decorations(false)
+        .transparent(true)
+        // v0.2.3：去原生窗口阴影 —— 透明无边框窗的 NSWindow shadow 会紧贴
+        // panel 外形画一圈硬黑边（用户实测"太丑"）。投影由 preview.css 的
+        // --pv-shadow（柔和 50px blur）负责。
+        .shadow(false)
+        .always_on_top(true)
+        .accept_first_mouse(true)
+        .focused(pinned)
+        .visible(true)
+        .build()
+        .map_err(|e| format!("create preview window: {e}"))?;
+    let _ = app.emit("usticky://backdrop-refresh", ());
+    Ok(())
+}
+
+/// 关闭预览窗口（浮窗 hover 收尾 / preview.ts 自关 / 浮窗 hide 兜底共用）。
+/// 幂等：窗口不存在时静默成功。
+///
+/// `force = false`（默认）：窗口**聚焦中**（用户在预览里编辑）时跳过 ——
+/// 浮窗 hover(false) / grace close 不该打断编辑；编辑态窗口由 preview.ts
+/// 自己的 blur/Esc 关闭。`force = true`：浮窗 hide 等兜底路径强制关。
+#[tauri::command]
+pub async fn close_preview_window(app: AppHandle, force: Option<bool>) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("preview") {
+        if !force.unwrap_or(false) && w.is_focused().unwrap_or(false) {
+            return Ok(());
+        }
+        w.close().map_err(|e| e.to_string())?;
+        // 关窗同样触发合成层重排 → 浮窗玻璃重采样（见 open 的注释）
+        let _ = app.emit("usticky://backdrop-refresh", ());
+    }
     Ok(())
 }

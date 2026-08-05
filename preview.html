@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<!--
+  QuickLook 式预览窗入口（v0.2）。
+  动态创建的独立 webview（open_preview_window 命令），URL 带 ?id=<todo uuid>。
+    - hover dwell 触发：focused(false) 非聚焦面板，鼠标离开卡片 grace 后自关
+    - 点击缩略图触发：focused(true) 聚焦编辑态，Esc / 窗口 blur 自关
+  lang attr 在 src/i18n/index.ts initLocale() 时改。
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Usticky · Preview</title>
+  </head>
+  <body>
+    <div id="preview-app"></div>
+    <script type="module" src="/src/preview.ts"></script>
+  </body>
+</html>

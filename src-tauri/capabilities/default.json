@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "permissions shared by floating + settings windows — core IPC + opener (GitHub link)",
-  "windows": ["floating", "settings"],
+  "description": "permissions shared by floating + settings + preview windows — core IPC + opener (GitHub link); clipboard image attachments served via assetProtocol scope in tauri.conf.json (no core:asset permission in Tauri 2)",
+  "windows": ["floating", "settings", "preview"],
   "permissions": [
     "core:default",
     "core:window:allow-show",

@@ -31,6 +31,7 @@ export default defineConfig({
       input: {
         main: `${root}index.html`,
         settings: `${root}settings.html`,
+        preview: `${root}preview.html`,
       },
       output: {
         entryFileNames: "assets/[name].js",

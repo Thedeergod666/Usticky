@@ -78,7 +78,8 @@
   50%      { transform: rotate(0.001deg); opacity: 0.999; }
 }
 .todo-card,
-.todo-input {
+.todo-input,
+.todo-paste-btn {
   animation: usticky-backdrop-heartbeat 4s linear infinite;
 }
 
@@ -94,7 +95,8 @@
  *     了 transform 通道，再叠加会冲突 / 浪费合成预算
  */
 .todo-card.force-reflow,
-.todo-input.force-reflow {
+.todo-input.force-reflow,
+.todo-paste-btn.force-reflow {
   /* filter: drop-shadow 是 compositor 友好属性，1px blur 视觉无感但
    * 触发 paint invalidation → backdrop layer 立刻重采样。 */
   filter: drop-shadow(0 0 0 transparent);
@@ -493,33 +495,8 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
   white-space: nowrap;
 }
 
-/* ── hover-expand：被截断的 title 在卡片 hover 时换行展开 ──
- *
- * 触发：JS 在 .todo-card 的 mouseenter/mouseleave 上 toggle .title-expanded。
- * 设计取舍：
- *   - 4 行 clamp：避免 500 字 title 撑成 50 行巨型窗口；超过 4 行
- *     保留 .todo-title 上的原生 title= tooltip 给"真要看全文"的用户。
- *   - 不加 height / max-height transition —— 跟 styles.css:88-94 一致，
- *     layout 属性不做 spring；展开瞬时即可。
- *   - .todo-card 默认 align-items: center（2026-07-09 改）+ .todo-title
- *     line-height: 1（text box 13px）—— 单行卡片里 title 视觉居中，
- *     checkbox 用 align-self: flex-start 钉顶（不受 card center 影响），
- *     解决"偏上"且 hover-expand 多行时 checkbox 0 跳。
- *   - word-break: break-word + overflow-wrap: anywhere —— CJK 长串字符
- *     和超长英文 token 都能在边界断行，不会撑出 flex 容器。 */
-.todo-card.title-expanded .todo-title {
-  white-space: normal;
-  /* 多行展开时 line-height 拉回 1.4 —— 默认值附近，避免 line-height: 1
-   * 让 4 行文字挤成 52px 太紧，行间无呼吸。 */
-  line-height: 1.4;
-  word-break: break-word;
-  overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-line-clamp: 4;
-  line-clamp: 4;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
+/* v0.2：hover-expand（.title-expanded 换行展开）已退役，由 QuickLook 预览窗
+ * （preview.html webview）替代 —— hover 长文不再把卡变长，dwell 后弹预览。 */
 
 /* ── 编辑态 input（替换 .todo-title，in-place 编辑） ──
  *
@@ -649,8 +626,18 @@ body[data-active] #app .todo-due.days     { color: var(--c-data-cyan);  backgrou
   background: var(--c-data-alert);
 }
 
-/* ── 输入区 ── */
+/* ── 输入区（v0.2.3：输入瓦片 + 独立粘贴瓦片，两框并排列） ──
+ * .todo-input-row 是 flex 行容器：左 .todo-input（输入框 + 快捷键 hint），
+ * 右 .todo-paste-btn（独立玻璃瓦片，跟输入框等高、中间留缝 —— 用户截图
+ * 参考布局）。两块瓦片共享同一套 tile 变量（bg/border/radius/shadow/blur）。 */
+.todo-input-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;  /* 与 #app 卡片间 gap 一致（v0.2.4 用户要求视觉同节奏） */
+}
 .todo-input {
+  flex: 1 1 auto;
+  min-width: 0;  /* 行内收缩让位给粘贴框 */
   display: flex;
   align-items: center;
   gap: 8px;
@@ -671,6 +658,11 @@ body[data-active] #app .todo-due.days     { color: var(--c-data-cyan);  backgrou
 }
 .todo-input input {
   flex: 1 1 auto;
+  /* **v0.2.3 hint 截断修复**：flex item 默认 min-width:auto = 不肯缩到
+   * placeholder 内容宽以下 → hint（flex 0 0 auto）被推出瓦片右缘裁掉
+   * （用户实测 "Press ⌘" 后半截消失）。min-width:0 让 input 自由缩，
+   * placeholder 在框内自然截断，hint 永远完整可见。 */
+  min-width: 0;
   background: transparent;
   border: none;
   outline: none;
@@ -697,29 +689,12 @@ body[data-active] #app .todo-due.days     { color: var(--c-data-cyan);  backgrou
   white-space: nowrap;  /* 防止 hint 文字本身被换行（防御性，默认 inline 不会换） */
 }
 
-/* 窄窗模式（两档 —— 文字 + 容器都缩到极简）：
- *
- *   正常（≥ 280）→ 10px 字号 + 背景框 + 2px/6px padding（iOS 26 胶囊）
- *   图标（< 280）→ 9px 字号 + 无背景 + 1px/2px padding + gap 4px +
- *                  容器 padding 8px/8px，hint 文字 '⌘⇧'（去 'Space'）
- *
- * 阈值 280 = minWidth 240 + 40px 余量。
- *
- * 由 main.ts 的 syncNarrowMode() 根据 window.innerWidth 设
- * body[data-narrow] = "" / "1" 触发。
- *
- * 为什么不做 3 档（之前 compact 240-279 用 '⌘⇧Space' 完整版）：
- *   用户实测 260px 浮窗下 compact 版 '⌘⇧Space' 仍被裁 —— 中文
- *   13px 字号下 input 占位符 '要做的事？回车保存' 实际渲染 ~135px
- *   （比英文 'What needs doing? Press Enter' 宽 ~25px），加上
- *   hint '⌘⇧Space' 9px 紧凑版 ~46px + gap 6px + padding 32px
- *   ≈ 219px 临界点已超 240 minWidth。tier 1 直接用 '⌘⇧' 图标版
- *   是唯一 fit 方案，放弃 240-279 区间保留 'Space' 文字。
- *
- * 为什么不用 display:none：
- *   用户明确反馈'图标不被挤压'，不能用'消失'替代。tier 1 '⌘⇧'
- *   icon 仍是可见的快捷键提示（modifier only），失去的是 key
- *   字母 —— 用户已在快捷键录入流程里设过键，icon 已够提醒。 */
+/* 窄窗模式（< 240，正常不可达 —— minWidth 240，仅拖窗 clamp 前一瞬路过）：
+ * 容器 padding/gap 缩到极简，hint 换 '⌘⇧' 图标版（main.ts updateInputHint）。
+ * v0.2.3 起完整 hint 靠 input min-width:0 在 ≥240 全宽段 fit，280 阈值退役。 */
+body[data-narrow="1"] .todo-input-row {
+  gap: 6px;
+}
 body[data-narrow="1"] .todo-input {
   gap: 4px;
   padding: 8px 8px;
@@ -731,6 +706,59 @@ body[data-narrow="1"] .todo-input-hint {
   background: transparent;
   border-radius: 2px;
   letter-spacing: 0;
+}
+
+/* ── 粘贴按钮（v0.2.3 独立玻璃瓦片） ──
+ * 跟输入框等高的方形瓦片（align-self:stretch 拿行高 + 固定 width:34px
+ * 凑正方形 —— 输入瓦片高 = padding 8×2 + 13px 字 ~17px 行高 + border
+ * ≈ 34px）。**别用 aspect-ratio**：WKWebView 里 flex stretch + aspect-ratio
+ * 的 height→width 传递失效，宽度会塌成 fit-content（~17px 窄条，v0.2.3
+ * 用户实测）。同一套 tile 玻璃质感；始终可见（"点一下"动作，不需要
+ * hover 驱动显隐；非聚焦窗口 CSS :hover 不可靠，反馈走 :active）。 */
+.todo-paste-btn {
+  flex: 0 0 auto;
+  align-self: stretch;
+  width: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: var(--tile-bg);
+  backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
+  -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
+  border: 1px solid var(--tile-border);
+  border-radius: 14px;
+  box-shadow: var(--tile-shadow);
+  color: var(--text-faint);
+  cursor: pointer;
+  transition:
+    background-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+    color 0.15s ease-out;
+}
+.todo-paste-btn svg {
+  width: 15px;
+  height: 15px;
+}
+.todo-paste-btn:active {
+  color: var(--c-data-info);
+  border-color: rgba(10, 132, 255, 0.45);
+  background: rgba(10, 132, 255, 0.18);
+}
+
+/* ── 图片附件缩略图（v0.2） ──
+ * 卡内 checkbox 右侧的 20px 方形预览，GIF 原生动画。点击 → 聚焦预览窗
+ * （preview.html）。attachment 文件丢失时 img error → JS 摘掉节点。 */
+.todo-thumb {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  object-fit: cover;
+  border-radius: 5px;
+  border: 1px solid var(--tile-border);
+  cursor: pointer;
+  -webkit-user-drag: none;
+  user-select: none;
 }
 
 /* ── Section header (Pending / Done) ── */
