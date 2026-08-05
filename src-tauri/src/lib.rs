@@ -578,6 +578,8 @@ pub fn run() {
             commands::add_todo,
             commands::update_todo,
             commands::delete_todo,
+            commands::restore_todo,
+            commands::purge_attachment,
             commands::reorder_todos,
             commands::resize_floating_window,
             commands::reset_floating_window,

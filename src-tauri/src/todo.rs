@@ -185,10 +185,14 @@ impl Store {
         if let Some(loc) = data.locale.as_deref() {
             rust_i18n::set_locale(loc);
         }
-        Ok(Self {
+        let store = Self {
             data,
             data_path: Mutex::new(Some(data_path)),
-        })
+        };
+        // 启动兜底：清掉上次崩溃/异常退出留下的孤儿附件文件
+        // （删除已延后到前端 undo 栈，见 commands::purge_attachment）。
+        store.purge_orphan_attachments();
+        Ok(store)
     }
 
     pub fn todos(&self) -> &[Todo] {
@@ -327,6 +331,66 @@ impl Store {
     pub fn delete(&mut self, id: &str) -> Option<Todo> {
         let idx = self.data.todos.iter().position(|t| t.id == id)?;
         Some(self.data.todos.remove(idx))
+    }
+
+    /// 撤销删除 -- 把前端 undo 栈暂存的完整 Todo 原样塞回 Vec。
+    ///
+    /// 保留原 id/order/status，尽量回到删除前的位置。边缘情况：删除后
+    /// 用户若 reorder 过同 section，reorder 会把该 section 的 order 重排成
+    /// 0,1,2...，此时原 order 可能跟某条 todo 撞号 -> `todos_sorted` 的
+    /// stable sort 会把这条排到同号之后（它在 Vec 末尾）。这是可接受的
+    /// 退化：reorder 之后精确原位本就不可能保证，恢复到 section 末尾已
+    /// 足够。
+    ///
+    /// 防御：id 已存在（前端重复 restore / 并发）-> 不重复插入，返回已有那条，
+    /// 避免同 id 在 Vec 里出现两份（会污染后续 update/delete 的 position 命中）。
+    pub fn restore(&mut self, todo: Todo) -> Todo {
+        if let Some(existing) = self.data.todos.iter().find(|t| t.id == todo.id) {
+            return existing.clone();
+        }
+        let cloned = todo.clone();
+        self.data.todos.push(todo);
+        cloned
+    }
+
+    /// 启动时清理孤儿附件文件 -- 崩溃/异常退出留下的、todos.json 里已没有
+    /// 对应 todo 引用的附件文件。开销可忽略（目录里通常就几个文件）。
+    ///
+    /// 为什么需要：delete_todo 的附件文件删除已延后到前端 undo 栈超时
+    /// （见 `commands::purge_attachment`）。如果用户删除后还没等 undo 窗口
+    /// 超时就关掉浮窗 / 杀进程，附件文件就成了孤儿。启动时扫一遍兜底清理。
+    /// uuid 命名保证不会误删别家的文件。
+    pub fn purge_orphan_attachments(&self) {
+        let dir = match self.attachments_dir() {
+            Some(d) => d,
+            None => return,
+        };
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => return, // 目录不存在 = 从没存过附件，跳过
+        };
+        let live: std::collections::HashSet<&str> = self
+            .data
+            .todos
+            .iter()
+            .filter_map(|t| t.attachment.as_ref().map(|a| a.file.as_str()))
+            .collect();
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if !live.contains(name) {
+                    if let Err(e) = fs::remove_file(entry.path()) {
+                        // NotFound 不算错（用户手动清过 / 跨设备拷贝丢了附件）
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!(
+                                "purge orphan attachment {:?} failed: {}",
+                                entry.path(),
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// 拖拽后批量重排（按 status 内顺序）。

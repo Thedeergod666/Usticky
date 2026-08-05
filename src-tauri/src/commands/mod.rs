@@ -182,26 +182,57 @@ pub async fn delete_todo(
     store: State<'_, SharedStore>,
     id: String,
 ) -> Result<Todo, String> {
-    let (deleted, attachments_dir) = {
+    let deleted = {
         let mut s = store.write().await;
-        let d = s
-            .delete(&id)
-            .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?;
-        (d, s.attachments_dir())
+        s.delete(&id)
+            .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?
     };
-    // v0.2：删除 todo 连带清理附件文件。失败只 log 不阻塞 —— 孤儿文件
-    // 下次启动无害（磁盘上几 KB），比"删 todo 失败"好。
-    if let (Some(att), Some(dir)) = (&deleted.attachment, &attachments_dir) {
-        let path = dir.join(&att.file);
+    // v0.2 撤销删除：附件文件**不**在这里删。前端把被删 Todo 存进 undo 栈，
+    // 8s 内可点「撤销」调 `restore_todo` 恢复（图片完整可恢复）；超时后前端
+    // 调 `purge_attachment` 真删文件。崩溃/异常退出留下的孤儿由启动孤儿扫描
+    // 兜底（`Store::purge_orphan_attachments`）。
+    persist_and_emit(&app, &store).await;
+    Ok(deleted)
+}
+
+/// 撤销删除 - 把前端 undo 栈暂存的完整 Todo 塞回 store。
+///
+/// 复用原 id/order/status，尽量回到原位（见 `Store::restore` 的退化说明）。
+#[tauri::command]
+pub async fn restore_todo(
+    app: AppHandle,
+    store: State<'_, SharedStore>,
+    todo: Todo,
+) -> Result<Todo, String> {
+    let restored = {
+        let mut s = store.write().await;
+        s.restore(todo)
+    };
+    persist_and_emit(&app, &store).await;
+    Ok(restored)
+}
+
+/// 真删单个附件文件 - 前端 undo 栈超时（用户没点撤销）后调用。
+///
+/// 安全校验：`file` 必须是纯文件名，禁止含路径分隔符 / `..`，否则前端
+/// （或中间人篡改 IPC）可构造 `../../etc/passwd` 删任意文件。不 emit
+/// todos-changed、不 persist - 这个调用只动磁盘文件，不改 todo 数据。
+#[tauri::command]
+pub async fn purge_attachment(store: State<'_, SharedStore>, file: String) -> Result<(), String> {
+    if file.is_empty() || file.contains('/') || file.contains('\\') || file.contains("..") {
+        return Err("invalid attachment file name".to_string());
+    }
+    let dir = store.read().await.attachments_dir();
+    if let Some(dir) = dir {
+        let path = dir.join(&file);
         if let Err(e) = std::fs::remove_file(&path) {
-            // NotFound 不算错（用户手动清过 / 跨设备拷贝丢了附件）
+            // NotFound 不算错（已被启动孤儿扫描清掉 / 用户手动清过）
             if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("delete attachment {:?} failed: {}", path, e);
+                tracing::warn!("purge attachment {:?} failed: {}", path, e);
             }
         }
     }
-    persist_and_emit(&app, &store).await;
-    Ok(deleted)
+    Ok(())
 }
 
 #[tauri::command]

@@ -881,6 +881,31 @@ body:not([data-hover]):not([data-low-power]) .todo-section-done {
   transform: translateX(-50%) translateY(0);
 }
 
+/* 带「撤销」按钮的 action flash（删除用它）。默认 .mini-flash 是
+ * pointer-events:none 的纯提示；has-action 改成 flex 横排 + 可点。 */
+.mini-flash.has-action {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.mini-flash-text {
+  white-space: nowrap;
+}
+.mini-flash-action {
+  background: transparent;
+  border: none;
+  color: var(--c-data-info, #0a84ff);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+  white-space: nowrap;
+}
+.mini-flash-action:active {
+  opacity: 0.7;
+}
+
 /* ── 省电模式（body[data-low-power]） ──
  *
  * v2 调整（2026-07-03）：省电模式保留强 alpha（视觉一致），但关掉 blur/saturate

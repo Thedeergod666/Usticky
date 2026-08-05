@@ -223,17 +223,54 @@ function syncNarrowMode() {
 
 // ── mini flash（复用 Musage 模式） ──
 let miniFlashTimer: ReturnType<typeof setTimeout> | null = null;
-function showMiniFlash(msg: string): void {
+
+function ensureMiniFlashEl(): HTMLElement {
   let el = app.querySelector<HTMLElement>(".mini-flash");
   if (!el) {
     el = document.createElement("div");
     el.className = "mini-flash";
     app.appendChild(el);
   }
+  return el;
+}
+
+function hideMiniFlash(): void {
+  if (miniFlashTimer) {
+    clearTimeout(miniFlashTimer);
+    miniFlashTimer = null;
+  }
+  const el = app.querySelector<HTMLElement>(".mini-flash");
+  if (el) el.classList.remove("visible");
+}
+
+function showMiniFlash(msg: string): void {
+  const el = ensureMiniFlashEl();
   el.textContent = msg;
-  el.classList.add("visible");
+  el.classList.remove("has-action");
   if (miniFlashTimer) clearTimeout(miniFlashTimer);
-  miniFlashTimer = setTimeout(() => el?.classList.remove("visible"), 3000);
+  el.classList.add("visible");
+  miniFlashTimer = setTimeout(() => el.classList.remove("visible"), 3000);
+}
+
+/// 文字 + 可点按钮的 action flash（删除撤销用它）。**不**自设超时 --
+/// flash 关闭交给调用方（undoDelete 调 hideMiniFlash / undo 栈 timer
+/// 超时调 hideMiniFlash），保证 8s undo 窗口内按钮一直可点。
+function showActionFlash(msg: string, actionLabel: string, onAction: () => void): void {
+  const el = ensureMiniFlashEl();
+  el.textContent = "";
+  const text = document.createElement("span");
+  text.className = "mini-flash-text";
+  text.textContent = msg;
+  const btn = document.createElement("button");
+  btn.className = "mini-flash-action";
+  btn.type = "button";
+  btn.textContent = actionLabel;
+  btn.addEventListener("click", () => onAction());
+  el.appendChild(text);
+  el.appendChild(btn);
+  el.classList.add("has-action");
+  if (miniFlashTimer) clearTimeout(miniFlashTimer);
+  el.classList.add("visible");
 }
 
 // ── 工具 ──
@@ -633,6 +670,12 @@ const PREVIEW_TEXT_W = 460;
 let previewTodoId: string | null = null;
 let previewPinnedId: string | null = null;
 let previewMouseInside = false;
+/// 上一 tick hover-pos 的 over_preview 值。用于检测"鼠标刚从预览窗滑回浮窗"
+/// 的 true->false 边沿：over_preview 期间 rustHoveredCardId 被清空，鼠标滑回
+/// 浮窗空白区时 newId===rustHoveredCardId（都 null）会命中 line ~1572 的短路
+/// return，导致 schedulePreviewClose 永不重排 -> 预览常驻（v0.2.4 回归）。
+/// 边沿置位 justLeftPreview 跳过该短路一次，让 grace close 重排。
+let previewWasOver = false;
 let previewDwellTimer: ReturnType<typeof setTimeout> | null = null;
 let previewCloseTimer: ReturnType<typeof setTimeout> | null = null;
 /// 预览窗是否已预热（隐藏创建过一次）。首次 floating-hover(true) 触发。
@@ -980,6 +1023,58 @@ function resetDeleteConfirm(todoId: string) {
   }
 }
 
+// ── 删除撤销栈（单条 / 8s）──
+//
+// 删除 todo 后，被删的完整 Todo（含 attachment）暂存进 undoEntry，显示
+// 带「撤销」按钮的 action flash。8s 内点撤销 -> restore_todo 把它塞回
+// store；超时 -> purge_attachment 真删附件文件。单条：新删顶掉旧的，旧
+// 条目先触发自己的 purge（用户已经放弃撤销那条了）。
+//
+// 为什么附件不跟 delete_todo 一起删：那样撤销时图片文件已没了 = 裂图。
+// 附件文件生命周期严格绑定 undo 栈：窗口内完整可恢复，超时后才真删。
+const DELETE_UNDO_MS = 8000;
+
+interface UndoEntry {
+  todo: Todo;
+  file: string | null;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+let undoEntry: UndoEntry | null = null;
+
+/// 清掉 undo 栈条目。purge=true 时顺带真删附件文件（超时 / 被新删顶掉）；
+/// purge=false 时保留文件（点撤销恢复用）。
+function clearUndoEntry(purge: boolean): void {
+  if (!undoEntry) return;
+  if (undoEntry.timer) {
+    clearTimeout(undoEntry.timer);
+    undoEntry.timer = null;
+  }
+  if (purge && undoEntry.file) {
+    const file = undoEntry.file;
+    void invoke("purge_attachment", { file }).catch((e) =>
+      console.error("[usticky] purge_attachment failed", e),
+    );
+  }
+  undoEntry = null;
+}
+
+async function undoDelete(): Promise<void> {
+  const entry = undoEntry;
+  if (!entry) return;
+  // 清栈但**不** purge -- 附件要恢复，文件留着。
+  undoEntry = null;
+  if (entry.timer) clearTimeout(entry.timer);
+  hideMiniFlash();
+  try {
+    await invoke("restore_todo", { todo: entry.todo });
+    showMiniFlash(t("app.undo.flash", { title: entry.todo.title }));
+  } catch (e) {
+    console.error("[usticky] restore_todo failed", e);
+    showMiniFlash(t("app.error.save_failed"));
+  }
+}
+
 async function deleteTodo(todo: Todo) {
   const row = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(todo.id)}"]`);
   if (row) {
@@ -987,7 +1082,26 @@ async function deleteTodo(todo: Todo) {
     setTimeout(async () => {
       try {
         await invoke("delete_todo", { id: todo.id });
-        showMiniFlash(t("app.delete.flash", { title: todo.title }));
+        // 新删顶掉旧 undo 条目（旧的真删附件）-> 存新条目 -> 显示
+        // 带撤销按钮的 action flash。8s 超时后真删附件 + 关 flash。
+        clearUndoEntry(true);
+        const entry: UndoEntry = {
+          todo,
+          file: todo.attachment?.file ?? null,
+          timer: null,
+        };
+        entry.timer = setTimeout(() => {
+          clearUndoEntry(true);
+          hideMiniFlash();
+        }, DELETE_UNDO_MS);
+        undoEntry = entry;
+        showActionFlash(
+          t("app.delete.flash", { title: todo.title }),
+          t("app.action.undo"),
+          () => {
+            void undoDelete();
+          },
+        );
       } catch (e) {
         console.error("[usticky] delete_todo failed", e);
         row.classList.remove("vanishing");
