@@ -692,6 +692,24 @@ pub async fn paste_from_clipboard(
             std::fs::create_dir_all(&dir).map_err(|e| format!("create attachments dir: {e}"))?;
             let file = format!("{}.{}", uuid::Uuid::new_v4(), img.ext);
             let path = dir.join(&file);
+            // **P1 fix（review v0.2.6）**：attachment 落盘 mode 0o600，对齐 todos.json
+            // 的安全姿态。std::fs::write 走默认 mode (0o666 & ~umask，常见 0o644)，
+            // 剪贴板图片常常含敏感内容（聊天截图、密码管理器 UI、扫描件），
+            // 同机其他账号可读。todo.rs persist_to_disk 已用同模式 (v0.1.5 P2-1)。
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .and_then(|mut f| f.write_all(&img.data))
+                    .map_err(|e| format!("write attachment: {e}"))?;
+            }
+            #[cfg(not(unix))]
             std::fs::write(&path, &img.data).map_err(|e| format!("write attachment: {e}"))?;
 
             let title = match img.name.as_deref().map(str::trim) {
