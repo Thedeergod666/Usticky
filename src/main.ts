@@ -97,7 +97,7 @@ let rustHoveredCardId: string | null = null;
 ///
 /// 未来新增"不应被 SortableJS 当作拖拽起点"的卡内控件（如优先级 chip、
 /// 标签按钮），只需把选择器追加到这条常量里。
-const NON_DRAGGABLE_SELECTORS = ".todo-check, .todo-delete, .todo-copy, .todo-edit-input, .todo-thumb";
+const NON_DRAGGABLE_SELECTORS = ".todo-check, .todo-delete, .todo-copy, .todo-edit-input, .todo-banner";
 
 // 浮窗层级模式（pin_top / pin_bottom / normal）
 // 启动时从后端 get_pin_mode 拉，跟 usticky://pin-mode-changed 事件同步
@@ -502,25 +502,6 @@ function buildTodoRow(todo: Todo): HTMLElement {
   });
   row.appendChild(check);
 
-  // v0.2 图片附件缩略图：GIF 在 <img> 里原生动画。点击 → 聚焦预览窗
-  // （pinned 模式）。加载失败（附件文件丢了）→ 隐藏缩略图，不留裂图。
-  if (todo.attachment) {
-    const thumb = document.createElement("img");
-    thumb.className = "todo-thumb";
-    thumb.alt = "";
-    thumb.draggable = false;
-    const url = attachmentUrl(todo.attachment.file);
-    if (url) thumb.src = url;
-    thumb.title = t("app.action.preview");
-    thumb.setAttribute("aria-label", t("app.action.preview"));
-    thumb.addEventListener("error", () => thumb.remove());
-    thumb.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void openPreviewPinned(todo.id);
-    });
-    row.appendChild(thumb);
-  }
-
   const title = document.createElement("div");
   title.className = "todo-title";
   title.textContent = todo.title;
@@ -577,6 +558,26 @@ function buildTodoRow(todo: Todo): HTMLElement {
   });
   actions.appendChild(del);
   row.appendChild(actions);
+
+  // v0.2.6 图片附件 banner：整宽预览（替代旧 20px 缩略图 -- 旧版太小且
+  // 首启竞态下 attachmentsDir 未就绪，<img> 无 src -> 空白框）。放在卡末尾，
+  // .todo-card flex-wrap:wrap + banner flex-basis:100% 让它折到标题行下方
+  // 独占一行。GIF 原生动画，点击 -> 聚焦预览窗看全图。加载失败摘节点不留裂图。
+  if (todo.attachment) {
+    const banner = document.createElement("img");
+    banner.className = "todo-banner";
+    banner.alt = "";
+    banner.draggable = false;
+    const url = attachmentUrl(todo.attachment.file);
+    if (url) banner.src = url;
+    banner.setAttribute("aria-label", t("app.action.preview"));
+    banner.addEventListener("error", () => banner.remove());
+    banner.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void openPreviewPinned(todo.id);
+    });
+    row.appendChild(banner);
+  }
 
   // 聚焦路径的按钮 hover 反馈（未聚焦路径由 hover-pos 驱动，见 setBtnHover）
   for (const btn of [copyBtn, del]) {
@@ -670,12 +671,6 @@ const PREVIEW_TEXT_W = 460;
 let previewTodoId: string | null = null;
 let previewPinnedId: string | null = null;
 let previewMouseInside = false;
-/// 上一 tick hover-pos 的 over_preview 值。用于检测"鼠标刚从预览窗滑回浮窗"
-/// 的 true->false 边沿：over_preview 期间 rustHoveredCardId 被清空，鼠标滑回
-/// 浮窗空白区时 newId===rustHoveredCardId（都 null）会命中 line ~1572 的短路
-/// return，导致 schedulePreviewClose 永不重排 -> 预览常驻（v0.2.4 回归）。
-/// 边沿置位 justLeftPreview 跳过该短路一次，让 grace close 重排。
-let previewWasOver = false;
 let previewDwellTimer: ReturnType<typeof setTimeout> | null = null;
 let previewCloseTimer: ReturnType<typeof setTimeout> | null = null;
 /// 预览窗是否已预热（隐藏创建过一次）。首次 floating-hover(true) 触发。
@@ -948,10 +943,13 @@ const PASTE_ICON_SVG = `<svg width="13" height="13" viewBox="0 0 24 24" fill="no
 /// Rust 端读剪贴板无焦点要求 —— 未聚焦浮窗也能粘（前端
 /// navigator.clipboard.read() 在非 key window 下不可靠，同 copyTodoText
 /// 的 writeText 失败同理，所以不走前端 Clipboard API）。
-async function pasteFromClipboard() {
+async function pasteFromClipboard(title?: string | null): Promise<{ kind: string } | null> {
   try {
-    const res = await invoke<{ kind: string; title: string }>("paste_from_clipboard");
+    const res = await invoke<{ kind: string; title: string }>("paste_from_clipboard", {
+      title: title ?? null,
+    });
     showMiniFlash(res.kind === "image" ? t("app.paste.flash_image") : t("app.paste.flash"));
+    return res;
   } catch (e) {
     // 后端 Err("empty") = 剪贴板为空（或只有空白文本）
     if (String(e).includes("empty")) {
@@ -960,6 +958,7 @@ async function pasteFromClipboard() {
       console.error("[usticky] paste_from_clipboard failed", e);
       showMiniFlash(t("app.paste.failed"));
     }
+    return null;
   }
 }
 
@@ -1586,7 +1585,14 @@ async function init() {
       clearTimeout(hoverEnterTimer);
       hoverEnterTimer = null;
     }
-    setHoverAttr(e.payload);
+    // 玻璃：进浮窗永远 hover；离浮窗时若预览开着（鼠标正穿缝 card 与 preview
+    // 之间的 12px GAP），保持 hover 不摘 -- 预览是 todo 的一部分，穿缝是过渡
+    // 动作，不该闪一下 idle 让卡片变暗。预览真关（preview-closed）且鼠标仍
+    // 在外时才落 idle（见 preview-closed listener）。
+    const previewOpen = previewTodoId !== null && previewPinnedId === null;
+    if (e.payload || !previewOpen) {
+      setHoverAttr(e.payload);
+    }
     // 回到浮窗 → 取消任何进行中的预览 grace close（穿缝/折返不闪断）
     if (e.payload) cancelPreviewClose();
     // 首次 hover 预热预览窗（隐藏创建，webview 提前加载完）→ 后续 dwell
@@ -1602,7 +1608,10 @@ async function init() {
     if (!e.payload) {
       setBtnHover(null);
       previewMouseInside = false;
-      if (rustHoveredCardId !== null) {
+      // 预览开着时（鼠标正穿缝 card 与 preview 之间的 GAP）不摘卡片强调 --
+      // 预览是 todo 的一部分，穿缝是过渡。rustHoveredCardId 不清，让
+      // over_preview / 回卡时仍能正确跟手。预览真关时由 preview-closed 释放。
+      if (!previewOpen && rustHoveredCardId !== null) {
         const oldId = rustHoveredCardId;
         rustHoveredCardId = null;
         const old = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(oldId)}"]`);
@@ -1649,8 +1658,13 @@ async function init() {
     if (!appEl) return;
 
     // 鼠标在预览窗上（Rust hit-test 命中 preview 窗口）→ 驻留态：
-    // 坐标相对浮窗无意义，不能跑 elementFromPoint；取消 dwell / grace
-    // close，浮窗卡片 unhover（藏按钮）。注意这里**只**置
+    // 坐标相对浮窗无意义，不能跑 elementFromPoint；取消 dwell / grace close。
+    // 预览窗是 todo 的一部分 -- hover 到预览窗时浮窗侧对应卡片**保持**强调
+    // 态（.card-hover / 操作按钮可见），而非摘掉进未强调态（用户 2026-08-05
+    // 反馈：原实现 unhoverCard 摘 .card-hover -> 卡片像失焦了）。把
+    // rustHoveredCardId 对齐到 previewTodoId 并确保其 .card-hover 在（未聚焦
+    // 路径幂等；聚焦路径 JS mouseleave 可能已摘，这里挂回，最多滞后一 tick）。
+    // 注意这里**只**置
     // previewMouseInside（阻止自动关闭），不置 previewPinnedId ——
     // 路过预览窗不该把内容锁死，回到浮窗 hover 别的卡仍要跟上。
     if (e.payload.over_preview) {
@@ -1658,27 +1672,20 @@ async function init() {
       cancelPreviewDwell();
       cancelPreviewClose();
       setBtnHover(null);
-      if (rustHoveredCardId !== null) {
-        const oldId = rustHoveredCardId;
-        rustHoveredCardId = null;
-        const old = appEl.querySelector<HTMLElement>(
-          `.todo-card[data-todo-id="${cssEscape(oldId)}"]`,
-        );
-        if (old) unhoverCard(old);
+      if (previewTodoId !== null) {
+        if (rustHoveredCardId !== null && rustHoveredCardId !== previewTodoId) {
+          appEl.querySelector<HTMLElement>(
+            `.todo-card[data-todo-id="${cssEscape(rustHoveredCardId)}"]`,
+          )?.classList.remove(CARD_HOVER_CLASS);
+        }
+        rustHoveredCardId = previewTodoId;
+        appEl.querySelector<HTMLElement>(
+          `.todo-card[data-todo-id="${cssEscape(previewTodoId)}"]`,
+        )?.classList.add(CARD_HOVER_CLASS);
       }
-      previewWasOver = true;
       return;
     }
     previewMouseInside = false;
-    // over_preview true->false 边沿：鼠标刚从预览窗滑回浮窗。此时
-    // rustHoveredCardId 仍是 null（over_preview 期间被清空），若落在空白区
-    // newId===rustHoveredCardId（都 null）会命中下面 line ~1686 的短路
-    // return -> schedulePreviewClose 永不重排 -> 预览常驻（v0.2.4 回归根因）。
-    // 置 justLeftPreview 跳过该短路一次，让卡->空白分支的 schedulePreviewClose
-    // 得以执行；下一 tick previewWasOver 已复位，稳态 null===null 仍短路（防
-    // 每 tick 重排 timer 永不触发）。
-    const justLeftPreview = previewWasOver;
-    previewWasOver = false;
 
     // payload 已是视口相对坐标（Rust 端换算），直接喂 elementFromPoint
     const relX = e.payload.x;
@@ -1705,7 +1712,7 @@ async function init() {
     setBtnHover(btnHit);
     const card = el?.closest<HTMLElement>(".todo-card") ?? null;
     const newId = card?.dataset.todoId ?? null;
-    if (newId === rustHoveredCardId && !justLeftPreview) return; // 还在同一张卡上
+    if (newId === rustHoveredCardId) return; // 还在同一张卡上
 
     // 卡切换 / 卡→空白：收起上一张，展开新一张（如果有）
     if (rustHoveredCardId !== null) {
@@ -1800,6 +1807,16 @@ async function init() {
   // sync 到 body[data-pin-mode] —— CSS 据此在 PinBottom idle 进一步淡化 done 卡
   document.body.dataset.pinMode = currentPinMode;
 
+  // ── v0.2 附件目录：缩略图 / convertFileSrc 拼 URL 用，拉一次即可 ──
+  // **必须在首次 render 之前拿到**：buildTodoRow 给 <img> 挂 src 依赖
+  // attachmentsDir，若首次 render（下方 get_todos）先跑，已存在附件的 todo
+  // 首屏 <img> 无 src -> 空白框（v0.2.6 修复"粘贴图片显示空白框"根因之一）。
+  try {
+    attachmentsDir = await invoke<string>("get_attachments_dir");
+  } catch (e) {
+    console.error("[usticky] get_attachments_dir failed", e);
+  }
+
   // ── 启动时拉一次 snapshot ──
   try {
     const snap = await invoke<TodoSnapshot>("get_todos");
@@ -1832,13 +1849,6 @@ async function init() {
   })
     .then((fn) => (unlistenShortcut = fn))
     .catch((e) => console.error("[usticky] listen shortcut-changed failed", e));
-
-  // ── v0.2 附件目录：缩略图 / convertFileSrc 拼 URL 用，拉一次即可 ──
-  try {
-    attachmentsDir = await invoke<string>("get_attachments_dir");
-  } catch (e) {
-    console.error("[usticky] get_attachments_dir failed", e);
-  }
 
   // ── v0.2 预览窗 ↔ 浮窗同步（QuickLook 生命周期） ──
   //   preview-entered：鼠标进了预览窗 → 只取消 grace close（v0.2.3 起**不
@@ -1876,8 +1886,8 @@ async function init() {
     // 恒命中（previewPinnedId 始终 null）-> 直接 return -> 鼠标离开预览窗后
     // grace close 永不重排 -> 预览常驻。这里改为：只要还是当前预览就重排
     // grace close（schedulePreviewClose 内部守卫仍挡 pinned / mouseInside）。
-    // 与 hover-pos 的 justLeftPreview 边沿互为双保险（preview-left 走 mouseleave
-    // 事件、hover-pos 走 50ms tick，任一先到都能兜住）。
+    // 与 hover-pos 互为双保险（preview-left 走 mouseleave 事件、hover-pos 走
+    // 50ms tick，任一先到都能兜住 grace close 重排）。
     if (previewPinnedId === id) previewPinnedId = null;
     schedulePreviewClose();
   })
@@ -1889,6 +1899,20 @@ async function init() {
     previewMouseInside = false;
     cancelPreviewDwell();
     cancelPreviewClose();
+    // 穿缝期间保留的玻璃 / 卡片强调在此刻释放：预览真关 + 鼠标仍不在浮窗
+    // （floating-hover 早已 emit false，lastHoverPayload=false），落 idle +
+    // 摘 .card-hover。鼠标在浮窗上时不动（lastHoverPayload=true），让
+    // hover-pos 正常驱动，避免摘了又挂抖动。
+    if (lastHoverPayload === false) {
+      setHoverAttr(false);
+      setBtnHover(null);
+      if (rustHoveredCardId !== null) {
+        const oldId = rustHoveredCardId;
+        rustHoveredCardId = null;
+        const old = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(oldId)}"]`);
+        if (old) unhoverCard(old);
+      }
+    }
   })
     .then((fn) => (unlistenPreviewClosed = fn))
     .catch((e) => console.error("[usticky] listen preview-closed failed", e));
@@ -2132,7 +2156,8 @@ function ensureInputBar() {
   app.insertBefore(bar, app.firstChild);
 
   // v0.2 粘贴按钮：读剪贴板 → 文本/图片直接落成 pending todo。
-  // 跟 input 内 Cmd+V 的区别：后者只粘纯文本进输入框，这里能粘图片。
+  // 与 input 内 Cmd+V 的区别：粘贴按钮不要求浮窗聚焦（后端读剪贴板无焦点要求），
+  // input Cmd+V 需浮窗聚焦（窗口为 key window 才派 paste）；v0.2.6 起两者都能粘图片。
   const pasteBtn = bar.querySelector<HTMLButtonElement>(".todo-paste-btn")!;
   pasteBtn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -2182,6 +2207,33 @@ function ensureInputBar() {
         input.blur();
       }
     }
+  });
+
+  // v0.2.6：输入框内 Cmd+V 粘图片。input 是 type=text，默认只吃文本，粘图片
+  // 静默丢弃（用户此前只能点粘贴按钮）。补 paste 监听：剪贴板含图片就
+  // preventDefault 改走 paste_from_clipboard（后端读 OS 剪贴板，能落附件 todo），
+  // 并把已键入的文字当图片 todo 的标题传进去；纯文本则放行默认插入 input。
+  // 仅在 input 聚焦时触发（窗口此时是 key window，paste 事件可靠） -- 未聚焦
+  // 浮窗的粘贴仍由粘贴按钮兜底（后端读剪贴板无焦点要求）。
+  input.addEventListener("paste", (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    let hasImage = false;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.startsWith("image/")) {
+        hasImage = true;
+        break;
+      }
+    }
+    if (!hasImage) return; // 纯文本 -> 走默认插入 input
+    e.preventDefault();
+    const typed = input.value.trim();
+    void pasteFromClipboard(typed || null).then((res) => {
+      // 图片成功落盘 + 用了输入框文字当标题 -> 清空输入框（文字已被消费进 todo）。
+      // kind !== "image"（罕见：前端检测到图片但后端读到文本的竞态）不清空，
+      // 保留用户文字不被吞。
+      if (res && res.kind === "image" && typed) input.value = "";
+    });
   });
 }
 

@@ -658,17 +658,22 @@ pub async fn get_attachments_dir(store: State<'_, SharedStore>) -> Result<String
     Ok(dir.to_string_lossy().into_owned())
 }
 
-/// 读取剪贴板并创建 pending todo（粘贴按钮的唯一入口）。
+/// 读取剪贴板并创建 pending todo（粘贴按钮 + 输入框 Cmd+V 共同入口）。
 ///
 ///   - 剪贴板是图片 → 落盘 `attachments/<uuid>.<ext>` + 创建带 attachment 的 todo
 ///   - 剪贴板是文本 → 整段文本作为一个 todo（多行保留，预览窗口负责展示全文）
 ///   - 空剪贴板 → Err("empty")，前端 flash 提示
 ///
 /// 图片落盘失败（磁盘满 / 权限）→ Err 上抛，**不**创建半成品 todo。
+///
+/// `title`：输入框 Cmd+V 粘图片时把已键入的文字作为图片 todo 的标题传进来
+/// （文字被消费进 todo，前端随后清空输入框）。粘贴按钮 / 输入框无文字时传 None，
+/// 回退到 img.name 再到默认 "图片" 标题的既有链路。文本分支忽略此参数。
 #[tauri::command]
 pub async fn paste_from_clipboard(
     app: AppHandle,
     store: State<'_, SharedStore>,
+    title: Option<String>,
 ) -> Result<PasteOutcome, String> {
     match crate::clipboard::read(&app) {
         crate::clipboard::ClipboardContent::Text(text) => {
@@ -712,9 +717,12 @@ pub async fn paste_from_clipboard(
             #[cfg(not(unix))]
             std::fs::write(&path, &img.data).map_err(|e| format!("write attachment: {e}"))?;
 
-            let title = match img.name.as_deref().map(str::trim) {
+            let title = match title.as_deref().map(str::trim) {
                 Some(n) if !n.is_empty() => validate_title(n)?,
-                _ => rust_i18n::t!("commands.paste.image_title").to_string(),
+                _ => match img.name.as_deref().map(str::trim) {
+                    Some(n) if !n.is_empty() => validate_title(n)?,
+                    _ => rust_i18n::t!("commands.paste.image_title").to_string(),
+                },
             };
             let attachment = crate::todo::TodoAttachment {
                 file,

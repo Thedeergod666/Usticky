@@ -257,6 +257,9 @@ body[data-active] #app {
    * 在自身 text box 内自然向下展开（.todo-title flex: 1 1 auto 占满
    * 剩余高度）—— 0 跳。 */
   align-items: center;
+  /* v0.2.6：允许换行 -- 图片附件 .todo-banner（flex-basis 100%）折到标题行
+   * 下方独占一行。无 banner 的卡无满宽子元素，wrap 不触发，布局不变。 */
+  flex-wrap: wrap;
   gap: 10px;
   padding: 9px 13px 9px;
   background: var(--tile-bg);
@@ -746,19 +749,24 @@ body[data-narrow="1"] .todo-input-hint {
   background: rgba(10, 132, 255, 0.18);
 }
 
-/* ── 图片附件缩略图（v0.2） ──
- * 卡内 checkbox 右侧的 20px 方形预览，GIF 原生动画。点击 → 聚焦预览窗
- * （preview.html）。attachment 文件丢失时 img error → JS 摘掉节点。 */
-.todo-thumb {
-  flex: 0 0 auto;
-  width: 20px;
-  height: 20px;
+/* ── 图片附件 banner（v0.2.6，替代旧 20px 缩略图） ──
+ * 卡末尾整宽图片预览：.todo-card flex-wrap:wrap 让 banner（flex-basis 100%）
+ * 折到标题行下方独占一行。GIF 原生动画，点击 -> 聚焦预览窗看全图。
+ * attachment 文件丢失时 img error -> JS 摘掉节点不留裂图。 */
+.todo-banner {
+  /* flex: 0 0 100% + .todo-card flex-wrap:wrap -> banner 折到标题行下方独占
+   * 一行（无 banner 的卡不触发 wrap，布局不变）。整宽 + 固定高 + cover 裁剪
+   * -> 图片在卡内真正可见（替代旧 20px 缩略图，太小且首启竞态下空白框）。 */
+  flex: 0 0 100%;
+  width: 100%;
+  height: 100px;
   object-fit: cover;
-  border-radius: 5px;
+  border-radius: 8px;
   border: 1px solid var(--tile-border);
   cursor: pointer;
   -webkit-user-drag: none;
   user-select: none;
+  display: block;
 }
 
 /* ── Section header (Pending / Done) ── */

@@ -1,6 +1,6 @@
 # Usticky 项目说明
 
-> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.2.4 剪贴板粘贴 + QuickLook 预览（消闪收尾 + pin 焦点语义 + 预览 footer 日期/按钮）** / 2026-08-05。
+> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.2.6 图片 banner 展示 + 输入框 Cmd+V 粘图片（修首启空白框竞态）** / 2026-08-06。
 
 ## 这是什么
 
@@ -405,6 +405,16 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ✅ **前端**：`showActionFlash`（可点 toast，复用 `.mini-flash`）+ `hideMiniFlash` + 单条 undo 栈（`DELETE_UNDO_MS = 8000`）+ `undoDelete` / `clearUndoEntry`；`deleteTodo` 简化（vanishing 动画 + invoke，undo 由 listener 统一）；beforeunload 清理 `unlistenTodoDeleted`。
 ✅ i18n 复用现有 `app.delete.flash` / `app.action.undo` / `app.undo.flash`，无新增 key。
 ✅ 构建验证：`cargo check` ✓、`tsc --noEmit` 干净 ✓、`vite build` ✓。
+
+### v0.2.6（2026-08-06，图片 banner 展示 + 输入框 Cmd+V 粘图片）
+
+用户反馈两个问题，根因 + 修法：
+
+✅ **① 粘贴图片后 todo 内显示空白框**：双层根因 -- a) **首启竞态**：`get_attachments_dir` 在 `init()` 里排在 `get_todos`/首次 `render()` **之后**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 旧 ~1830 行），已存在附件的 todo 首屏 `buildTodoRow` 调 `attachmentUrl()` 时 `attachmentsDir` 仍 null -> `<img>` 无 `src` -> 空白边框框（且无 error 事件 -> `thumb.remove()` 不触发，框常驻）。b) **缩略图太小**：旧 `.todo-thumb` 20×20，即便加载成功也几乎看不出图，像空白框。修：a) `get_attachments_dir` 挪到 `get_todos` **之前**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) init）；b) 卡内 20px 缩略图换成**整宽 banner**（`.todo-banner`，`flex: 0 0 100%` + `.todo-card` 加 `flex-wrap:wrap` 让它折到标题行下方独占一行，100px 高 `object-fit:cover` 圆角），图片真正可见，点击仍聚焦预览窗看全图 / GIF 动画。`NON_DRAGGABLE_SELECTORS` `.todo-thumb` -> `.todo-banner`。顺手删了缩略图上残留的 `title=`（违反 v0.2.1 "浮窗内不准原生 tooltip" 规则的漏网之鱼）。
+✅ **② 输入框内 Cmd+V 粘不了图片**：input 是 `type=text`，默认只吃文本，粘图片静默丢弃（用户此前只能点粘贴按钮）。修：input 挂 `paste` 监听，`clipboardData.items` 含 `image/*` 就 `preventDefault` 改走 `paste_from_clipboard`（后端读 OS 剪贴板，能落附件 todo），并把已键入文字当图片 todo 的标题传进去（文字被消费进 todo 后清空 input；`kind !== "image"` 的罕见竞态不清空，保留用户文字）。纯文本放行默认插入。仅 input 聚焦时触发（窗口为 key window，paste 事件可靠）-- 未聚焦浮窗的粘贴仍由粘贴按钮兜底。
+✅ **`paste_from_clipboard` 加可选 `title: Option<String>` 参数**（[commands/mod.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/commands/mod.rs)）：图片分支标题回退链 `title` 参数 -> `img.name` -> 默认 "图片"；文本分支忽略。粘贴按钮传 None（行为不变），输入框 Cmd+V 传已键入文字。
+✅ **附带：预览窗 hover 穿缝行为改进**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts)）：预览开着时鼠标穿 card↔preview 之间的缝隙（短暂"两窗都不在"），原实现会立即摘 `.card-hover` + 落 idle 玻璃 -> 卡片像失焦闪一下。改：预览开着（`previewTodoId !== null && previewPinnedId === null`，即非 pinned 的 hover 面板）时，`floating-hover(false)` / hover-pos 不摘卡片强调、不落 idle；`over_preview` 命中时把 `rustHoveredCardId` 对齐到 `previewTodoId` 保持 `.card-hover`。释放时机统一收到 `preview-closed`：预览真关 + 鼠标仍不在浮窗（`lastHoverPayload === false`）才落 idle + 摘 `.card-hover`；鼠标在浮窗上则不动（让 hover-pos 正常驱动，避免摘了又挂抖动）。顺带删了 `previewWasOver` / `justLeftPreview` 边沿机制（被 preview-closed 释放路径取代，不再需要）。
+✅ 构建验证：`cargo check --all-targets` 零警告 ✓、`cargo test --lib` 20/20 ✓、`pnpm build`（tsc + vite）✓。
 
 ### 仍未做
 
