@@ -920,6 +920,19 @@ fn close_hover_preview_for_pin(app: &AppHandle) {
     let _ = app.emit("usticky://backdrop-refresh", ());
 }
 
+/// 固定窗的关窗兜底（preview.ts closeSelf 的 win.close 失败时调用）。
+/// Rust 端 w.close() 不经 webview 权限，是最后的兜底 -- preview.ts 拿到
+/// `core:window:allow-close` 权限后 win.close 通常就够，这里防边缘 quirk
+/// （v0.2.4 实测过 win.close 偶发不触发关窗）。
+#[tauri::command]
+pub fn close_pinned_preview(app: AppHandle, todo_id: String) -> Result<(), String> {
+    let label = format!("preview-pin-{}", todo_id);
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.close();
+    }
+    Ok(())
+}
+
 /// 预热：首次 hover 浮窗时**隐藏**创建预览窗，webview 加载开销提前付掉，
 /// 第一次 dwell 打开不再等 300-500ms 白屏。已存在则 no-op。
 /// 隐藏窗口不抢焦点、不上屏（visible(false)），open_preview_window 复用时

@@ -601,6 +601,7 @@ pub fn run() {
             commands::prewarm_preview_window,
             commands::take_pending_preview_todo,
             commands::pin_preview,
+            commands::close_pinned_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Usticky");

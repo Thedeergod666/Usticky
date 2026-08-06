@@ -332,13 +332,20 @@ function closeSelf() {
   }
   // win.close 失败时复位 closing + 走兜底 -- 否则 closing 永远 true，后续
   // Esc / blur 全被 `if (closing) return` 吞掉，窗口卡死常驻（v0.2.4 实测）。
-  // hover 预览兜底走 close_preview_window（关 label="preview"）；固定窗无
-  // 专门命令，best-effort 再 win.close 一次。
+  // hover 预览兜底走 close_preview_window（关 label="preview"）；固定窗兜底
+  // 走 close_pinned_preview（按 todoId 关 preview-pin-<id>）。
   win.close().catch((e) => {
     console.debug("[preview] close failed, 走兜底", e);
     closing = false;
     if (isPinned) {
-      win.close().catch(() => {});
+      // 固定窗 win.close 失败 -> 后端按 label 关（Rust w.close 不经 webview 权限）。
+      if (currentTodoId) {
+        invoke("close_pinned_preview", { todoId: currentTodoId }).catch((e2) =>
+          console.debug("[preview] backend pinned close also failed", e2),
+        );
+      } else {
+        win.close().catch(() => {});
+      }
     } else {
       invoke("close_preview_window", { force: true }).catch((e2) =>
         console.debug("[preview] backend force close also failed", e2),
