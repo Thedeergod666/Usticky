@@ -113,7 +113,14 @@ let currentShortcut: string = "Cmd+Shift+Space";
 /// 跟 settings.ts 同款逻辑，前端两个 webview 各实现一份（避免引入共享 module）。
 function formatShortcutForDisplay(s: string): string {
   const isMac = /mac/i.test(navigator.platform);
-  if (!isMac) return s;
+  // P2-8 fix: 跟 settings.ts / tray.rs 的非 Mac 归一化对齐 -- 把
+  // Cmd/Command/Super 替换成 Ctrl，三处实现显示一致。默认值在非 Mac 恒为
+  // Ctrl+...，这里只影响"存了 Cmd+..."的罕见情况。
+  if (!isMac) {
+    return s.replace(/\bCmd\b/g, "Ctrl")
+            .replace(/\bCommand\b/g, "Ctrl")
+            .replace(/\bSuper\b/g, "Ctrl");
+  }
   const parts = s.split("+").map((p) => p.trim());
   let out = "";
   for (const p of parts) {
@@ -674,6 +681,7 @@ let previewDwellTimer: ReturnType<typeof setTimeout> | null = null;
 let previewCloseTimer: ReturnType<typeof setTimeout> | null = null;
 /// 预览窗是否已预热（隐藏创建过一次）。首次 floating-hover(true) 触发。
 let previewPrewarmed = false;
+
 
 function cancelPreviewDwell() {
   if (previewDwellTimer !== null) {
@@ -1318,7 +1326,11 @@ function exitEditMode(card: HTMLElement, newTitle: string) {
   if (todo) {
     titleEl.addEventListener("click", (e) => {
       e.stopPropagation();
-      enterEditMode(card, todo);
+      // P2-3 fix: 用 newTitle 构造 todo，而非 lastRenderedSnap 里的 stale 快照
+      // （快照 title 是旧值，但 titleEl 已显示 newTitle）。否则用户在 invoke
+      // 往返窗口内重新点进编辑，input 会回退到旧 title；成功路径 render 会
+      // 重建替换此 listener，这里只兜极端时序。
+      enterEditMode(card, { ...todo, title: newTitle });
     });
   }
   input.replaceWith(titleEl);

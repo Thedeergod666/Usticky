@@ -67,6 +67,17 @@ pub fn read(app: &AppHandle) -> ClipboardContent {
 fn read_plugin_image(app: &AppHandle) -> Option<ClipboardImage> {
     let img = app.clipboard().read_image().ok()?;
     let (w, h) = (img.width(), img.height());
+    // **P3-3 fix**：read_image() 内部已分配 RGBA buffer，这里**至少**在
+    // to_vec() 二次拷贝 + PNG 编码前预检体积，防超大剪贴板图（Win/Linux
+    // 主路径）OOM。read_image 自身的内部分配护不住（在插件层），但拦掉
+    // to_vec + PNG 编码这两步已能挡住绝大多数 GB 级 payload。macOS 原生
+    // 路径（1a/1c/file-url）已分别 data.len()/metadata 预检，唯独插件路径漏。
+    let rgba_bytes = (w as u64)
+        .saturating_mul(h as u64)
+        .saturating_mul(4) as usize;
+    if rgba_bytes > MAX_IMAGE_BYTES {
+        return None;
+    }
     let rgba = img.rgba().to_vec();
     let raw = image::RgbaImage::from_raw(w, h, rgba)?;
     let mut buf = std::io::Cursor::new(Vec::new());

@@ -319,11 +319,25 @@ impl Store {
             }
         }
 
-        // status 没变（None 或同值）→ in-place update
+        // status 没变（None 或同值）-> in-place update。
+        //
+        // **P2-7 fix**：status 同值 + title None -> 真正 no-op（返 `Ok(None)`）。
+        // 旧实现这里仍 `todo.updated_at = now` 并返 `Some`，导致同值 status
+        // （toggle 取消 / IPC 误传）刷新 updated_at + 触发无谓 persist+emit。
+        // done 的 updated_at 在预览窗当"完成日期"展示（preview.ts），同值更新
+        // 会让完成日期跳变到 now。
+        let new_title = match title {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // in-place title 更新。仅当 title 实际变化时刷 updated_at（同值 title
+        // 也算 no-op，跟 status 同值对称）。
         let todo = &mut self.data.todos[idx];
-        if let Some(title) = title {
-            todo.title = title;
+        if todo.title == new_title {
+            return Ok(None);
         }
+        todo.title = new_title;
         todo.updated_at = now;
         Ok(Some(todo.clone()))
     }
@@ -342,15 +356,18 @@ impl Store {
     /// 退化：reorder 之后精确原位本就不可能保证，恢复到 section 末尾已
     /// 足够。
     ///
-    /// 防御：id 已存在（前端重复 restore / 并发）-> 不重复插入，返回已有那条，
+    /// 防御：id 已存在（前端重复 restore / 并发）-> **不重复插入**，返 `None`。
+    /// 调用方（`restore_todo` command）据此跳过 persist，直接返已存在那条，
     /// 避免同 id 在 Vec 里出现两份（会污染后续 update/delete 的 position 命中）。
-    pub fn restore(&mut self, todo: Todo) -> Todo {
-        if let Some(existing) = self.data.todos.iter().find(|t| t.id == todo.id) {
-            return existing.clone();
+    /// 返 `Some(todo)` = 实际插入了，调用方据此走 persist + rollback 路径
+    /// （见 commands::restore_todo 的 P0-1 fix）。
+    pub fn restore(&mut self, todo: Todo) -> Option<Todo> {
+        if self.data.todos.iter().any(|t| t.id == todo.id) {
+            return None;
         }
         let cloned = todo.clone();
         self.data.todos.push(todo);
-        cloned
+        Some(cloned)
     }
 
     /// 启动时清理孤儿附件文件 -- 崩溃/异常退出留下的、todos.json 里已没有
@@ -1050,7 +1067,8 @@ mod reorder_tests {
         assert_eq!(s.data.todos[0].order, 0);
     }
 
-    /// **P1-2 fix**：status 与现值相同（toggle 取消等）→ no-op，不动 Vec。
+    /// **P1-2 / P2-7 fix**：status 与现值相同（toggle 取消等）+ title None →
+    /// 真正 no-op（`Ok(None)`），不动 Vec、不刷 updated_at、不触发 persist+emit。
     #[test]
     fn update_status_noop_when_unchanged() {
         let mut s = fresh_store(vec![
@@ -1058,13 +1076,30 @@ mod reorder_tests {
             mk("b", TodoStatus::Pending, 1),
         ]);
         let pinned_order = s.data.todos[0].order;
-        let updated = s
-            .update("a", None, Some(TodoStatus::Pending))
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.status, TodoStatus::Pending);
+        let pinned_updated_at = s.data.todos[0].updated_at;
+        let res = s.update("a", None, Some(TodoStatus::Pending)).unwrap();
+        assert!(
+            res.is_none(),
+            "same-value status + no title should be Ok(None) no-op"
+        );
         assert_eq!(ids(&s), vec!["a", "b"]);
         assert_eq!(s.data.todos[0].order, pinned_order);
+        assert_eq!(
+            s.data.todos[0].updated_at, pinned_updated_at,
+            "no-op must not bump updated_at"
+        );
+    }
+
+    /// **P2-7 fix**：status 同值 + title 也同值 → 仍 no-op（`Ok(None)`）。
+    #[test]
+    fn update_same_title_and_same_status_is_noop() {
+        let mut s = fresh_store(vec![mk("a", TodoStatus::Pending, 0)]);
+        let pinned_updated_at = s.data.todos[0].updated_at;
+        let res = s
+            .update("a", Some("a".into()), Some(TodoStatus::Pending))
+            .unwrap();
+        assert!(res.is_none(), "same title + same status should be no-op");
+        assert_eq!(s.data.todos[0].updated_at, pinned_updated_at);
     }
 
     /// **P1-2 fix**：同时改 title + status → status 路径生效（title 也更新）。

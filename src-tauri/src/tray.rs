@@ -30,7 +30,7 @@
 // 触发 NSStatusBar `assertBarrierOnQueue` SIGTRAP（Musage 2026-06-18 踩过）。
 // Usticky 没有 poller 高频写 tray，所以不需要 mpsc channel，单次派发足够。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use tauri::{
     menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
@@ -60,6 +60,43 @@ use crate::SharedStore;
 /// 会让 flag 卡 true，但 rebuild 本来就罕见，下一次切换时还能补建，
 /// 安全性 OK。
 static MENU_OPEN_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// **P2-2 fix**：MENU_OPEN_FLAG 置 true 的时刻（ms，UNIX_EPOCH 起）。
+/// rebuild_tray 据此判断"菜单打开中"是否已超 5s -> 超时视为 flag
+/// 卡死（用户右键弹菜单后 click outside dismiss，on_menu_event 不 fire），
+/// 强制清 flag + 重建，避免 checkmark 永久 stale。
+static MENU_OPEN_SET_AT: AtomicI64 = AtomicI64::new(0);
+
+/// 菜单打开 flag 的最大有效期。超过即视为卡死，rebuild 时清掉重建。
+const MENU_OPEN_TIMEOUT_MS: i64 = 5000;
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 标记菜单即将打开（同时记时间戳，供 rebuild 超时判断）。
+fn mark_menu_open() {
+    MENU_OPEN_FLAG.store(true, Ordering::SeqCst);
+    MENU_OPEN_SET_AT.store(now_millis(), Ordering::SeqCst);
+}
+
+/// 菜单是否仍处于"有效打开中"状态。true 且未超 5s -> 返 true；
+/// 超时则清 flag 返 false（视为卡死，允许 rebuild）。
+fn menu_still_open() -> bool {
+    if !MENU_OPEN_FLAG.load(Ordering::SeqCst) {
+        return false;
+    }
+    let elapsed = now_millis().saturating_sub(MENU_OPEN_SET_AT.load(Ordering::SeqCst));
+    if elapsed < MENU_OPEN_TIMEOUT_MS {
+        true
+    } else {
+        MENU_OPEN_FLAG.store(false, Ordering::SeqCst);
+        false
+    }
+}
 
 /// 读 store 当前 pin mode（blocking_read 在 sync 上下文安全 —— 跟 lib.rs setup 同款）。
 fn current_pin_mode<R: Runtime>(app: &AppHandle<R>) -> PinMode {
@@ -99,7 +136,20 @@ fn format_shortcut_for_display(s: &str) -> String {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        s.to_string()
+        // **P2-8 fix**：跟 settings.ts / main.ts 的非 Mac 归一化对齐 -- 把
+        // Cmd/Command/Super 替换成 Ctrl，避免三份实现（tray label / 浮窗 input
+        // hint / 设置面板按钮）对同一 accelerator 显示不一致。默认值在非 Mac
+        // 恒为 Ctrl+...，这里只影响"存了 Cmd+..."的罕见情况（Win 键被按下 /
+        // 跨平台配置迁移），归一化后三处一致。
+        let parts: Vec<&str> = s.split('+').map(|p| p.trim()).collect();
+        let mapped: Vec<String> = parts
+            .iter()
+            .map(|p| match p.to_lowercase().as_str() {
+                "cmd" | "command" | "super" => "Ctrl".to_string(),
+                _ => (*p).to_string(),
+            })
+            .collect();
+        mapped.join("+")
     }
 }
 
@@ -289,10 +339,10 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             {
                 match (button, button_state) {
                     (MouseButton::Right, MouseButtonState::Down) => {
-                        MENU_OPEN_FLAG.store(true, Ordering::SeqCst);
+                        mark_menu_open();
                     }
                     (MouseButton::Right, MouseButtonState::Up) => {
-                        MENU_OPEN_FLAG.store(true, Ordering::SeqCst);
+                        mark_menu_open();
                     }
                     (MouseButton::Left, _) => {
                         MENU_OPEN_FLAG.store(false, Ordering::SeqCst);
@@ -346,7 +396,7 @@ pub fn rebuild_tray(app: &AppHandle) -> tauri::Result<()> {
     // 替换 Win32 PopupMenu，正在跟用户交互的菜单条目瞬间悬空 / 关闭 ——
     // 用户体感"按了没反应 / 菜单突然消失"。等用户收完菜单（on_menu_event
     // 清 flag）再 rebuild。
-    if MENU_OPEN_FLAG.load(Ordering::SeqCst) {
+    if menu_still_open() {
         tracing::trace!("tray menu open, deferring rebuild");
         return Ok(());
     }
@@ -354,7 +404,7 @@ pub fn rebuild_tray(app: &AppHandle) -> tauri::Result<()> {
     app.run_on_main_thread(move || {
         // 在 main thread 上**再次**确认 —— 之前 listener 派发到这里时可能
         // 距上次 check 已有几十微秒，期间用户右键弹了菜单。
-        if MENU_OPEN_FLAG.load(Ordering::SeqCst) {
+        if menu_still_open() {
             tracing::trace!("tray menu open (re-check on main thread), deferring rebuild");
             return;
         }

@@ -1,16 +1,18 @@
-// QuickLook 式预览窗（v0.2）—— preview.html
+// QuickLook 式预览窗（v0.2）-- preview.html
 //
-// 生命周期（跟浮窗 main.ts 的预览状态机配对）：
-//   打开：open_preview_window 命令（hover dwell → focused(false) 面板；
-//         点击缩略图 → focused(true) 编辑态）。已开时后端复用窗口 + emit
-//         usticky://preview-todo 换内容，本文件原地 re-render。
-//   关闭（三条路径，殊途同归）：
-//     1. Esc 键 → closeSelf()
-//     2. 窗口 blur（聚焦后用户点别处）→ closeSelf()
-//     3. 浮窗侧 grace close / 浮窗 hide → 后端直接 close 本窗
-//        （beforeunload 里补发 preview-closed，浮窗状态机幂等清理）
-//   鼠标进入 → emit preview-entered（浮窗据此取消自动关闭 = pinned）
-//   鼠标离开且未聚焦 → emit preview-left（浮窗重启 grace close）
+// 两种形态（v0.2.x 起）：
+//   1. hover 预览（label="preview"，URL 无 pinned）：hover 卡片 -> 弹出，
+//      非聚焦面板，鼠标离开 / 浮窗 grace close 自关。pin 按钮 = 提升为
+//      独立固定窗（调 pin_preview，后端建固定窗 + 关掉本 hover 预览）。
+//   2. 固定窗（label="preview-pin-<todoId>"，URL ?pinned=1）：独立常驻，
+//      blur / 浮窗 hide 都不自关，只走 Esc / 取消固定按钮（= 关窗）。
+//      可同时存在多个（每个 todo 一个）。pin 按钮恒 active = 取消固定。
+//
+// 关闭路径：
+//   hover 预览：Esc / blur / 浮窗 grace close / promoteToPinned 后端关 ->
+//     closeSelf（emit preview-closed 让浮窗状态机复位）
+//   固定窗：Esc / 取消固定按钮 -> closeSelf（**不** emit preview-closed --
+//     独立窗口，不归浮窗 hover 状态机管）
 //
 // 编辑：textarea 输入防抖 700ms 自动保存（update_todo title）。空标题
 // 不保存（后端 validate_title 会拒），hint 行短暂显示错误。
@@ -36,12 +38,15 @@ interface Todo {
   attachment?: TodoAttachment | null;
 }
 
-// 底部操作按钮图标（复制 / 垃圾桶删除 —— v0.2.4 起全 App 统一垃圾桶，
+// 底部操作按钮图标（复制 / 垃圾桶删除 -- v0.2.4 起全 App 统一垃圾桶，
 // 与 main.ts 卡内按钮同 lucide trash-2 / feather copy 风格，13px 显示）
 const COPY_ICON_SVG = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
 const TRASH_ICON_SVG = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>`;
+/// pin 按钮（复制键左侧）。hover 预览里点 = 提升为独立固定窗（promoteToPinned）；
+/// 固定窗里恒 active，点 = 取消固定（关窗）。lucide pin 图标（针头朝下）。
+const PIN_ICON_SVG = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>`;
 
-/// epoch ms → 短日期（"2026/8/5" / "8/5/2026"，随 locale）
+/// epoch ms -> 短日期（"2026/8/5" / "8/5/2026"，随 locale）
 function formatDate(ms: number): string {
   return new Date(ms).toLocaleDateString(
     getLocale() === "zh-CN" ? "zh-CN" : "en-US",
@@ -56,12 +61,22 @@ interface TodoSnapshot {
 const appEl = document.getElementById("preview-app")!;
 const win = getCurrentWindow();
 
+/// 本窗是否为「独立固定窗」模式（URL ?pinned=1）。hover 预览=false，
+/// 固定窗=true。决定 pin 按钮语义 / blur 是否自关 / 是否广播浮窗 hover 事件。
+const isPinned = new URLSearchParams(window.location.search).get("pinned") === "1";
+
 let currentTodoId: string | null = null;
 let currentTodo: Todo | null = null;
 let attachmentsDir: string | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let closing = false;
 const SAVE_DEBOUNCE_MS = 700;
+
+/// hint 行的"静止文案"：固定窗显示「已固定 · Esc 关闭」提示如何释放，
+/// hover 预览回默认 hint。flashHint 反馈完仍回到这里。
+function hintRestingText(): string {
+  return isPinned ? t("preview.hint_pinned") : t("preview.hint");
+}
 
 function attachmentUrl(file: string): string | null {
   if (!attachmentsDir) return null;
@@ -85,7 +100,7 @@ function render(todo: Todo) {
     img.draggable = false;
     const url = attachmentUrl(todo.attachment.file);
     if (url) img.src = url;
-    // 附件文件丢失 → 图片区整体摘掉，留文本编辑区
+    // 附件文件丢失 -> 图片区整体摘掉，留文本编辑区
     img.addEventListener("error", () => img.remove());
     panel.appendChild(img);
   }
@@ -98,7 +113,7 @@ function render(todo: Todo) {
   panel.appendChild(textarea);
 
   // ── 底部 footer（v0.2.4）：左 创建日期 ｜ 中 hint ｜ 右 [完成日期(done)]
-  // ＋ 复制按钮 ＋ 垃圾桶删除按钮（二次确认同卡内） ──
+  // ＋ pin 按钮 ＋ 复制按钮 ＋ 垃圾桶删除按钮（二次确认同卡内） ──
   const footer = document.createElement("div");
   footer.className = "preview-footer";
 
@@ -109,7 +124,7 @@ function render(todo: Todo) {
 
   const hint = document.createElement("div");
   hint.className = "preview-hint";
-  hint.textContent = t("preview.hint");
+  hint.textContent = hintRestingText();
   footer.appendChild(hint);
 
   const actions = document.createElement("div");
@@ -120,6 +135,27 @@ function render(todo: Todo) {
     doneAt.textContent = `${t("preview.completed")} ${formatDate(todo.updated_at)}`;
     actions.appendChild(doneAt);
   }
+  // pin 按钮（复制键左侧）：
+  //   hover 预览 -> 点 = 提升为独立固定窗（promoteToPinned）。
+  //   固定窗 -> 恒 active，点 = 取消固定（closeSelf 关窗）。
+  const pinBtn = document.createElement("button");
+  pinBtn.className = "preview-action-btn preview-pin";
+  pinBtn.innerHTML = PIN_ICON_SVG;
+  if (isPinned) {
+    pinBtn.classList.add("active");
+    pinBtn.setAttribute("aria-label", t("app.action.unpin"));
+    pinBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeSelf();
+    });
+  } else {
+    pinBtn.setAttribute("aria-label", t("app.action.pin"));
+    pinBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void promoteToPinned();
+    });
+  }
+  actions.appendChild(pinBtn);
   const copyBtn = document.createElement("button");
   copyBtn.className = "preview-action-btn";
   copyBtn.setAttribute("aria-label", t("app.action.copy"));
@@ -150,7 +186,7 @@ function render(todo: Todo) {
 
   appEl.appendChild(panel);
 
-  // 输入 → 防抖自动保存。外部 todos-changed 回填时（见 listener）
+  // 输入 -> 防抖自动保存。外部 todos-changed 回填时（见 listener）
   // 只在 textarea 未聚焦时覆盖，不打断正在输入的内容。
   textarea.addEventListener("input", () => {
     if (saveTimer) clearTimeout(saveTimer);
@@ -160,7 +196,7 @@ function render(todo: Todo) {
     }, SAVE_DEBOUNCE_MS);
   });
 
-  // 拖窗：panel 空白区 / 图片上 mousedown → startDragging。
+  // 拖窗：panel 空白区 / 图片上 mousedown -> startDragging。
   // textarea 放行（选中文本 / 聚焦编辑），hint 是文字也放行（无妨，可拖）。
   panel.addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
@@ -190,7 +226,7 @@ async function saveTitle(value: string, hint?: HTMLElement | null) {
   const id = currentTodoId;
   if (!id) return;
   const trimmed = value.trim();
-  // 空标题 / 未改动 → 不保存（后端 validate_title 拒空串，改了也白改）
+  // 空标题 / 未改动 -> 不保存（后端 validate_title 拒空串，改了也白改）
   if (!trimmed || trimmed === currentTodo?.title) return;
   try {
     await invoke("update_todo", { id, title: trimmed });
@@ -203,7 +239,7 @@ async function saveTitle(value: string, hint?: HTMLElement | null) {
       h.textContent = t("app.error.save_failed");
       setTimeout(() => {
         h.classList.remove("error");
-        h.textContent = t("preview.hint");
+        h.textContent = hintRestingText();
       }, 2000);
     }
   }
@@ -227,7 +263,7 @@ function flashHint(hint: HTMLElement | null, msg: string) {
   if (!h) return;
   h.textContent = msg;
   setTimeout(() => {
-    h.textContent = t("preview.hint");
+    h.textContent = hintRestingText();
   }, 1500);
 }
 
@@ -255,7 +291,7 @@ async function copyTitle(hint: HTMLElement | null) {
   flashHint(hint, t("app.copy.flash"));
 }
 
-/// 删除当前 todo：后端 emit todos-changed → 当前 id 没了 → closeSelf
+/// 删除当前 todo：后端 emit todos-changed -> 当前 id 没了 -> closeSelf
 /// （listener 已有该路径），这里再直接 closeSelf 一次做幂等双保险。
 async function deleteSelf() {
   const id = currentTodoId;
@@ -268,25 +304,46 @@ async function deleteSelf() {
   }
 }
 
+/// hover 预览的 pin 按钮：把当前 todo 提升为独立固定窗。后端 pin_preview
+/// 会创建 preview-pin-<todoId> 窗口（沿用本窗位置/尺寸，平滑过渡）并关掉
+/// 本 hover 预览。本 webview 随即销毁，下面的 closeSelf 兜底未必跑到。
+async function promoteToPinned() {
+  const id = currentTodoId;
+  if (!id) return;
+  flushPendingSave();
+  try {
+    await invoke("pin_preview", { todoId: id });
+    closeSelf();
+  } catch (e) {
+    console.error("[preview] pin_preview failed", e);
+  }
+}
+
 // ── 关闭 ──
 
 function closeSelf() {
   if (closing) return;
   closing = true;
   flushPendingSave();
-  // 先广播再关窗 —— 浮窗状态机（previewTodoId/previewPinnedId）靠它复位。
-  // 后端主动 close 的路径（浮窗 grace close / hide）走 beforeunload 补发。
-  emit("usticky://preview-closed", {}).catch(() => {});
-  // win.close 失败时复位 closing + 走后端 force close 兜底 -- 否则 closing
-  // 永远 true，后续 Esc / blur 全被 `if (closing) return` 吞掉，窗口卡死
-  // 常驻置顶（v0.2.4 用户实测：预览常驻、Esc 无效）。后端 close_preview_window
-  // 走 Rust w.close()，不经过本 JS closing 标志，是最后的兜底。
+  // 固定窗是独立的 -- 关掉不广播 preview-closed（那是浮窗 hover 状态机的
+  // 复位信号，固定窗不归它管）。hover 预览关掉要广播让浮窗复位。
+  if (!isPinned) {
+    emit("usticky://preview-closed", {}).catch(() => {});
+  }
+  // win.close 失败时复位 closing + 走兜底 -- 否则 closing 永远 true，后续
+  // Esc / blur 全被 `if (closing) return` 吞掉，窗口卡死常驻（v0.2.4 实测）。
+  // hover 预览兜底走 close_preview_window（关 label="preview"）；固定窗无
+  // 专门命令，best-effort 再 win.close 一次。
   win.close().catch((e) => {
-    console.debug("[preview] close failed, 走后端 force close 兜底", e);
+    console.debug("[preview] close failed, 走兜底", e);
     closing = false;
-    invoke("close_preview_window", { force: true }).catch((e2) =>
-      console.debug("[preview] backend force close also failed", e2),
-    );
+    if (isPinned) {
+      win.close().catch(() => {});
+    } else {
+      invoke("close_preview_window", { force: true }).catch((e2) =>
+        console.debug("[preview] backend force close also failed", e2),
+      );
+    }
   });
 }
 
@@ -298,7 +355,7 @@ async function loadTodo(id: string) {
     const todo = snap.todos.find((x) => x.id === id);
     if (!todo) {
       renderMissing();
-      // todo 被删 → 窗口没有存在意义
+      // todo 被删 -> 窗口没有存在意义
       closeSelf();
       return;
     }
@@ -319,7 +376,12 @@ async function init() {
   onLocaleChange(() => {
     document.title = t("preview.title");
     const hint = appEl.querySelector<HTMLElement>(".preview-hint");
-    if (hint) hint.textContent = t("preview.hint");
+    if (hint) hint.textContent = hintRestingText();
+    // pin 按钮 aria-label 随语言刷新
+    const pinBtn = appEl.querySelector<HTMLElement>(".preview-pin");
+    if (pinBtn) {
+      pinBtn.setAttribute("aria-label", t(isPinned ? "app.action.unpin" : "app.action.pin"));
+    }
   });
 
   let unlistenLocale: UnlistenFn | null = null;
@@ -346,9 +408,12 @@ async function init() {
     renderMissing();
   }
 
-  // 后端复用窗口：emit 换 todo（hover 在卡间移动时复用同一预览窗）
+  // 后端复用 hover 预览窗：emit 换 todo（hover 在卡间移动时复用同一预览窗）。
+  // 固定窗 label 不同，收不到这个 emit（w.emit 只发给 "preview"），这里加
+  // isPinned 守卫只是防御。
   let unlistenSetTodo: UnlistenFn | null = null;
   listen<{ id: string }>("usticky://preview-todo", (e) => {
+    if (isPinned) return;
     if (e.payload.id && e.payload.id !== currentTodoId) {
       flushPendingSave();
       void loadTodo(e.payload.id);
@@ -357,7 +422,7 @@ async function init() {
     .then((fn) => (unlistenSetTodo = fn))
     .catch((e) => console.error("[preview] listen preview-todo failed", e));
 
-  // 外部数据变化：当前 todo 被删 → 关窗；标题被别处改 → 未聚焦时回填。
+  // 外部数据变化：当前 todo 被删 -> 关窗；标题被别处改 -> 未聚焦时回填。
   let unlistenTodos: UnlistenFn | null = null;
   listen<TodoSnapshot>("usticky://todos-changed", (e) => {
     if (!currentTodoId) return;
@@ -375,8 +440,8 @@ async function init() {
     .then((fn) => (unlistenTodos = fn))
     .catch((e) => console.error("[preview] listen todos-changed failed", e));
 
-  // Esc 关闭（QuickLook 语义）。textarea 里按 Esc 也关 —— 编辑有自动保存，
-  // 不需要 Esc = 取消编辑的二级语义。
+  // Esc 关闭（QuickLook 语义）。textarea 里按 Esc 也关 -- 编辑有自动保存，
+  // 不需要 Esc = 取消编辑的二级语义。固定窗同样走 Esc 关窗。
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       e.preventDefault();
@@ -384,14 +449,18 @@ async function init() {
     }
   });
 
-  // 窗口 blur 关闭：用户聚焦过预览窗（点击 / pinned 打开）后点别处 → 收。
-  // focused(false) 创建的面板不会收到这个事件（状态没变化过），不受误伤。
-  // focused(true) → emit preview-focused：浮窗据此 pin（编辑保护，hover
-  // 不换内容）。焦点语义可靠 —— blur 必触发 closeSelf → preview-closed
-  // 释放，不存在锁死路径（v0.2.3 起替代 mouseenter 误 pin 的旧路径）。
+  // 窗口 blur 关闭（仅 hover 预览）：用户聚焦过预览窗后点别处 -> 收。
+  // focused(false) 创建的 hover 面板不会收到这个事件（状态没变化过）。
+  // focused(true) -> emit preview-focused：浮窗据此 pin（编辑保护，hover
+  // 不换内容）。焦点语义可靠 -- blur 必触发 closeSelf -> preview-closed
+  // 释放，不存在锁死路径。
+  //
+  // 固定窗：blur 不关（常驻），也不广播 preview-focused -- 它独立于浮窗
+  // hover 状态机，不该挡 hover 换卡。
   let unlistenFocus: UnlistenFn | null = null;
   win
     .onFocusChanged(({ payload: focused }) => {
+      if (isPinned) return;
       if (!focused) {
         closeSelf();
       } else if (currentTodoId) {
@@ -401,14 +470,15 @@ async function init() {
     .then((fn) => (unlistenFocus = fn))
     .catch((e) => console.error("[preview] onFocusChanged failed", e));
 
-  // 鼠标进出 → 浮窗 pinned 状态机
+  // 鼠标进出 -> 浮窗 pinned 状态机（仅 hover 预览）。固定窗不参与 -- 它独立，
+  // 鼠标进/出不该触发浮窗 grace close 重排。
   document.body.addEventListener("mouseenter", () => {
-    if (!currentTodoId) return;
+    if (isPinned || !currentTodoId) return;
     emit("usticky://preview-entered", { id: currentTodoId }).catch(() => {});
   });
   document.body.addEventListener("mouseleave", () => {
-    if (!currentTodoId) return;
-    // 聚焦中的预览窗（编辑态）离开鼠标不解除 pinned —— blur 会负责关。
+    if (isPinned || !currentTodoId) return;
+    // 聚焦中的预览窗（编辑态）离开鼠标不解除 pinned -- blur 会负责关。
     win
       .isFocused()
       .then((focused) => {
@@ -419,27 +489,33 @@ async function init() {
       .catch(() => {});
   });
 
-  // 后端主动 close（浮窗 grace close / 浮窗 hide 兜底）：补发 preview-closed
-  // 让浮窗状态机复位（浮窗自己发起的路径已自清，这里是幂等双保险）。
+  // 后端主动 close（浮窗 grace close / 浮窗 hide 兜底）：hover 预览补发
+  // preview-closed 让浮窗状态机复位（浮窗自己发起的路径已自清，这里幂等双保险）。
+  // 固定窗不会被浮窗 hide 收掉（hide_dismiss 只关 label="preview"），故不补发。
   window.addEventListener("beforeunload", () => {
     flushPendingSave();
-    emit("usticky://preview-closed", {}).catch(() => {});
+    if (!isPinned) {
+      emit("usticky://preview-closed", {}).catch(() => {});
+    }
     unlistenLocale?.();
     unlistenSetTodo?.();
     unlistenTodos?.();
     unlistenFocus?.();
   });
 
-  // prewarm 竞态防线：prewarm 隐藏创建的 webview 可能还没加载完，后端
-  // open_preview_window reuse 路径 emit 的 preview-todo 会丢 → 后端在
-  // emit 前先存 pending id，这里 listeners 就位后主动取一次。
-  try {
-    const pendingId = await invoke<string | null>("take_pending_preview_todo");
-    if (pendingId && pendingId !== currentTodoId) {
-      await loadTodo(pendingId);
+  // prewarm 竞态防线（仅 hover 预览）：prewarm 隐藏创建的 webview 可能还没
+  // 加载完，后端 open_preview_window reuse 路径 emit 的 preview-todo 会丢 ->
+  // 后端在 emit 前先存 pending id，这里 listeners 就位后主动取一次。
+  // 固定窗不走 prewarm 路径，跳过（否则会偷走 hover 预览的 pending id）。
+  if (!isPinned) {
+    try {
+      const pendingId = await invoke<string | null>("take_pending_preview_todo");
+      if (pendingId && pendingId !== currentTodoId) {
+        await loadTodo(pendingId);
+      }
+    } catch (e) {
+      console.debug("[preview] take_pending_preview_todo failed", e);
     }
-  } catch (e) {
-    console.debug("[preview] take_pending_preview_todo failed", e);
   }
 }
 

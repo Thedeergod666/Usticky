@@ -5,6 +5,7 @@
       "too_long": "标题过长（最多 {max} 字符）",
       "not_found": "Todo 不存在",
       "no_primary_monitor": "未检测到主显示器",
+      "no_attachments_dir": "附件目录不可用",
       "unsupported_locale": "不支持的语言",
       "shortcut_no_modifier": "快捷键必须包含至少一个修饰键（Ctrl / Alt / Shift / Cmd）"
     },

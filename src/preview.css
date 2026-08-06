@@ -168,6 +168,17 @@ html, body {
   background: #ff453a;
 }
 
+/* pin 按钮（v0.2.x，复制键左侧）：置上后预览常驻屏幕（blur 不自关）。
+ * active 态用 accent 高亮 + 填充图标 -- (0,3,0) 选择器压过普通 :hover，
+ * 同删除确认态的写法。未置顶时走通用 .preview-action-btn :hover 反馈。 */
+.preview-action-btn.preview-pin.active {
+  color: var(--pv-accent);
+  background: rgba(10, 132, 255, 0.18);
+}
+.preview-action-btn.preview-pin.active svg {
+  fill: currentColor;
+}
+
 /* 保存状态反馈（自动保存 debounce 触发时短暂切换文案） */
 .preview-hint.saving { color: var(--pv-accent); }
 .preview-hint.error { color: #ff453a; }

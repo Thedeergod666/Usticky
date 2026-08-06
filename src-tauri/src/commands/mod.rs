@@ -201,28 +201,83 @@ pub async fn delete_todo(
 /// 撤销删除 - 把前端 undo 栈暂存的完整 Todo 塞回 store。
 ///
 /// 复用原 id/order/status，尽量回到原位（见 `Store::restore` 的退化说明）。
+///
+/// **P0-1 fix**：persist 失败回滚 in-memory restore。restore 是"撤销删除"，
+/// 若 persist 失败而内存留着这条 todo，下次启动 todos.json 没有它 ->
+/// `purge_orphan_attachments` 会把它的附件文件当孤儿删掉 -> 用户的撤销
+/// （含图片）不可逆丢失。回滚内存态让 in-memory 跟磁盘一致（都"未恢复"），
+/// 附件留作孤儿由下次启动扫描清（诚实失败，而非假成功 + 重启后图片没了）。
+/// 抄 [`set_quick_add_shortcut`] 的 snapshot + rollback 模板。
 #[tauri::command]
 pub async fn restore_todo(
     app: AppHandle,
     store: State<'_, SharedStore>,
     todo: Todo,
 ) -> Result<Todo, String> {
-    let restored = {
+    let restored_id = todo.id.clone();
+    // restore 返回 Some = 实际插入了；None = id 已存在（重复 restore / 并发）
+    let inserted = {
         let mut s = store.write().await;
         s.restore(todo)
     };
-    persist_and_emit(&app, &store).await;
+    let restored = match inserted {
+        Some(t) => t,
+        None => {
+            // id 已存在 -> 无需 persist / emit，直接返当前那条
+            let existing = store
+                .read()
+                .await
+                .todos()
+                .iter()
+                .find(|t| t.id == restored_id)
+                .cloned()
+                .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?;
+            return Ok(existing);
+        }
+    };
+    // 实际插入了 -> persist。失败则回滚（删掉刚插入的，让内存跟磁盘一致）。
+    let (snap, data, path) = {
+        let s = store.read().await;
+        (s.snapshot(), s.data_clone(), s.data_path_clone())
+    };
+    let persist_err: Option<String> = match path {
+        Some(p) => crate::todo::persist_to_disk(&p, &data)
+            .err()
+            .map(|e| e.to_string()),
+        None => Some("data path not initialized".to_string()),
+    };
+    if let Some(e) = persist_err {
+        tracing::error!("restore_todo persist failed: {}", e);
+        let _ = app.emit("usticky://persist-failed", e.clone());
+        // 回滚 in-memory：删掉刚 restore 进去的 todo
+        store.write().await.delete(&restored_id);
+        // 不 emit todos-changed：内存已回到"未恢复"，前端拿 Err 自己处理 flash
+        return Err(format!("restore failed: persist error: {e}"));
+    }
+    emit_todos_changed(&app, &snap);
     Ok(restored)
 }
 
 /// 真删单个附件文件 - 前端 undo 栈超时（用户没点撤销）后调用。
 ///
-/// 安全校验：`file` 必须是纯文件名，禁止含路径分隔符 / `..`，否则前端
-/// （或中间人篡改 IPC）可构造 `../../etc/passwd` 删任意文件。不 emit
+/// 安全校验：`file` 必须是纯文件名，禁止含路径分隔符 / `..` / `:` / NUL，
+/// 否则前端（或中间人篡改 IPC）可构造 `../../etc/passwd` 删任意文件。不 emit
 /// todos-changed、不 persist - 这个调用只动磁盘文件，不改 todo 数据。
+///
+/// **P1-1 fix**：补 `:` 和 `\0` 拦截。旧实现只拦 `/ \ .. 空`，`C:foo`
+/// 这类 Windows drive-relative 路径能逃出 attachments 目录（`dir.join("C:foo")`
+/// 在 Windows 上是 drive-relative，`remove_file` 命中 C: 盘相对 CWD 的文件）。
+/// 附件文件名恒为 `<uuid>.<ext>`，不含冒号，拒冒号零误伤。NUL 字节 Rust std
+/// 本就拒（`OsStr::to_cstring` 报错），这里兜底防御。
 #[tauri::command]
 pub async fn purge_attachment(store: State<'_, SharedStore>, file: String) -> Result<(), String> {
-    if file.is_empty() || file.contains('/') || file.contains('\\') || file.contains("..") {
+    if file.is_empty()
+        || file.contains('/')
+        || file.contains('\\')
+        || file.contains("..")
+        || file.contains(':')
+        || file.contains('\0')
+    {
         return Err("invalid attachment file name".to_string());
     }
     let dir = store.read().await.attachments_dir();
@@ -653,7 +708,7 @@ pub async fn get_attachments_dir(store: State<'_, SharedStore>) -> Result<String
         .read()
         .await
         .attachments_dir()
-        .ok_or_else(|| rust_i18n::t!("commands.error.no_primary_monitor").to_string())?;
+        .ok_or_else(|| rust_i18n::t!("commands.error.no_attachments_dir").to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("create attachments dir: {e}"))?;
     Ok(dir.to_string_lossy().into_owned())
 }
@@ -693,7 +748,7 @@ pub async fn paste_from_clipboard(
                 .read()
                 .await
                 .attachments_dir()
-                .ok_or_else(|| "attachments dir unavailable".to_string())?;
+                .ok_or_else(|| rust_i18n::t!("commands.error.no_attachments_dir").to_string())?;
             std::fs::create_dir_all(&dir).map_err(|e| format!("create attachments dir: {e}"))?;
             let file = format!("{}.{}", uuid::Uuid::new_v4(), img.ext);
             let path = dir.join(&file);
@@ -701,6 +756,11 @@ pub async fn paste_from_clipboard(
             // 的安全姿态。std::fs::write 走默认 mode (0o666 & ~umask，常见 0o644)，
             // 剪贴板图片常常含敏感内容（聊天截图、密码管理器 UI、扫描件），
             // 同机其他账号可读。todo.rs persist_to_disk 已用同模式 (v0.1.5 P2-1)。
+            //
+            // **P2-5 fix**：write_all 失败（磁盘满 / 权限被剥中途）时清掉
+            // 0 字节 / 半截孤儿文件。不清理也能被下次启动 purge_orphan_attachments
+            // 扫掉，但立即清理更干净（不依赖启动兜底，避免瞬态孤儿在 attachments/
+            // 目录里留着）。
             #[cfg(unix)]
             {
                 use std::io::Write;
@@ -712,10 +772,16 @@ pub async fn paste_from_clipboard(
                     .mode(0o600)
                     .open(&path)
                     .and_then(|mut f| f.write_all(&img.data))
-                    .map_err(|e| format!("write attachment: {e}"))?;
+                    .map_err(|e| {
+                        let _ = std::fs::remove_file(&path);
+                        format!("write attachment: {e}")
+                    })?;
             }
             #[cfg(not(unix))]
-            std::fs::write(&path, &img.data).map_err(|e| format!("write attachment: {e}"))?;
+            std::fs::write(&path, &img.data).map_err(|e| {
+                let _ = std::fs::remove_file(&path);
+                format!("write attachment: {e}")
+            })?;
 
             let title = match title.as_deref().map(str::trim) {
                 Some(n) if !n.is_empty() => validate_title(n)?,
@@ -765,6 +831,93 @@ pub async fn take_pending_preview_todo() -> Result<Option<String>, String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take())
+}
+
+/// hover 预览的 pin 按钮 -> 把当前 todo 提升为**独立固定窗**
+/// （label=`preview-pin-<todoId>`，URL `?pinned=1`）。固定窗常驻屏幕，blur /
+/// 浮窗 hide 都不自关，只走 Esc / 取消固定按钮（preview.ts closeSelf）。
+/// 可同时存在多个（每个 todo 一个）。
+///
+/// 沿用当前 hover 预览窗（`preview`）的位置 / 尺寸创建固定窗，平滑过渡；
+/// 然后关掉 hover 预览。dedup：该 todo 已有固定窗 -> focus 它，不开新的。
+#[tauri::command]
+pub async fn pin_preview(app: AppHandle, todo_id: String) -> Result<(), String> {
+    let label = format!("preview-pin-{}", todo_id);
+    // dedup：已有该 todo 的固定窗 -> focus 它，关掉 hover 预览即可。
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.show();
+        let _ = w.set_focus();
+        close_hover_preview_for_pin(&app);
+        return Ok(());
+    }
+    // 沿用 hover 预览窗（如在屏）的位置 / 尺寸 -> 固定窗原地上屏，无跳变。
+    // pin 按钮只在 hover 预览里，理论上 `preview` 一定开着；兜底用浮窗左侧。
+    let scale = app
+        .get_webview_window("preview")
+        .and_then(|p| p.scale_factor().ok())
+        .or_else(|| {
+            app.get_webview_window("floating")
+                .and_then(|f| f.scale_factor().ok())
+        })
+        .unwrap_or(1.0);
+    let (pos_x_logical, pos_y_logical, w_logical, h_logical) =
+        if let Some(p) = app.get_webview_window("preview") {
+            let pos = p.outer_position().map_err(|e| e.to_string())?;
+            let size = p.outer_size().map_err(|e| e.to_string())?;
+            (
+                pos.x as f64 / scale,
+                pos.y as f64 / scale,
+                size.width as f64 / scale,
+                size.height as f64 / scale,
+            )
+        } else {
+            // 兜底：浮窗左侧 12px GAP，尺寸用默认（极少走到）。
+            let (w_l, h_l) = (460.0, 340.0);
+            let fpos = app
+                .get_webview_window("floating")
+                .and_then(|f| f.outer_position().ok())
+                .unwrap_or(tauri::PhysicalPosition::new(0, 0));
+            (
+                fpos.x as f64 / scale - w_l - 12.0,
+                fpos.y as f64 / scale,
+                w_l,
+                h_l,
+            )
+        };
+
+    let title = rust_i18n::t!("window.preview").to_string();
+    let url = WebviewUrl::App(format!("preview.html?id={}&pinned=1", todo_id).into());
+    let _win = WebviewWindowBuilder::new(&app, &label, url)
+        .title(title)
+        .inner_size(w_logical, h_logical)
+        .position(pos_x_logical, pos_y_logical)
+        .resizable(true)
+        .decorations(false)
+        .transparent(true)
+        // 同 hover 预览：去原生阴影（黑边），投影交 preview.css --pv-shadow。
+        .shadow(false)
+        .always_on_top(true)
+        .accept_first_mouse(true)
+        .focused(true)
+        .visible(true)
+        .build()
+        .map_err(|e| format!("create pinned preview window: {e}"))?;
+    // 新 always-on-top 窗口上屏触发浮窗合成层重排 -> 刷玻璃。
+    let _ = app.emit("usticky://backdrop-refresh", ());
+    // 关掉 hover 预览（内容已转到固定窗）。beforeunload 可能不触发，
+    // 直接 emit preview-closed 让浮窗状态机复位。
+    close_hover_preview_for_pin(&app);
+    Ok(())
+}
+
+/// pin_preview 内部：关掉 hover 预览窗（label="preview"）并广播 preview-closed
+/// 让浮窗状态机复位。固定窗（label="preview-pin-*"）不归本函数管 -- 独立常驻。
+fn close_hover_preview_for_pin(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("preview") {
+        let _ = w.close();
+    }
+    let _ = app.emit("usticky://preview-closed", ());
+    let _ = app.emit("usticky://backdrop-refresh", ());
 }
 
 /// 预热：首次 hover 浮窗时**隐藏**创建预览窗，webview 加载开销提前付掉，
@@ -891,6 +1044,12 @@ pub async fn open_preview_window(
     anchor_y: Option<f64>,
     text_h: Option<f64>,
 ) -> Result<(), String> {
+    // 已有该 todo 的独立固定窗 -> 不开 hover 预览（避免同 todo 两个窗口）。
+    // 固定窗已可见，用户看那个即可；hover 该 todo 也不重复弹。
+    let pin_label = format!("preview-pin-{}", todo_id);
+    if app.get_webview_window(&pin_label).is_some() {
+        return Ok(());
+    }
     let todo = store
         .read()
         .await

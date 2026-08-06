@@ -432,6 +432,7 @@ async function init(): Promise<void> {
   // 旧逻辑双重 render → 切档瞬间 active class 与 dict 错位闪烁。
   onLocaleChange((newLocale) => {
     currentLocale = newLocale as Locale;
+    render(); // P2-1 fix: 切语言后重建 DOM，否则 section/按钮文字停留旧语言
   });
 
   // 监听后端 locale-changed（来自 tray 菜单 / 浮窗的切换）
