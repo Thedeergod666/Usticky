@@ -97,7 +97,7 @@ let rustHoveredCardId: string | null = null;
 ///
 /// 未来新增"不应被 SortableJS 当作拖拽起点"的卡内控件（如优先级 chip、
 /// 标签按钮），只需把选择器追加到这条常量里。
-const NON_DRAGGABLE_SELECTORS = ".todo-check, .todo-delete, .todo-copy, .todo-edit-input, .todo-banner";
+const NON_DRAGGABLE_SELECTORS = ".todo-check, .todo-delete, .todo-copy, .todo-edit-input, .todo-thumb";
 
 // 浮窗层级模式（pin_top / pin_bottom / normal）
 // 启动时从后端 get_pin_mode 拉，跟 usticky://pin-mode-changed 事件同步
@@ -502,6 +502,25 @@ function buildTodoRow(todo: Todo): HTMLElement {
   });
   row.appendChild(check);
 
+  // v0.2.6 图片附件内联缩略图：check 与 title 之间。flex:1 1 0 跟 title 1:1
+  // 各占一半宽；无标题时 .todo-title:empty 折叠，图片独占整宽。高度一行不变。
+  // GIF 原生动画，点击 -> 聚焦预览窗看全图。加载失败摘节点不留裂图。
+  if (todo.attachment) {
+    const thumb = document.createElement("img");
+    thumb.className = "todo-thumb";
+    thumb.alt = "";
+    thumb.draggable = false;
+    const url = attachmentUrl(todo.attachment.file);
+    if (url) thumb.src = url;
+    thumb.setAttribute("aria-label", t("app.action.preview"));
+    thumb.addEventListener("error", () => thumb.remove());
+    thumb.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void openPreviewPinned(todo.id);
+    });
+    row.appendChild(thumb);
+  }
+
   const title = document.createElement("div");
   title.className = "todo-title";
   title.textContent = todo.title;
@@ -558,26 +577,6 @@ function buildTodoRow(todo: Todo): HTMLElement {
   });
   actions.appendChild(del);
   row.appendChild(actions);
-
-  // v0.2.6 图片附件 banner：整宽预览（替代旧 20px 缩略图 -- 旧版太小且
-  // 首启竞态下 attachmentsDir 未就绪，<img> 无 src -> 空白框）。放在卡末尾，
-  // .todo-card flex-wrap:wrap + banner flex-basis:100% 让它折到标题行下方
-  // 独占一行。GIF 原生动画，点击 -> 聚焦预览窗看全图。加载失败摘节点不留裂图。
-  if (todo.attachment) {
-    const banner = document.createElement("img");
-    banner.className = "todo-banner";
-    banner.alt = "";
-    banner.draggable = false;
-    const url = attachmentUrl(todo.attachment.file);
-    if (url) banner.src = url;
-    banner.setAttribute("aria-label", t("app.action.preview"));
-    banner.addEventListener("error", () => banner.remove());
-    banner.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void openPreviewPinned(todo.id);
-    });
-    row.appendChild(banner);
-  }
 
   // 聚焦路径的按钮 hover 反馈（未聚焦路径由 hover-pos 驱动，见 setBtnHover）
   for (const btn of [copyBtn, del]) {
@@ -1483,6 +1482,10 @@ async function init() {
       clearTimeout(hoverEnterTimer);
       hoverEnterTimer = null;
     }
+    // 预览开着时（鼠标正穿缝 card 与 preview 之间的 GAP）不摘玻璃 -- 预览是
+    // todo 的一部分，穿缝是过渡。强调释放统一交给 over_preview / floating-hover
+    // / preview-closed，避免这里摘了又挂抖动。
+    if (previewTodoId !== null && previewPinnedId === null) return;
     setHoverAttr(false);
   };
   document.body.addEventListener("mouseenter", onBodyMouseEnter);
@@ -1673,6 +1676,10 @@ async function init() {
       cancelPreviewClose();
       setBtnHover(null);
       if (previewTodoId !== null) {
+        // 预览是 todo 的一部分：hover 到预览窗时浮窗玻璃也保持 hover（聚焦
+        // 路径下 onBodyMouseLeave / onFocusChanged 可能已摘，这里挂回；
+        // 未聚焦路径幂等无副作用）。
+        setHoverAttr(true);
         if (rustHoveredCardId !== null && rustHoveredCardId !== previewTodoId) {
           appEl.querySelector<HTMLElement>(
             `.todo-card[data-todo-id="${cssEscape(rustHoveredCardId)}"]`,

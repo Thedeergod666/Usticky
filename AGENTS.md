@@ -1,6 +1,6 @@
 # Usticky 项目说明
 
-> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.2.6 图片 banner 展示 + 输入框 Cmd+V 粘图片（修首启空白框竞态）** / 2026-08-06。
+> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.2.6 图片内联单行展示（1:1 共享 / 纯图占满）+ 输入框 Cmd+V 粘图片（修首启空白框竞态）** / 2026-08-06。
 
 ## 这是什么
 
@@ -343,7 +343,7 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 
 用户实测反馈四个问题，根因 + 修法：
 
-✅ **① hover 显示慢**：dwell 600/350ms 太长 + 首次创建 webview 300-500ms 白屏。修：dwell 砍到 **文本 350ms / 图片 250ms**（main.ts `PREVIEW_DWELL_TEXT/IMAGE_MS`）；首次 floating-hover(true) 时 `prewarm_preview_window` **隐藏创建**预览窗（webview 提前加载完），后续 dwell open 只剩定位+show。
+✅ **① 粘贴图片后 todo 内显示空白框 + 占用过高**：双层根因 -- a) **首启竞态**：`get_attachments_dir` 在 `init()` 里排在 `get_todos`/首次 `render()` **之后**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 旧 ~1830 行），已存在附件的 todo 首屏 `buildTodoRow` 调 `attachmentUrl()` 时 `attachmentsDir` 仍 null -> `<img>` 无 `src` -> 空白边框框（且无 error 事件 -> `thumb.remove()` 不触发，框常驻）。修：`get_attachments_dir` 挪到 `get_todos` **之前**。b) **展示方式**：图片改**内联单行**（check 与 title 之间，`.todo-thumb`），`flex:1 1 0` 跟 `.todo-title` 1:1 各占一半宽 + `align-self:stretch` 填内容高（行高跟纯文本 todo 一致，保持不变）；纯图 todo（空标题）走 `.todo-title:empty`（`flex:0 0 auto`）折叠成 0 宽 -> 图片独占整宽。点击仍聚焦预览窗看全图 / GIF 动画。`.todo-card` 不用 flex-wrap（单行 nowrap）。`.todo-title` / `.todo-edit-input` flex 由 `1 1 auto` 改 `1 1 0`（跟图片 1:1 共享宽度）。`NON_DRAGGABLE_SELECTORS` 含 `.todo-thumb`。顺手删了缩略图上残留的 `title=`（违反 v0.2.1 "浮窗内不准原生 tooltip" 规则的漏网之鱼）。
 ✅ **② 有时显示"小弹窗"**：不是预览窗，是 `.todo-title` 的原生 `title=` tooltip（macOS hover 停留 ~1-2s 弹白色小条）。修：buildTodoRow / exitEditMode 两处 `title.title = ...` **已删**，长文预览统一走 QuickLook 预览窗。**规则：浮窗/预览窗内不准用原生 title= tooltip**。
 ✅ **③ 预览出现 ~2s 后丢毛玻璃**（gif 证实，连浮窗玻璃一起丢）：macOS WKWebView backdrop-filter sample 在新 always-on-top 窗口上屏后失效的旧病（v0.1.2 起浮窗靠 level 切换后 emit backdrop-refresh 救；预览窗开着期间没有 level 切换可搭车）。修：a) open/close preview 两条路径末尾 emit `usticky://backdrop-refresh` 救浮窗；b) preview.ts **heartbeat**（每 1200ms 给 .preview-panel 挂 100ms `.force-reflow`（`filter: drop-shadow(0 0 0 transparent)`，浮窗 styles.css 同款 paint invalidation），`visibilityState === "hidden"` 跳过 —— prewarm 隐藏态不耗 GPU）。
 ✅ **④ 鼠标停在大卡片上预览会消失**（振荡）：根因双层 —— a) 预览窗定位可能盖住浮窗/鼠标 → `windowNumberAtPoint` 命中预览窗而非浮窗 → hover emitter 报 inside=false → unhoverCard → 450ms grace close → 关窗 → 又 inside → 循环；b) 预览窗非聚焦态 WKWebView 不派 mouseenter → `preview-entered` 发不出 → pinned 机制失效。修：
@@ -406,13 +406,13 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ✅ i18n 复用现有 `app.delete.flash` / `app.action.undo` / `app.undo.flash`，无新增 key。
 ✅ 构建验证：`cargo check` ✓、`tsc --noEmit` 干净 ✓、`vite build` ✓。
 
-### v0.2.6（2026-08-06，图片 banner 展示 + 输入框 Cmd+V 粘图片）
+### v0.2.6（2026-08-06，图片内联单行展示 + 输入框 Cmd+V 粘图片）
 
 用户反馈两个问题，根因 + 修法：
 
 ✅ **① 粘贴图片后 todo 内显示空白框**：双层根因 -- a) **首启竞态**：`get_attachments_dir` 在 `init()` 里排在 `get_todos`/首次 `render()` **之后**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 旧 ~1830 行），已存在附件的 todo 首屏 `buildTodoRow` 调 `attachmentUrl()` 时 `attachmentsDir` 仍 null -> `<img>` 无 `src` -> 空白边框框（且无 error 事件 -> `thumb.remove()` 不触发，框常驻）。b) **缩略图太小**：旧 `.todo-thumb` 20×20，即便加载成功也几乎看不出图，像空白框。修：a) `get_attachments_dir` 挪到 `get_todos` **之前**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) init）；b) 卡内 20px 缩略图换成**整宽 banner**（`.todo-banner`，`flex: 0 0 100%` + `.todo-card` 加 `flex-wrap:wrap` 让它折到标题行下方独占一行（配套把 `.todo-title` / `.todo-edit-input` 的 `flex` 从 `1 1 auto` 改 `1 1 0` -- 否则 `flex-wrap:wrap` 下长标题的 base size = 全文宽会触发换行，checkbox 独占一行、标题被挤到下一行），100px 高 `object-fit:cover` 圆角），图片真正可见，点击仍聚焦预览窗看全图 / GIF 动画。`NON_DRAGGABLE_SELECTORS` `.todo-thumb` -> `.todo-banner`。顺手删了缩略图上残留的 `title=`（违反 v0.2.1 "浮窗内不准原生 tooltip" 规则的漏网之鱼）。
 ✅ **② 输入框内 Cmd+V 粘不了图片**：input 是 `type=text`，默认只吃文本，粘图片静默丢弃（用户此前只能点粘贴按钮）。修：input 挂 `paste` 监听，`clipboardData.items` 含 `image/*` 就 `preventDefault` 改走 `paste_from_clipboard`（后端读 OS 剪贴板，能落附件 todo），并把已键入文字当图片 todo 的标题传进去（文字被消费进 todo 后清空 input；`kind !== "image"` 的罕见竞态不清空，保留用户文字）。纯文本放行默认插入。仅 input 聚焦时触发（窗口为 key window，paste 事件可靠）-- 未聚焦浮窗的粘贴仍由粘贴按钮兜底。
-✅ **`paste_from_clipboard` 加可选 `title: Option<String>` 参数**（[commands/mod.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/commands/mod.rs)）：图片分支标题回退链 `title` 参数 -> `img.name` -> 默认 "图片"；文本分支忽略。粘贴按钮传 None（行为不变），输入框 Cmd+V 传已键入文字。
+✅ **`paste_from_clipboard` 加可选 `title: Option<String>` 参数 + 纯图 todo（空标题）**（[commands/mod.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/commands/mod.rs)）：图片分支标题回退链 `title` 参数 -> `img.name` -> **空字符串**（纯图 todo，前端 `.todo-title:empty` 折叠让图片占满整宽）；文本分支忽略。粘贴按钮传 None（行为不变），输入框 Cmd+V 传已键入文字。`add_with_attachment` 不校验标题（可存空）；`update_todo` 仍走 `validate_title` 拒空 -> 编辑态不能清空标题，仅 paste 能创建空标题纯图 todo。
 ✅ **附带：预览窗 hover 穿缝行为改进**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts)）：预览开着时鼠标穿 card↔preview 之间的缝隙（短暂"两窗都不在"），原实现会立即摘 `.card-hover` + 落 idle 玻璃 -> 卡片像失焦闪一下。改：预览开着（`previewTodoId !== null && previewPinnedId === null`，即非 pinned 的 hover 面板）时，`floating-hover(false)` / hover-pos 不摘卡片强调、不落 idle；`over_preview` 命中时把 `rustHoveredCardId` 对齐到 `previewTodoId` 保持 `.card-hover`。释放时机统一收到 `preview-closed`：预览真关 + 鼠标仍不在浮窗（`lastHoverPayload === false`）才落 idle + 摘 `.card-hover`；鼠标在浮窗上则不动（让 hover-pos 正常驱动，避免摘了又挂抖动）。顺带删了 `previewWasOver` / `justLeftPreview` 边沿机制（被 preview-closed 释放路径取代，不再需要）。
 ✅ 构建验证：`cargo check --all-targets` 零警告 ✓、`cargo test --lib` 20/20 ✓、`pnpm build`（tsc + vite）✓。
 

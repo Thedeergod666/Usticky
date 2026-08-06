@@ -668,7 +668,7 @@ pub async fn get_attachments_dir(store: State<'_, SharedStore>) -> Result<String
 ///
 /// `title`：输入框 Cmd+V 粘图片时把已键入的文字作为图片 todo 的标题传进来
 /// （文字被消费进 todo，前端随后清空输入框）。粘贴按钮 / 输入框无文字时传 None，
-/// 回退到 img.name 再到默认 "图片" 标题的既有链路。文本分支忽略此参数。
+/// 回退到 img.name（文件名）；都无则空标题（纯图 todo，前端整宽显示）。文本分支忽略此参数。
 #[tauri::command]
 pub async fn paste_from_clipboard(
     app: AppHandle,
@@ -721,7 +721,9 @@ pub async fn paste_from_clipboard(
                 Some(n) if !n.is_empty() => validate_title(n)?,
                 _ => match img.name.as_deref().map(str::trim) {
                     Some(n) if !n.is_empty() => validate_title(n)?,
-                    _ => rust_i18n::t!("commands.paste.image_title").to_string(),
+                    // 纯图 todo：无标题。前端 buildTodoRow 见空标题让 .todo-title
+                    // 折叠（:empty），图片独占整宽（v0.2.6 inline 图片 1:1 布局）。
+                    _ => String::new(),
                 },
             };
             let attachment = crate::todo::TodoAttachment {
