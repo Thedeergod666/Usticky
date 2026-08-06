@@ -730,11 +730,13 @@ function openPreviewFor(id: string, card: HTMLElement | null, pinned: boolean) {
 /// 统一 grace close：450ms 内鼠标进预览窗（over_preview）/ 回卡片 /
 /// 回浮窗都会 cancel。显式 pin（编辑态）/ 鼠标在预览窗上 → 直接不排。
 function schedulePreviewClose() {
+  console.debug("[hover] schedule guard", { ptid: previewTodoId, pin: previewPinnedId, pmi: previewMouseInside });
   if (previewTodoId === null || previewPinnedId !== null || previewMouseInside) return;
   cancelPreviewClose();
   const id = previewTodoId;
   previewCloseTimer = setTimeout(() => {
     previewCloseTimer = null;
+    console.debug("[hover] grace FIRED", { id, ptid: previewTodoId, pin: previewPinnedId });
     if (previewTodoId !== id || previewPinnedId) return;
     previewTodoId = null;
     invoke("close_preview_window", { force: false }).catch((e) =>
@@ -743,10 +745,32 @@ function schedulePreviewClose() {
   }, PREVIEW_CLOSE_GRACE_MS);
 }
 
+/// 挂/摘 .card-hover，顺带冻结/解冻图片缩略图宽度。
+/// v0.2.6: 图片跟 title 都是 flex:1 1 0（默认 1:1），actions 出现时两者等比
+/// 收缩 -> 图片被挤小（用户反馈）。挂 .card-hover **之前**先读 thumb 当前宽
+/// （= 无 actions 的 1:1 宽）冻成 flex:0 0 <w>px -> actions 出现时只有 title
+/// 收缩省略（"..."），图片保持原宽。摘时解冻回 flex:1 1 0。仅对有 .todo-thumb
+/// 的卡生效（文本卡无 thumb，no-op）。box-sizing:border-box -> offsetWidth 即
+/// flex-basis 值。所有 .card-hover 增删都走这条统一入口（hoverCard /
+/// unhoverCard / over_preview 三处），避免边沿漏解冻留 stale freeze。
+function setCardHover(card: HTMLElement, on: boolean) {
+  // 幂等：已在目标态就跳过（over_preview 每 50ms tick 重复调，避免反复
+  // 读 offsetWidth 触发布局）。
+  if (card.classList.contains(CARD_HOVER_CLASS) === on) return;
+  const thumb = card.querySelector<HTMLElement>(".todo-thumb");
+  if (on) {
+    if (thumb && thumb.offsetWidth > 0) thumb.style.flex = `0 0 ${thumb.offsetWidth}px`;
+    card.classList.add(CARD_HOVER_CLASS);
+  } else {
+    card.classList.remove(CARD_HOVER_CLASS);
+    if (thumb) thumb.style.flex = "";
+  }
+}
+
 /// 进入卡片 hover：挂 .card-hover（操作按钮显隐）+ 立即出/切预览。
 /// 聚焦窗口走 mouseenter，未聚焦走 Rust hover-pos（同一状态机）。
 function hoverCard(card: HTMLElement) {
-  card.classList.add(CARD_HOVER_CLASS);
+  setCardHover(card, true);
   const id = card.dataset.todoId;
   if (!id) return;
   // 显式 pin（用户进了预览窗编辑）→ hover 不抢内容。想换预览的唯一
@@ -773,7 +797,7 @@ function hoverCard(card: HTMLElement) {
 /// 顺手撤销删除按钮的二次确认态（hover 结束还留着 armed 态会让用户
 /// 在看不到按钮的情况下第二次点击直接删除）。
 function unhoverCard(card: HTMLElement) {
-  card.classList.remove(CARD_HOVER_CLASS);
+  setCardHover(card, false);
   cancelPreviewDwell();
   const id = card.dataset.todoId;
   if (id) resetDeleteConfirm(id);
@@ -1593,6 +1617,7 @@ async function init() {
     // 动作，不该闪一下 idle 让卡片变暗。预览真关（preview-closed）且鼠标仍
     // 在外时才落 idle（见 preview-closed listener）。
     const previewOpen = previewTodoId !== null && previewPinnedId === null;
+    console.debug("[hover] fh", e.payload, { previewOpen, pmi: previewMouseInside, ptid: previewTodoId, rid: rustHoveredCardId });
     if (e.payload || !previewOpen) {
       setHoverAttr(e.payload);
     }
@@ -1681,14 +1706,16 @@ async function init() {
         // 未聚焦路径幂等无副作用）。
         setHoverAttr(true);
         if (rustHoveredCardId !== null && rustHoveredCardId !== previewTodoId) {
-          appEl.querySelector<HTMLElement>(
+          const old = appEl.querySelector<HTMLElement>(
             `.todo-card[data-todo-id="${cssEscape(rustHoveredCardId)}"]`,
-          )?.classList.remove(CARD_HOVER_CLASS);
+          );
+          if (old) setCardHover(old, false);
         }
         rustHoveredCardId = previewTodoId;
-        appEl.querySelector<HTMLElement>(
+        const pc = appEl.querySelector<HTMLElement>(
           `.todo-card[data-todo-id="${cssEscape(previewTodoId)}"]`,
-        )?.classList.add(CARD_HOVER_CLASS);
+        );
+        if (pc) setCardHover(pc, true);
       }
       return;
     }
@@ -1901,6 +1928,7 @@ async function init() {
     .then((fn) => (unlistenPreviewLeft = fn))
     .catch((e) => console.error("[usticky] listen preview-left failed", e));
   listen("usticky://preview-closed", () => {
+    console.debug("[hover] preview-closed", { lhp: lastHoverPayload, rid: rustHoveredCardId });
     previewTodoId = null;
     previewPinnedId = null;
     previewMouseInside = false;

@@ -1015,6 +1015,12 @@ pub async fn close_preview_window(app: AppHandle, force: Option<bool>) -> Result
         w.close().map_err(|e| e.to_string())?;
         // 关窗同样触发合成层重排 → 浮窗玻璃重采样（见 open 的注释）
         let _ = app.emit("usticky://backdrop-refresh", ());
+        // 兜底直接 emit preview-closed：w.close() 在 Tauri 2 / WKWebView 下
+        // 可能不触发 webview beforeunload，preview.ts 的 beforeunload 监听不来，
+        // 浮窗收不到 preview-closed，穿缝期间保留的强调无法释放（卡死，只有
+        // 点别的应用触发 onFocusChanged 才摘）。preview.ts beforeunload 仍会
+        // 再 emit 一次，listener 幂等无副作用。
+        let _ = app.emit("usticky://preview-closed", ());
     }
     Ok(())
 }
