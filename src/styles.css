@@ -478,7 +478,12 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
 
 /* 标题 */
 .todo-title {
-  flex: 1 1 auto;
+  /* flex-basis 0（非 auto）：v0.2.6 起 .todo-card flex-wrap:wrap（让图片 banner
+   * 折到新行），若 title 用 auto，长标题的 base size = 全文宽 -> 触发换行 ->
+   * checkbox 独占一行、标题被挤到下一行。改 0：title 的 base 永远 0，不参与
+   * 换行判定，flex-grow 填满剩余 + min-width:0 收缩省略，与 nowrap 旧态等价。
+   * 唯一触发换行的只剩 .todo-banner（flex-basis 100%）。 */
+  flex: 1 1 0;
   min-width: 0;
   font-size: 13px;
   font-weight: 500;
@@ -516,7 +521,7 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
  * 已完成态（.todo-card.done）的 input：去掉 line-through（用户正在编辑，
  * 删除线是给"完成态显示"的标记，不应该污染输入体验）。 */
 .todo-edit-input {
-  flex: 1 1 auto;
+  flex: 1 1 0; /* 同 .todo-title：flex-basis 0 防 flex-wrap 换行（见 .todo-title 注释） */
   min-width: 0;
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.10);
