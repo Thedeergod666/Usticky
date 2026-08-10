@@ -196,6 +196,16 @@ function render(todo: Todo) {
     }, SAVE_DEBOUNCE_MS);
   });
 
+  // textarea focus -> emit preview-editing：浮窗据此设 previewPinnedId（编辑锁，
+  // hover 不抢内容）。这是唯一可靠的"编辑中"信号 —— 窗口聚焦 ≠ 编辑（点缩略图
+  // 看图也抢焦点，但不是编辑），textarea focus 才是。固定窗不 emit（独立于
+  // 浮窗 hover 状态机，不该挡 hover 换卡）。
+  textarea.addEventListener("focus", () => {
+    if (!isPinned && currentTodoId) {
+      emit("usticky://preview-editing", { id: currentTodoId }).catch(() => {});
+    }
+  });
+
   // 拖窗：panel 空白区 / 图片上 mousedown -> startDragging。
   // textarea 放行（选中文本 / 聚焦编辑），hint 是文字也放行（无妨，可拖）。
   panel.addEventListener("mousedown", (e) => {
@@ -458,8 +468,10 @@ async function init() {
 
   // 窗口 blur 关闭（仅 hover 预览）：用户聚焦过预览窗后点别处 -> 收。
   // focused(false) 创建的 hover 面板不会收到这个事件（状态没变化过）。
-  // focused(true) -> emit preview-focused：浮窗据此 pin（编辑保护，hover
-  // 不换内容）。焦点语义可靠 -- blur 必触发 closeSelf -> preview-closed
+  // focused(true) -> emit preview-focused：浮窗据**只 cancelPreviewClose**
+  // （防自动关窗），**不设 previewPinnedId**。窗口聚焦 ≠ 编辑 —— 点缩略图
+  // 看图也抢焦点，若据此 pin 则 hover 又被锁死。编辑锁改由 textarea focus
+  // （preview-editing 事件）显式设。blur 必触发 closeSelf -> preview-closed
   // 释放，不存在锁死路径。
   //
   // 固定窗：blur 不关（常驻），也不广播 preview-focused -- 它独立于浮窗

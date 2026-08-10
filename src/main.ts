@@ -102,7 +102,7 @@ let rustHoveredCardId: string | null = null;
 /// 内联缩略图后的回归（v0.2.5 之前 .todo-thumb 是 20×20 角标小图，
 /// 用户不会拿它当拖拽起点）。
 ///
-/// 缩略图上的 `click` handler (`openPreviewPinned`) 仍 `stopPropagation`，
+/// 缩略图上的 `click` handler (`openPreviewFromThumbClick`) 仍 `stopPropagation`，
 /// 无位移点击 -> 聚焦预览窗；带位移的拖动 -> SortableJS 接管。
 ///
 /// 未来新增"不应被 SortableJS 当作拖拽起点"的卡内控件（如优先级 chip、
@@ -533,7 +533,7 @@ function buildTodoRow(todo: Todo): HTMLElement {
     thumb.addEventListener("error", () => thumb.remove());
     thumb.addEventListener("click", (e) => {
       e.stopPropagation();
-      void openPreviewPinned(todo.id);
+      void openPreviewFromThumbClick(todo.id);
     });
     row.appendChild(thumb);
   }
@@ -671,8 +671,10 @@ const CARD_HOVER_CLASS = "card-hover";
 //
 // 状态：
 //   previewTodoId      — 当前预览的 todo
-//   previewPinnedId    — 显式 pin：点击缩略图聚焦 / 预览窗内真实 mouseenter
-//                        （= 用户在编辑）。pinned 期间 hover 不换内容、不关窗。
+//   previewPinnedId    — 编辑锁：用户点进预览窗 textarea（preview-editing
+//                        事件）才设。pinned 期间 hover 不换内容、不关窗。
+//                        点缩略图（openPreviewFromThumbClick）和窗口聚焦
+//                        （preview-focused）都**不**设此值 —— "看"≠"编"。
 //   previewMouseInside — 鼠标在预览窗上（Rust hit-test over_preview），仅
 //                        阻止自动关闭，**不**阻塞 hover 换卡（路过预览窗
 //                        不该把内容锁死 —— 跟显式 pin 区分）。
@@ -804,8 +806,11 @@ function hoverCard(card: HTMLElement) {
   setCardHover(card, true);
   const id = card.dataset.todoId;
   if (!id) return;
-  // 显式 pin（用户进了预览窗编辑）→ hover 不抢内容。想换预览的唯一
-  // 路径是显式点击别的缩略图（openPreviewPinned）。
+  // 显式 pin（用户点进预览窗 textarea 编辑，preview-editing 事件设过）
+  // → hover 不抢内容。编辑锁的唯一来源是 textarea focus，不再由
+  // openPreviewFromThumbClick / preview-focused 设（点缩略图是"看"不是"编"，
+  // 不该锁死 hover）。想换预览：移到别的卡 hover 即可，或点进 textarea
+  // 开始编辑触发 pin。
   if (previewPinnedId !== null) return;
   // 回到任意卡 = 关闭意图取消（必须在 previewTodoId===id 短路之前，
   // 否则 unhover 排的 grace close 会在"回同一张卡"时照样炸）。
@@ -836,12 +841,16 @@ function unhoverCard(card: HTMLElement) {
   schedulePreviewClose();
 }
 
-/// 点击缩略图 → 聚焦预览窗（编辑入口）。pinned 后浮窗侧不再自动关窗，
-/// 窗口生命周期归 preview.ts（Esc / blur 自关，emit preview-closed 同步）。
-function openPreviewPinned(todoId: string) {
+/// 点击缩略图 → 立即开预览看全图。pinned: true 仍传（Rust set_focus 抢
+/// 焦点，避免 floating 抢 key → preview blur → closeSelf 竞态把刚开的窗关
+/// 掉），但**不设 previewPinnedId** —— 点缩略图是"看"不是"编"，hover 别的
+/// 卡仍要能切换。编辑锁改由 textarea focus（preview-editing 事件）显式设。
+/// 若此前在编辑（previewPinnedId 由 textarea focus 设过），点缩略图 = 转去
+/// 看别的图，清 pin 让 hover 接管。
+function openPreviewFromThumbClick(todoId: string) {
   cancelPreviewDwell();
   cancelPreviewClose();
-  previewPinnedId = todoId;
+  previewPinnedId = null;
   const card = app.querySelector<HTMLElement>(
     `.todo-card[data-todo-id="${cssEscape(todoId)}"]`,
   );
@@ -1922,13 +1931,22 @@ async function init() {
   //                     pin** —— 预览窗一旦拿到焦点（acceptFirstMouse 点击 /
   //                     show 抢 key），mouseenter 恢复派发就会误 pin，且聚焦
   //                     时 preview-left 永不发出 → pin 锁死、hover 换卡失效）
-  //   preview-focused：预览窗真正拿到键盘焦点（= 用户点进去编辑）→ pin。
-  //                     焦点语义可靠：blur 必触发 closeSelf → preview-closed
-  //                     释放，不存在锁死路径
+  //   preview-focused：预览窗拿到键盘焦点 → 只 cancelPreviewClose（防自动
+  //                     关窗），**不设 previewPinnedId**。焦点 ≠ 编辑 ——
+  //                     openPreviewFromThumbClick 也走 pinned:true 抢焦点，
+  //                     若据此 pin 则点缩略图后 hover 又被锁死（用户反馈
+  //                     "点图后 hover 别的卡预览不变"）。编辑锁改由
+  //                     preview-editing（textarea focus）显式设。
+  //   preview-editing：用户点进预览窗 textarea（真要编辑标题）→ pin。
+  //                     这是唯一可靠的"编辑中"信号：窗口聚焦 ≠ 编辑
+  //                     （可能只是看图），textarea focus 才是。blur 时
+  //                     preview.ts onFocusChanged(false) → closeSelf →
+  //                     preview-closed 释放，无锁死路径。
   //   preview-left   ：鼠标离开预览窗（未聚焦）→ 解除 pin，重启 grace close
   //   preview-closed ：预览窗关闭（Esc / blur 自关）→ 清两侧状态
   let unlistenPreviewEntered: UnlistenFn | null = null;
   let unlistenPreviewFocused: UnlistenFn | null = null;
+  let unlistenPreviewEditing: UnlistenFn | null = null;
   let unlistenPreviewLeft: UnlistenFn | null = null;
   let unlistenPreviewClosed: UnlistenFn | null = null;
   listen<{ id: string }>("usticky://preview-entered", () => {
@@ -1936,12 +1954,17 @@ async function init() {
   })
     .then((fn) => (unlistenPreviewEntered = fn))
     .catch((e) => console.error("[usticky] listen preview-entered failed", e));
-  listen<{ id: string }>("usticky://preview-focused", (e) => {
-    previewPinnedId = e.payload.id;
+  listen<{ id: string }>("usticky://preview-focused", () => {
     cancelPreviewClose();
   })
     .then((fn) => (unlistenPreviewFocused = fn))
     .catch((e) => console.error("[usticky] listen preview-focused failed", e));
+  listen<{ id: string }>("usticky://preview-editing", (e) => {
+    previewPinnedId = e.payload.id;
+    cancelPreviewClose();
+  })
+    .then((fn) => (unlistenPreviewEditing = fn))
+    .catch((e) => console.error("[usticky] listen preview-editing failed", e));
   listen<{ id: string }>("usticky://preview-left", (e) => {
     const id = e.payload.id;
     if (previewTodoId !== id) return;
@@ -2158,6 +2181,7 @@ async function init() {
     unlistenShortcut?.();
     unlistenPreviewEntered?.();
     unlistenPreviewFocused?.();
+    unlistenPreviewEditing?.();
     unlistenPreviewLeft?.();
     unlistenPreviewClosed?.();
     unlistenBackdropRefresh?.();
