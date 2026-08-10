@@ -738,16 +738,17 @@ function openPreviewFor(id: string, card: HTMLElement | null, pinned: boolean) {
 /// 统一 grace close：450ms 内鼠标进预览窗（over_preview）/ 回卡片 /
 /// 回浮窗都会 cancel。显式 pin（编辑态）/ 鼠标在预览窗上 → 直接不排。
 function schedulePreviewClose() {
-  console.debug("[hover] schedule guard", { ptid: previewTodoId, pin: previewPinnedId, pmi: previewMouseInside });
   if (previewTodoId === null || previewPinnedId !== null || previewMouseInside) return;
   cancelPreviewClose();
   const id = previewTodoId;
   previewCloseTimer = setTimeout(() => {
     previewCloseTimer = null;
-    console.debug("[hover] grace FIRED", { id, ptid: previewTodoId, pin: previewPinnedId });
     if (previewTodoId !== id || previewPinnedId) return;
     previewTodoId = null;
-    invoke("close_preview_window", { force: false }).catch((e) =>
+    // force:true -- 能排到这里说明 previewPinnedId === null（非编辑态），强制
+    // 关安全，且绕过偶发的 is_focused 误判（focus 与 previewPinnedId 短暂错位
+    // 时 force:false 会被跳过 -> 预览不关 -> 卡片强调 / 玻璃卡死释放不了）。
+    invoke("close_preview_window", { force: true }).catch((e) =>
       console.debug("[usticky] close_preview_window failed", e),
     );
   }, PREVIEW_CLOSE_GRACE_MS);
@@ -767,7 +768,16 @@ function setCardHover(card: HTMLElement, on: boolean) {
   if (card.classList.contains(CARD_HOVER_CLASS) === on) return;
   const thumb = card.querySelector<HTMLElement>(".todo-thumb");
   if (on) {
-    if (thumb && thumb.offsetWidth > 0) thumb.style.flex = `0 0 ${thumb.offsetWidth}px`;
+    if (thumb && thumb.offsetWidth > 0) {
+      // 仅在有非空标题时冻结图片宽度：标题以省略号收缩给 actions 让位，
+      // 图片保持原宽。纯图 todo（空标题）的 thumb 独占整宽，冻结到全宽后
+      // actions 出现无处可放 -> 按钮被挤出卡片（用户反馈"图片宽度过大时
+      // hover 把复制/删除按钮挤到一边"）。纯图不冻结，让 thumb 自然收缩腾位。
+      const title = card.querySelector<HTMLElement>(".todo-title");
+      const hasTitle =
+        !!title && title.textContent !== null && title.textContent.trim().length > 0;
+      if (hasTitle) thumb.style.flex = `0 0 ${thumb.offsetWidth}px`;
+    }
     card.classList.add(CARD_HOVER_CLASS);
   } else {
     card.classList.remove(CARD_HOVER_CLASS);
@@ -1629,7 +1639,6 @@ async function init() {
     // 动作，不该闪一下 idle 让卡片变暗。预览真关（preview-closed）且鼠标仍
     // 在外时才落 idle（见 preview-closed listener）。
     const previewOpen = previewTodoId !== null && previewPinnedId === null;
-    console.debug("[hover] fh", e.payload, { previewOpen, pmi: previewMouseInside, ptid: previewTodoId, rid: rustHoveredCardId });
     if (e.payload || !previewOpen) {
       setHoverAttr(e.payload);
     }
@@ -1940,7 +1949,6 @@ async function init() {
     .then((fn) => (unlistenPreviewLeft = fn))
     .catch((e) => console.error("[usticky] listen preview-left failed", e));
   listen("usticky://preview-closed", () => {
-    console.debug("[hover] preview-closed", { lhp: lastHoverPayload, rid: rustHoveredCardId });
     previewTodoId = null;
     previewPinnedId = null;
     previewMouseInside = false;

@@ -1181,10 +1181,20 @@ pub async fn open_preview_window(
 #[tauri::command]
 pub async fn close_preview_window(app: AppHandle, force: Option<bool>) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("preview") {
-        if !force.unwrap_or(false) && w.is_focused().unwrap_or(false) {
+        let force = force.unwrap_or(false);
+        if !force && w.is_focused().unwrap_or(false) {
             return Ok(());
         }
-        w.close().map_err(|e| e.to_string())?;
+        // w.close() 偶发返 Err（窗口正被移动 / 合成层重排 / 已在关闭中等竞态）。
+        // 原实现 `w.close()?` 失败即 return Err、**不** emit preview-closed：浮窗
+        // grace timer 已先把 previewTodoId 置 null，但卡片强调 / 玻璃 hover 只在
+        // preview-closed 才释放 -> 卡死强调态 + 预览窗残留孤儿（用户实测"鼠标
+        // 离开后预览迟迟不消失 + todo 虽置底仍强调态"）。修：close 失败也 emit
+        // preview-closed 复位浮窗，并 hide 兜底藏掉残留窗（reuse 路径会重新 show）。
+        if let Err(e) = w.close() {
+            tracing::debug!(error = %e, "preview w.close failed, hide 兜底 + 仍 emit preview-closed");
+            let _ = w.hide();
+        }
         // 关窗同样触发合成层重排 → 浮窗玻璃重采样（见 open 的注释）
         let _ = app.emit("usticky://backdrop-refresh", ());
         // 兜底直接 emit preview-closed：w.close() 在 Tauri 2 / WKWebView 下
