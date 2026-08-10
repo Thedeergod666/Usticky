@@ -583,22 +583,6 @@ pub fn set_cursor_pointer(app: AppHandle, pointer: bool) {
     crate::platform::set_cursor_pointer_shape(&app, pointer);
 }
 
-/// 推后浮窗降级（PinBottom 模式 hover 收尾用）。前端 floating-hover(false)
-/// 但预览开着时调：把"降到 BELOW_NORMAL"推后到 preview-closed 后，让"窗口
-/// 降级"、"预览消失"、"卡片失强调"同帧。macOS 专有语义，Win/Linux no-op。
-#[tauri::command]
-pub fn suppress_window_lower(app: AppHandle, ms: Option<u64>) {
-    let _ = &app;
-    crate::platform::suppress_window_lower(ms.unwrap_or(1200));
-}
-
-/// 放行浮窗降级（清抑制窗口）。前端 preview-closed 后调。macOS 专有，其余 no-op。
-#[tauri::command]
-pub fn release_window_lower(app: AppHandle) {
-    let _ = &app;
-    crate::platform::release_window_lower();
-}
-
 // ── Quick-add 快捷键 ──
 
 /// 返回当前持久化的 quick-add 快捷键（accelerator 字符串，如 `"Cmd+Shift+Space"`）。

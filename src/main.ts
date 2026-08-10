@@ -737,21 +737,24 @@ function openPreviewFor(id: string, card: HTMLElement | null, pinned: boolean) {
 
 /// 统一 grace close：450ms 内鼠标进预览窗（over_preview）/ 回卡片 /
 /// 回浮窗都会 cancel。显式 pin（编辑态）/ 鼠标在预览窗上 → 直接不排。
-function schedulePreviewClose() {
+function schedulePreviewClose(immediate: boolean = false) {
   if (previewTodoId === null || previewPinnedId !== null || previewMouseInside) return;
   cancelPreviewClose();
   const id = previewTodoId;
-  previewCloseTimer = setTimeout(() => {
-    previewCloseTimer = null;
-    if (previewTodoId !== id || previewPinnedId) return;
-    previewTodoId = null;
-    // force:true -- 能排到这里说明 previewPinnedId === null（非编辑态），强制
-    // 关安全，且绕过偶发的 is_focused 误判（focus 与 previewPinnedId 短暂错位
-    // 时 force:false 会被跳过 -> 预览不关 -> 卡片强调 / 玻璃卡死释放不了）。
-    invoke("close_preview_window", { force: true }).catch((e) =>
-      console.debug("[usticky] close_preview_window failed", e),
-    );
-  }, PREVIEW_CLOSE_GRACE_MS);
+  previewCloseTimer = setTimeout(
+    () => {
+      previewCloseTimer = null;
+      if (previewTodoId !== id || previewPinnedId) return;
+      previewTodoId = null;
+      // force:true -- 能排到这里说明 previewPinnedId === null（非编辑态），强制
+      // 关安全，且绕过偶发的 is_focused 误判（focus 与 previewPinnedId 短暂错位
+      // 时 force:false 会被跳过 -> 预览不关 -> 卡片强调 / 玻璃卡死释放不了）。
+      invoke("close_preview_window", { force: true }).catch((e) =>
+        console.debug("[usticky] close_preview_window failed", e),
+      );
+    },
+    immediate ? 0 : PREVIEW_CLOSE_GRACE_MS,
+  );
 }
 
 /// 挂/摘 .card-hover，顺带冻结/解冻图片缩略图宽度。
@@ -1634,14 +1637,11 @@ async function init() {
       clearTimeout(hoverEnterTimer);
       hoverEnterTimer = null;
     }
-    // 玻璃：进浮窗永远 hover；离浮窗时若预览开着（鼠标正穿缝 card 与 preview
-    // 之间的 12px GAP），保持 hover 不摘 -- 预览是 todo 的一部分，穿缝是过渡
-    // 动作，不该闪一下 idle 让卡片变暗。预览真关（preview-closed）且鼠标仍
-    // 在外时才落 idle（见 preview-closed listener）。
-    const previewOpen = previewTodoId !== null && previewPinnedId === null;
-    if (e.payload || !previewOpen) {
-      setHoverAttr(e.payload);
-    }
+    // hover(false)：鼠标已离开浮窗 + 预览两窗 -> 立即摘玻璃 + 摘卡片强调 +
+    // 立即关预览（schedulePreviewClose(true)）。三者同帧，不再 grace 等折返
+    // （用户期望"马上消失"；原 450ms grace 让预览呆一会才关，与浮窗立即置底
+    // 错位 -- 浮窗已置底但卡片仍强调态）。
+    setHoverAttr(e.payload);
     // 回到浮窗 → 取消任何进行中的预览 grace close（穿缝/折返不闪断）
     if (e.payload) cancelPreviewClose();
     // 首次 hover 预热预览窗（隐藏创建，webview 提前加载完）→ 后续 dwell
@@ -1657,10 +1657,8 @@ async function init() {
     if (!e.payload) {
       setBtnHover(null);
       previewMouseInside = false;
-      // 预览开着时（鼠标正穿缝 card 与 preview 之间的 GAP）不摘卡片强调 --
-      // 预览是 todo 的一部分，穿缝是过渡。rustHoveredCardId 不清，让
-      // over_preview / 回卡时仍能正确跟手。预览真关时由 preview-closed 释放。
-      if (!previewOpen && rustHoveredCardId !== null) {
+      // hover(false) 立即摘当前 hover 卡的强调态（与浮窗降级、预览关闭同帧）。
+      if (rustHoveredCardId !== null) {
         const oldId = rustHoveredCardId;
         rustHoveredCardId = null;
         const old = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(oldId)}"]`);
@@ -1671,16 +1669,11 @@ async function init() {
       // 450ms 内穿缝进预览窗 / 折返浮窗都会 cancel；显式 pin（编辑中）
       // 时 schedule 内部守卫直接不排，窗口归 preview.ts 自治。
       cancelPreviewDwell();
-      schedulePreviewClose();
-      // 预览开着时把"浮窗降级"推后到 preview-closed 后：让窗口降级与预览消失 /
-      // 卡片失强调同帧（否则 hover(false) 立刻降级 -> 浮窗先沉底，预览走 450ms
-      // grace 才关 -> 用户看到"分两步"）。preview-closed listener 调
-      // release_window_lower 放行；1200ms 兜底防 preview-closed 漏发卡死。
-      if (previewOpen) {
-        invoke("suppress_window_lower", { ms: 1200 }).catch((e) =>
-          console.debug("[usticky] suppress_window_lower failed", e),
-        );
-      }
+      // hover(false) = 鼠标已离开浮窗 + 预览两窗（Rust 把 over_preview 也算
+      // inside，能收到 false 说明两窗都不在）-> 确定的"离开"，立即关预览
+      // （immediate=true 跳过 450ms grace）。与上面的摘玻璃 / 摘卡片强调同帧，
+      // 浮窗降级也在此刻（Rust emitter 同步降级）-> 三者同时发生。
+      schedulePreviewClose(true);
     }
   })
     .then((fn) => (unlistenHover = fn))
@@ -1963,11 +1956,6 @@ async function init() {
     previewMouseInside = false;
     cancelPreviewDwell();
     cancelPreviewClose();
-    // 放行浮窗降级（hover(false) 时推后的那条）-- 与下面的卡片强调 / 玻璃
-    // 释放同一帧，让"窗口降级 + 预览消失 + 卡片失强调"同时发生。
-    invoke("release_window_lower").catch((e) =>
-      console.debug("[usticky] release_window_lower failed", e),
-    );
     // 穿缝期间保留的玻璃 / 卡片强调在此刻释放：预览真关 + 鼠标仍不在浮窗
     // （floating-hover 早已 emit false，lastHoverPayload=false），落 idle +
     // 摘 .card-hover。鼠标在浮窗上时不动（lastHoverPayload=true），让
