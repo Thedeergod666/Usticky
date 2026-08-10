@@ -234,6 +234,12 @@ pub fn show_window_no_activate<R: Runtime>(app: &AppHandle<R>, label: &str) {
     }
 }
 
+/// 降级延迟（macOS 专有语义）-- Win 上 no-op。Win 的 z-order 是 best-effort
+/// 持续 re-assert（每 500ms TopMost），不像 macOS 有"hover(false) 立即降级"
+/// 的单点；前端调这个不影响 Win 行为。保留统一 API 形态。
+pub fn suppress_window_lower(_ms: u64) {}
+pub fn release_window_lower() {}
+
 // ── Quick-add 临时置顶 + 切回原应用 ──
 //
 // 跟 macOS 同套接口（详见 platform/macos.rs 顶部 doc）。Win 实现要点：

@@ -102,6 +102,46 @@ static LEVEL_SWITCHING_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// 兜底 / adopt 路径），都同步更新本原子。
 static LAST_INSIDE: AtomicBool = AtomicBool::new(false);
 
+/// **降级延迟**：hover(false) 时若预览开着，前端调 [`suppress_window_lower`]
+/// 把"浮窗降到 BELOW_NORMAL"推后到这个 deadline。preview-closed 后前端调
+/// [`release_window_lower`] 立即清掉（提前放行降级）。deadline 到期未释放
+/// 则 emitter 强制降级（防 preview-closed 漏发的兜底）。
+///
+/// 目的：让"窗口降级"、"预览窗消失"、"卡片失强调"三件事同帧发生。原实现
+/// hover(false) 立刻降级 -> 浮窗先沉底，预览窗走 450ms grace close 才关 ->
+/// 用户看到"分两步"。
+static SUPPRESS_LOWER_DEADLINE: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+
+fn suppress_lower_deadline() -> &'static Mutex<Option<std::time::Instant>> {
+    SUPPRESS_LOWER_DEADLINE.get_or_init(|| Mutex::new(None))
+}
+
+/// emitter 每 tick 调：是否当前处于降级抑制窗口内（deadline 未到）。
+fn is_window_lower_suppressed() -> bool {
+    let g = suppress_lower_deadline()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    matches!(*g, Some(deadline) if deadline > std::time::Instant::now())
+}
+
+/// 把"浮窗降级"推后 `ms` 毫秒。前端 hover(false)（预览开着）时调。
+pub fn suppress_window_lower(ms: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+    let mut g = suppress_lower_deadline()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *g = Some(deadline);
+}
+
+/// 立即放行降级（清抑制窗口）。前端 preview-closed 后调，让下一 tick
+/// emitter 降级与预览消失同帧。
+pub fn release_window_lower() {
+    let mut g = suppress_lower_deadline()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *g = None;
+}
+
 // ── 公开 API ──
 
 /// PinBottom 模式启动时调：把 level 切到 below-normal，并开启 hover 切 level。
@@ -526,14 +566,25 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                         }
                     }
 
-                    // (3) PinBottom 模式：同步切 NSWindow level
+                    // (3) PinBottom 模式：切 NSWindow level
+                    //
+                    // **降级延迟**：inside=false 时**不立即**降级到 BELOW_NORMAL。
+                    // 场景：hover todo -> hover 预览 -> 鼠标离开两窗。若 hover(false)
+                    // 立刻降级，浮窗会先沉底，而预览窗走 450ms grace close 才关 ->
+                    // 用户看到"置底"先于"预览消失/卡片失强调"（实测体感"分两步"）。
+                    // 期望三者同时：所以 hover(false) 时前端调 `suppress_window_lower`
+                    // 把降级推后，等预览真关（preview-closed）后调
+                    // `release_window_lower` 立即放行 -> 下一 tick emitter 降级，与
+                    // 预览消失/卡片失强调同一帧。
+                    //
+                    // raise 路径（inside=true）永不抑制：进浮窗必须立即顶起。
+                    // force_emit（pin mode 切换）也照常切 level。
                     if LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst) {
-                        let level = if inside {
-                            LEVEL_FLOATING
-                        } else {
-                            LEVEL_BELOW_NORMAL
-                        };
-                        set_window_level(&app, level, false);
+                        if inside {
+                            set_window_level(&app, LEVEL_FLOATING, false);
+                        } else if !is_window_lower_suppressed() {
+                            set_window_level(&app, LEVEL_BELOW_NORMAL, false);
+                        }
                     }
                 }
             })); // catch_unwind(inner closure) 收尾

@@ -42,6 +42,8 @@ mod plat {
     pub fn set_window_pin_bottom<R: Runtime>(_app: &AppHandle<R>) {}
     pub fn set_window_normal<R: Runtime>(_app: &AppHandle<R>) {}
     pub fn set_window_hover_raise<R: Runtime>(_app: &AppHandle<R>, _hovering: bool) {}
+    pub fn suppress_window_lower(_ms: u64) {}
+    pub fn release_window_lower() {}
     pub fn set_cursor_pointer_shape<R: Runtime>(_app: &AppHandle<R>, _pointer: bool) {}
     /// 显示窗口不抢激活：Linux 无私有 API，直接 show（WM 自行决定焦点策略）。
     pub fn show_window_no_activate<R: Runtime>(app: &AppHandle<R>, label: &str) {

@@ -1672,6 +1672,15 @@ async function init() {
       // 时 schedule 内部守卫直接不排，窗口归 preview.ts 自治。
       cancelPreviewDwell();
       schedulePreviewClose();
+      // 预览开着时把"浮窗降级"推后到 preview-closed 后：让窗口降级与预览消失 /
+      // 卡片失强调同帧（否则 hover(false) 立刻降级 -> 浮窗先沉底，预览走 450ms
+      // grace 才关 -> 用户看到"分两步"）。preview-closed listener 调
+      // release_window_lower 放行；1200ms 兜底防 preview-closed 漏发卡死。
+      if (previewOpen) {
+        invoke("suppress_window_lower", { ms: 1200 }).catch((e) =>
+          console.debug("[usticky] suppress_window_lower failed", e),
+        );
+      }
     }
   })
     .then((fn) => (unlistenHover = fn))
@@ -1954,6 +1963,11 @@ async function init() {
     previewMouseInside = false;
     cancelPreviewDwell();
     cancelPreviewClose();
+    // 放行浮窗降级（hover(false) 时推后的那条）-- 与下面的卡片强调 / 玻璃
+    // 释放同一帧，让"窗口降级 + 预览消失 + 卡片失强调"同时发生。
+    invoke("release_window_lower").catch((e) =>
+      console.debug("[usticky] release_window_lower failed", e),
+    );
     // 穿缝期间保留的玻璃 / 卡片强调在此刻释放：预览真关 + 鼠标仍不在浮窗
     // （floating-hover 早已 emit false，lastHoverPayload=false），落 idle +
     // 摘 .card-hover。鼠标在浮窗上时不动（lastHoverPayload=true），让
