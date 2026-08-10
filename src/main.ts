@@ -95,9 +95,19 @@ let rustHoveredCardId: string | null = null;
 /// 让原生 click 事件正常派发到这些按钮上。这是修复"完成/取消完成/删除
 /// 被拖拽吞掉"的关键配置（详见 sortableOpts 注释）。
 ///
+/// **不在这里放 `.todo-thumb`**：图片是 .todo-card flex 行的剩余空间占位
+/// （`flex: 1 1 0`，跟 .todo-title 1:1 各占一半宽；纯图 todo 占满整行），
+/// 用户在图片 visual 范围内 mousedown 期望能拖动整张卡。把 .todo-thumb
+/// 加进 filter 会让所有"压中图片区域"的拖动失效 —— 这是 v0.2.6 引入
+/// 内联缩略图后的回归（v0.2.5 之前 .todo-thumb 是 20×20 角标小图，
+/// 用户不会拿它当拖拽起点）。
+///
+/// 缩略图上的 `click` handler (`openPreviewPinned`) 仍 `stopPropagation`，
+/// 无位移点击 -> 聚焦预览窗；带位移的拖动 -> SortableJS 接管。
+///
 /// 未来新增"不应被 SortableJS 当作拖拽起点"的卡内控件（如优先级 chip、
 /// 标签按钮），只需把选择器追加到这条常量里。
-const NON_DRAGGABLE_SELECTORS = ".todo-check, .todo-delete, .todo-copy, .todo-edit-input, .todo-thumb";
+const NON_DRAGGABLE_SELECTORS = ".todo-check, .todo-delete, .todo-copy, .todo-edit-input";
 
 // 浮窗层级模式（pin_top / pin_bottom / normal）
 // 启动时从后端 get_pin_mode 拉，跟 usticky://pin-mode-changed 事件同步
