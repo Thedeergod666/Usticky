@@ -1012,7 +1012,7 @@ fn preview_position(
     mh: i32,
     anchor_sy: i32,
 ) -> (i32, i32) {
-    const GAP: i32 = 12;
+    const GAP: i32 = 4; // 浮窗与预览窗之间的横向缝隙（物理 px）。用户反馈 12 太大"有点缝"，收到 4。
     let y = anchor_sy.clamp(my, (my + mh - ph).max(my));
     // 左（默认）
     let left_x = fx - pw - GAP;
