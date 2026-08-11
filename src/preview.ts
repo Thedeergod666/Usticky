@@ -20,6 +20,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { t, initLocale, onLocaleChange, setLocale, getLocale } from "./i18n";
+import { mark as perfMark, endMeasure as perfMeasureEnd } from "./perf";
 import "./preview.css";
 
 interface TodoAttachment {
@@ -86,128 +87,73 @@ function attachmentUrl(file: string): string | null {
 
 // ── 渲染 ──
 
-function render(todo: Todo) {
-  currentTodo = todo;
-  appEl.innerHTML = "";
+/// S2：模块级骨架 refs。
+let skeletonBuilt = false;
+let panelEl: HTMLElement | null = null;
+let imageEl: HTMLImageElement | null = null;
+let textareaEl: HTMLTextAreaElement | null = null;
+let createdEl: HTMLElement | null = null;
+let hintEl: HTMLElement | null = null;
+let actionsEl: HTMLElement | null = null;
+let pinBtnEl: HTMLButtonElement | null = null;
+let copyBtnEl: HTMLButtonElement | null = null;
+let delBtnEl: HTMLButtonElement | null = null;
+let doneAtEl: HTMLElement | null = null;
 
+function ensureSkeleton() {
+  if (skeletonBuilt) return;
   const panel = document.createElement("div");
   panel.className = "preview-panel";
-
-  if (todo.attachment) {
-    const img = document.createElement("img");
-    img.className = "preview-image";
-    img.alt = todo.title;
-    img.draggable = false;
-    const url = attachmentUrl(todo.attachment.file);
-    if (url) img.src = url;
-    // 附件文件丢失 -> 图片区整体摘掉，留文本编辑区
-    img.addEventListener("error", () => img.remove());
-    panel.appendChild(img);
-  }
-
+  panelEl = panel;
   const textarea = document.createElement("textarea");
   textarea.className = "preview-text";
-  textarea.value = todo.title;
   textarea.spellcheck = false;
   textarea.maxLength = 114514;
+  textareaEl = textarea;
   panel.appendChild(textarea);
-
-  // ── 底部 footer（v0.2.4）：左 创建日期 ｜ 中 hint ｜ 右 [完成日期(done)]
-  // ＋ pin 按钮 ＋ 复制按钮 ＋ 垃圾桶删除按钮（二次确认同卡内） ──
   const footer = document.createElement("div");
   footer.className = "preview-footer";
-
   const created = document.createElement("span");
   created.className = "preview-date";
-  created.textContent = `${t("preview.created")} ${formatDate(todo.created_at)}`;
+  createdEl = created;
   footer.appendChild(created);
-
   const hint = document.createElement("div");
   hint.className = "preview-hint";
-  hint.textContent = hintRestingText();
+  hintEl = hint;
   footer.appendChild(hint);
-
   const actions = document.createElement("div");
   actions.className = "preview-actions";
-  if (todo.status === "done") {
-    const doneAt = document.createElement("span");
-    doneAt.className = "preview-date";
-    doneAt.textContent = `${t("preview.completed")} ${formatDate(todo.updated_at)}`;
-    actions.appendChild(doneAt);
-  }
-  // pin 按钮（复制键左侧）：
-  //   hover 预览 -> 点 = 提升为独立固定窗（promoteToPinned）。
-  //   固定窗 -> 恒 active，点 = 取消固定（closeSelf 关窗）。
+  actionsEl = actions;
   const pinBtn = document.createElement("button");
   pinBtn.className = "preview-action-btn preview-pin";
   pinBtn.innerHTML = PIN_ICON_SVG;
-  if (isPinned) {
-    pinBtn.classList.add("active");
-    pinBtn.setAttribute("aria-label", t("app.action.unpin"));
-    pinBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      closeSelf();
-    });
-  } else {
-    pinBtn.setAttribute("aria-label", t("app.action.pin"));
-    pinBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void promoteToPinned();
-    });
-  }
+  pinBtnEl = pinBtn;
   actions.appendChild(pinBtn);
   const copyBtn = document.createElement("button");
   copyBtn.className = "preview-action-btn";
-  copyBtn.setAttribute("aria-label", t("app.action.copy"));
   copyBtn.innerHTML = COPY_ICON_SVG;
-  copyBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    void copyTitle(hint);
-  });
+  copyBtnEl = copyBtn;
   actions.appendChild(copyBtn);
   const delBtn = document.createElement("button");
   delBtn.className = "preview-action-btn preview-delete";
-  delBtn.setAttribute("aria-label", t("app.action.delete"));
   delBtn.innerHTML = TRASH_ICON_SVG;
-  delBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    // 二次确认（同卡内删除语义）：第一次进确认态（实红），3s 内第二次
-    // 点击才真删；超时自动撤销。
-    if (delBtn.dataset.confirm === "1") {
-      void deleteSelf();
-    } else {
-      delBtn.dataset.confirm = "1";
-      setTimeout(() => delete delBtn.dataset.confirm, 3000);
-    }
-  });
+  delBtnEl = delBtn;
   actions.appendChild(delBtn);
   footer.appendChild(actions);
   panel.appendChild(footer);
-
   appEl.appendChild(panel);
-
-  // 输入 -> 防抖自动保存。外部 todos-changed 回填时（见 listener）
-  // 只在 textarea 未聚焦时覆盖，不打断正在输入的内容。
   textarea.addEventListener("input", () => {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       saveTimer = null;
-      void saveTitle(textarea.value, hint);
+      void saveTitle(textarea.value, hintEl);
     }, SAVE_DEBOUNCE_MS);
   });
-
-  // textarea focus -> emit preview-editing：浮窗据此设 previewPinnedId（编辑锁，
-  // hover 不抢内容）。这是唯一可靠的"编辑中"信号 —— 窗口聚焦 ≠ 编辑（点缩略图
-  // 看图也抢焦点，但不是编辑），textarea focus 才是。固定窗不 emit（独立于
-  // 浮窗 hover 状态机，不该挡 hover 换卡）。
   textarea.addEventListener("focus", () => {
     if (!isPinned && currentTodoId) {
       emit("usticky://preview-editing", { id: currentTodoId }).catch(() => {});
     }
   });
-
-  // 拖窗：panel 空白区 / 图片上 mousedown -> startDragging。
-  // textarea 放行（选中文本 / 聚焦编辑），hint 是文字也放行（无妨，可拖）。
   panel.addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
     const target = e.target as HTMLElement;
@@ -217,9 +163,102 @@ function render(todo: Todo) {
       console.debug("[preview] startDragging failed", err),
     );
   });
+  pinBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (isPinned) closeSelf();
+    else void promoteToPinned();
+  });
+  copyBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    void copyTitle(hintEl);
+  });
+  delBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (delBtn.dataset.confirm === "1") {
+      void deleteSelf();
+    } else {
+      delBtn.dataset.confirm = "1";
+      setTimeout(() => delete delBtn.dataset.confirm, 3000);
+    }
+  });
+  skeletonBuilt = true;
+}
+
+function render(todo: Todo) {
+  currentTodo = todo;
+  ensureSkeleton();
+  if (todo.attachment) {
+    if (!imageEl || !imageEl.isConnected) {
+      const img = document.createElement("img");
+      img.className = "preview-image";
+      img.alt = todo.title;
+      img.draggable = false;
+      img.addEventListener("error", () => {
+        img.remove();
+        imageEl = null;
+      });
+      panelEl!.insertBefore(img, textareaEl);
+      imageEl = img;
+    }
+    const url = attachmentUrl(todo.attachment.file);
+    if (url && imageEl.getAttribute("src") !== url) imageEl.src = url;
+    if (imageEl.alt !== todo.title) imageEl.alt = todo.title;
+  } else if (imageEl) {
+    imageEl.remove();
+    imageEl = null;
+  }
+  if (textareaEl) {
+    const focused = document.activeElement === textareaEl;
+    if (!focused && textareaEl.value !== todo.title) {
+      textareaEl.value = todo.title;
+    }
+  }
+  if (createdEl) {
+    createdEl.textContent = `${t("preview.created")} ${formatDate(todo.created_at)}`;
+  }
+  if (hintEl) {
+    const txt = hintEl.textContent ?? "";
+    if (txt === "" || txt === hintRestingText()) {
+      hintEl.textContent = hintRestingText();
+    }
+  }
+  if (todo.status === "done") {
+    if (!doneAtEl) {
+      const d = document.createElement("span");
+      d.className = "preview-date";
+      doneAtEl = d;
+      actionsEl!.insertBefore(d, pinBtnEl!);
+    }
+    doneAtEl.textContent = `${t("preview.completed")} ${formatDate(todo.updated_at)}`;
+  } else if (doneAtEl) {
+    doneAtEl.remove();
+    doneAtEl = null;
+  }
+  if (pinBtnEl) {
+    if (isPinned) {
+      pinBtnEl.classList.add("active");
+      pinBtnEl.setAttribute("aria-label", t("app.action.unpin"));
+    } else {
+      pinBtnEl.classList.remove("active");
+      pinBtnEl.setAttribute("aria-label", t("app.action.pin"));
+    }
+  }
+  if (copyBtnEl) copyBtnEl.setAttribute("aria-label", t("app.action.copy"));
+  if (delBtnEl) delBtnEl.setAttribute("aria-label", t("app.action.delete"));
 }
 
 function renderMissing() {
+  skeletonBuilt = false;
+  imageEl = null;
+  textareaEl = null;
+  createdEl = null;
+  hintEl = null;
+  actionsEl = null;
+  pinBtnEl = null;
+  copyBtnEl = null;
+  delBtnEl = null;
+  doneAtEl = null;
+  panelEl = null;
   appEl.innerHTML = "";
   const panel = document.createElement("div");
   panel.className = "preview-panel";
@@ -229,8 +268,6 @@ function renderMissing() {
   panel.appendChild(msg);
   appEl.appendChild(panel);
 }
-
-// ── 保存 ──
 
 async function saveTitle(value: string, hint?: HTMLElement | null) {
   const id = currentTodoId;
@@ -367,8 +404,11 @@ function closeSelf() {
 // ── 加载指定 todo ──
 
 async function loadTodo(id: string) {
+  perfMark("preview-load-start");
   try {
     const snap = await invoke<TodoSnapshot>("get_todos");
+    perfMark("preview-get-todos-end");
+    perfMeasureEnd("preview-get-todos", "preview-load-start", "preview-get-todos-end");
     const todo = snap.todos.find((x) => x.id === id);
     if (!todo) {
       renderMissing();
@@ -377,7 +417,11 @@ async function loadTodo(id: string) {
       return;
     }
     currentTodoId = id;
+    perfMark("preview-render-start");
     render(todo);
+    perfMark("preview-render-end");
+    perfMeasureEnd("preview-render", "preview-render-start", "preview-render-end");
+    perfMeasureEnd("preview-load-total", "preview-load-start");
   } catch (e) {
     console.error("[preview] get_todos failed", e);
     renderMissing();

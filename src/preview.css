@@ -39,8 +39,14 @@ html, body {
   gap: 10px;
   padding: 14px;
   background: var(--pv-bg);
-  backdrop-filter: blur(18px) saturate(150%);
-  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  /* **B1 fix（PERF_AUDIT.md）**：blur 18 → 12。WebKit 文档说 backdrop-filter
+   * 会增加 rendering passes，半径直接挂钩 GPU 成本。预览窗开启时与浮窗
+   * N 卡 blur 同时活跃，原 18px 在 100 卡 + 预览共存下 GPU 压力较大。
+   * 12px 视觉差异极小（半透深底 + 大半径时人眼已分不出 12 vs 18 边缘
+   * 锐度），Composite/Paint p95 应有可观测下降。视觉验收仍看眼，差异
+   * 可接受。Saturation 保留 150% 不动。 */
+  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
   border: 1px solid var(--pv-border);
   border-radius: 16px;
   box-shadow: var(--pv-shadow);

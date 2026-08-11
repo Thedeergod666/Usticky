@@ -775,7 +775,14 @@ pub fn persist_to_disk(path: &Path, data: &StoreData) -> Result<()> {
             .open(&tmp)
             .context("create tmp file")?;
 
-        let json = serde_json::to_vec_pretty(data).context("serialize")?;
+        // **B4 fix（PERF_AUDIT.md）**：pretty → compact —— 减小磁盘字节数 /
+        // 序列化时间。pretty 主要是给人看 / diff 用，Usticky 是单用户本地
+        // 工具，用户不直接 cat 这个文件。durability 不妥协：tmp 仍
+        // sync_all + rename + parent dir fsync（这三条是 v0.1.5 P2-2 fix
+        // 落地的，crash 后能恢复）。紧凑 JSON 不影响 fsync 的语义。
+        // **未做**：不在 reorder 路径 debounce（add / delete / restore 仍
+        // 立即持久化，crash 不能丢）。仅压缩序列化这步。
+        let json = serde_json::to_vec(data).context("serialize")?;
         f.write_all(&json).context("write tmp")?;
         f.sync_all().context("fsync tmp")?;
     }

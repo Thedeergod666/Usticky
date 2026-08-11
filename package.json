@@ -16,7 +16,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "icons": "python3 scripts/generate_icons.py"
+    "icons": "python3 scripts/generate_icons.py",
+    "perf:baseline": "node scripts/perf-baseline.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

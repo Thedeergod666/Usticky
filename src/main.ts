@@ -17,6 +17,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import Sortable from "sortablejs";
 import { t, initLocale, onLocaleChange, setLocale, getLocale } from "./i18n";
+import { mark as perfMark, endMeasure as perfMeasureEnd, dump as perfDump, clear as perfClear } from "./perf";
 import "./styles.css";
 
 // **P2-11 fix**：区分 Esc 来源。
@@ -488,6 +489,7 @@ function render(snap: TodoSnapshot) {
   // Enter 添加后 input 仍聚焦但已清空，此时 resize 是安全的，否则
   // "添加新 todo"永远等不到 resize（用户每次按 Enter 都被这里挡掉）。
   // **P2-2 fix**：用 isUserTyping() helper，涵盖 .todo-edit-input。
+  invalidateScrollable();
   if (!isUserTyping()) {
     void autoResizeWindow(snap);
   }
@@ -638,6 +640,12 @@ function buildTodoRow(todo: Todo): HTMLElement {
   // 每次 todos-changed 重绑 N×~8 监听器。监听器闭包只捕获稳定 todo.id，
   // click 时 lookupTodo(id) 查 lastRenderedSnap 拿当前真相（title / status
   // 可能已被外部变更刷新，闭包里的 todo 对象会 stale）。
+  //
+  // **A1 fix（PERF_AUDIT.md）**：原 10 个 per-card addEventListener 已**全部
+  // 移除**，改走 init() 末尾的 #app 委托（click / mouseover / mouseout 三
+  // 个）。N=100 时 buildTodoRow 路径少 1000 个匿名 listener + 闭包，闭包
+  // 不再捕获 id（id 现场从 dataset.todoId 查）。buildTodoRow 现在只管
+  // DOM 骨架创建 + dataset 写入，**不**挂任何 listener。
   const id = todo.id;
   const row = document.createElement("div");
   row.className = "todo-card";
@@ -645,11 +653,6 @@ function buildTodoRow(todo: Todo): HTMLElement {
 
   const check = document.createElement("div");
   check.className = "todo-check";
-  check.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const t = lookupTodo(id);
-    if (t) toggleDone(t);
-  });
   row.appendChild(check);
 
   const title = document.createElement("div");
@@ -657,11 +660,6 @@ function buildTodoRow(todo: Todo): HTMLElement {
   // 不挂原生 title= tooltip -- hover 停留 ~1-2s 后 macOS 弹白色小条，跟
   // QuickLook 预览窗视觉打架。长文预览统一走 dwell -> open_preview_window。
   // 单击进编辑态；不用 dblclick 避免"先点没反应"的体感。
-  title.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const t = lookupTodo(id);
-    if (t) enterEditMode(row, t);
-  });
   row.appendChild(title);
 
   const actions = document.createElement("div");
@@ -672,44 +670,13 @@ function buildTodoRow(todo: Todo): HTMLElement {
   // **P3-5 fix**：aria-label 让屏幕阅读器可读。不挂 title=（v0.2.1 规则：
   // 浮窗内不准原生 tooltip）。
   copyBtn.innerHTML = COPY_ICON_SVG;
-  copyBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const t = lookupTodo(id);
-    if (t) void copyTodoText(t);
-  });
   actions.appendChild(copyBtn);
 
   const del = document.createElement("button");
   del.className = "todo-delete";
   del.innerHTML = TRASH_ICON_SVG;  // v0.2.4：垃圾桶图标（原 "×" 文字）
-  del.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const t = lookupTodo(id);
-    if (!t) return;
-    // 二次确认：第一次点击只进入确认态（按钮变红），3s 内第二次点击才真删。
-    // 超时 / hover 结束自动撤销确认态。
-    if (del.dataset.confirm === "1") {
-      resetDeleteConfirm(t.id);
-      void deleteTodo(t);
-    } else {
-      armDeleteConfirm(t.id, del);
-    }
-  });
   actions.appendChild(del);
   row.appendChild(actions);
-
-  // 聚焦路径的按钮 hover 反馈（未聚焦路径由 hover-pos 驱动，见 setBtnHover）
-  for (const btn of [copyBtn, del]) {
-    btn.addEventListener("mouseenter", () => setBtnHover(btn));
-    btn.addEventListener("mouseleave", () => setBtnHover(null));
-  }
-
-  // 卡片 hover：挂 .card-hover（操作按钮显隐）+ 启动 QuickLook 预览 dwell
-  // （截断长文 / 图片卡），离开时收回。聚焦走这里的 mouseenter/leave，未聚焦
-  // 走 Rust hover-pos（同一对 hoverCard/unhoverCard，单一状态机，不依赖 CSS
-  // :hover -- 非 key window 的 WKWebView :hover 不可靠且会 stuck 残留）。
-  row.addEventListener("mouseenter", () => hoverCard(row));
-  row.addEventListener("mouseleave", () => unhoverCard(row));
 
   // 填可变内容（status class / check title / thumb / title text / due / aria）。
   // buildTodoRow 只调一次；后续 render 走 updateTodoRow 复用节点。
@@ -728,21 +695,54 @@ function lookupTodo(todoId: string): Todo | null {
 /// 就地更新行的可变内容。稳定骨架（check / title / actions + 监听器）只建
 /// 一次（buildTodoRow），updateTodoRow 只动文本 / 类名 / 可选子节点
 /// （thumb / due）。每次 render 对每条幸存 todo 调一次。
+///
+/// **A2 fix（PERF_AUDIT.md）**：旧实现每行 7 次 row.querySelector
+/// （check / title / thumb / actions / due / copy / del），N=100 时
+/// 每次 render 700 次选择器解析。改：稳定节点（check / title /
+/// actions / copy / del）首次 buildTodoRow 时一次性查好缓存到
+/// rowStableRefs 内部 slot，updateTodoRow 直接取。动态节点（thumb /
+/// due）按需 querySelector —— 它们的存在/缺失随 todo 内容变化，
+/// 缓存会 stale 不划算。
+interface RowStableRefs {
+  check: HTMLElement;
+  title: HTMLElement;
+  actions: HTMLElement;
+  copyBtn: HTMLElement;
+  delBtn: HTMLElement;
+}
+/// WeakMap：row 节点 GC 时自动清理，零手动管理。
+const rowStableRefs = new WeakMap<HTMLElement, RowStableRefs>();
+function getRowStableRefs(row: HTMLElement): RowStableRefs {
+  let refs = rowStableRefs.get(row);
+  if (!refs) {
+    refs = {
+      check: row.querySelector<HTMLElement>(".todo-check")!,
+      title: row.querySelector<HTMLElement>(".todo-title")!,
+      actions: row.querySelector<HTMLElement>(".todo-actions")!,
+      copyBtn: row.querySelector<HTMLElement>(".todo-copy")!,
+      delBtn: row.querySelector<HTMLElement>(".todo-delete")!,
+    };
+    rowStableRefs.set(row, refs);
+  }
+  return refs;
+}
 function updateTodoRow(row: HTMLElement, todo: Todo) {
   if (todo.status === "done") row.classList.add("done");
   else row.classList.remove("done");
   row.dataset.status = todo.status;
 
-  const check = row.querySelector<HTMLElement>(".todo-check");
+  const refs = getRowStableRefs(row);
+  const check = refs.check;
   if (check) {
     check.title = todo.status === "done" ? t("app.action.undo") : t("app.action.complete");
   }
 
-  const titleEl = row.querySelector<HTMLElement>(".todo-title");
+  const titleEl = refs.title;
 
   // 缩略图（check 与 title 之间）：attachment 有则建 / 更新 src，无则摘。
   // v0.2.6 图片附件内联：flex:1 1 0 跟 title 1:1 各占一半宽；无标题时
   // .todo-title:empty 折叠，图片独占整宽。GIF 原生动画，点击 -> 聚焦预览窗。
+  // thumb 是动态节点（attachment 来去），不缓存 —— 每次按需查
   let thumb = row.querySelector<HTMLImageElement>(".todo-thumb");
   if (todo.attachment) {
     if (!thumb) {
@@ -752,10 +752,8 @@ function updateTodoRow(row: HTMLElement, todo: Todo) {
       newThumb.draggable = false;
       newThumb.setAttribute("aria-label", t("app.action.preview"));
       newThumb.addEventListener("error", () => newThumb.remove());
-      newThumb.addEventListener("click", (e) => {
-        e.stopPropagation();
-        void openPreviewFromThumbClick(todo.id);
-      });
+      // **A1 fix**：thumb click 已删 —— 走 init() 末尾 #app 委托的
+      // click 监听器（target.closest(".todo-thumb") 命中）。
       // 插到 check 之后、title 之前（与旧 buildTodoRow 顺序一致）
       row.insertBefore(newThumb, titleEl);
       thumb = newThumb;
@@ -774,7 +772,8 @@ function updateTodoRow(row: HTMLElement, todo: Todo) {
   if (titleEl) titleEl.textContent = todo.title;
 
   // due 标签（title 与 actions 之间）：有则建 / 更新，无则摘
-  const actions = row.querySelector<HTMLElement>(".todo-actions");
+  const actions = refs.actions;
+  // due 动态节点，不缓存
   let due = row.querySelector<HTMLElement>(".todo-due");
   if (todo.due_at) {
     const { text, cls } = dueLabel(todo.due_at);
@@ -792,9 +791,9 @@ function updateTodoRow(row: HTMLElement, todo: Todo) {
   }
 
   // aria-label 随 locale 刷（onLocaleChange -> render -> updateTodoRow）
-  const copyBtn = row.querySelector<HTMLElement>(".todo-copy");
+  const copyBtn = refs.copyBtn;
   if (copyBtn) copyBtn.setAttribute("aria-label", t("app.action.copy"));
-  const delBtn = row.querySelector<HTMLElement>(".todo-delete");
+  const delBtn = refs.delBtn;
   if (delBtn) delBtn.setAttribute("aria-label", t("app.action.delete"));
 }
 
@@ -832,6 +831,7 @@ function renderEmptyState() {
 
   app.appendChild(empty);
 
+  invalidateScrollable();
   if (!app.querySelector<HTMLInputElement>(".todo-input input")?.matches(":focus")) {
     void autoResizeWindowToContent();
   }
@@ -839,9 +839,30 @@ function renderEmptyState() {
 
 // ── 自适应高度 ──
 
+/// **B3 fix（PERF_AUDIT.md）**：wheel handler 缓存 scrollHeight - clientHeight。
+/// 模块作用域（不在 init 内）—— render() / renderEmptyState() 在 init 外层
+/// 定义，调用 invalidateScrollable() 需可见。WeakMap 不能 clear，所以用
+/// 单值缓存 + 哨兵 -1，render/resize 触发 invalidate，下次 wheel 重新算。
+let cachedScrollable = -1;
+function invalidateScrollable() { cachedScrollable = -1; }
+function recomputeScrollable(): number {
+  const appEl = document.getElementById("app");
+  if (!appEl) return 0;
+  return Math.max(0, appEl.scrollHeight - appEl.clientHeight);
+}
+
 /// 卡片级 hover 态 class：Rust hover-pos 路径（未聚焦窗口收不到 CSS :hover）
 /// 命中的卡片挂上它，CSS 据此显示卡内操作按钮（复制 / 删除）。
 const CARD_HOVER_CLASS = "card-hover";
+
+/// **A1 fix（PERF_AUDIT.md）**：JS 路径（聚焦窗口）的当前 hover 卡片。
+/// Rust 路径另走 rustHoveredCardId（模块顶部）。两条路径互斥：
+///   - 浮窗聚焦：#app mouseover/mouseout 委托驱动 currentHoveredCardEl
+///   - 浮窗失焦：Rust hover-pos 走 rustHoveredCardId（init listener 维护）
+/// Rust 路径收到 hover(false) 时显式调 unhoverCard(currentHoveredCardEl) 清
+/// 聚焦路径残留（rustHoveredCardId 那个 listener 已实现），但聚焦路径
+/// 反向清 rustHoveredCardId 由 Rust 下一 tick inside=true 重置时自动覆盖。
+let currentHoveredCardEl: HTMLElement | null = null;
 
 // ── QuickLook 预览状态机（v0.2.1+ 即时跟手版） ──
 //
@@ -959,13 +980,29 @@ function schedulePreviewClose(immediate: boolean = false) {
 /// 的卡生效（文本卡无 thumb，no-op）。box-sizing:border-box -> offsetWidth 即
 /// flex-basis 值。所有 .card-hover 增删都走这条统一入口（hoverCard /
 /// unhoverCard / over_preview 三处），避免边沿漏解冻留 stale freeze。
+///
+/// **B2 fix（PERF_AUDIT.md）**：thumb.offsetWidth 读是强制同步布局的——
+/// 每次 hover 边沿都读两次（一次 `> 0` 判断，一次模板字面量）。Rust hover
+/// emitter 50ms tick 在边沿反复进出会触发 20Hz 的 layout flush 风险。
+/// 改：WeakMap 缓存每张卡的"无 actions 时的 thumb 宽"，首次 hover
+/// 测一次，后续 hover 复用。卡片被 GC（WeakMap 自动）后缓存自然清理。
+/// 缩略图宽仅在 render() 重建 / resize 时变化 —— 这两条路径下卡片是
+/// 全新节点，WeakMap 也是新条目，无需手动 invalidate。
+const thumbWidthCache = new WeakMap<HTMLElement, number>();
 function setCardHover(card: HTMLElement, on: boolean) {
   // 幂等：已在目标态就跳过（over_preview 每 50ms tick 重复调，避免反复
   // 读 offsetWidth 触发布局）。
   if (card.classList.contains(CARD_HOVER_CLASS) === on) return;
   const thumb = card.querySelector<HTMLElement>(".todo-thumb");
   if (on) {
-    if (thumb && thumb.offsetWidth > 0) {
+    if (thumb) {
+      // B2：缓存 thumb 宽，避免反复 hover 边沿触发 layout flush
+      let w = thumbWidthCache.get(card);
+      if (w === undefined) {
+        w = thumb.offsetWidth;  // 首次 hover 强制一次 layout 读
+        thumbWidthCache.set(card, w);
+      }
+      if (w > 0) {
       // 仅在有非空标题时冻结图片宽度：标题以省略号收缩给 actions 让位，
       // 图片保持原宽。纯图 todo（空标题）的 thumb 独占整宽，冻结到全宽后
       // actions 出现无处可放 -> 按钮被挤出卡片（用户反馈"图片宽度过大时
@@ -973,7 +1010,8 @@ function setCardHover(card: HTMLElement, on: boolean) {
       const title = card.querySelector<HTMLElement>(".todo-title");
       const hasTitle =
         !!title && title.textContent !== null && title.textContent.trim().length > 0;
-      if (hasTitle) thumb.style.flex = `0 0 ${thumb.offsetWidth}px`;
+        if (hasTitle) thumb.style.flex = `0 0 ${w}px`;
+      }
     }
     card.classList.add(CARD_HOVER_CLASS);
   } else {
@@ -1098,6 +1136,30 @@ async function resizeWindowToContent(appEl: HTMLElement) {
 }
 
 // ── 操作 ──
+/// **A3 fix（PERF_AUDIT.md）**：addTodo 改为乐观路径。
+///
+/// 旧实现 await add_todo 后才清 input —— IPC 往返 + fsync 期间
+/// （约 5-30ms，磁盘忙时更高）input 显示文字，体感"按下 Enter 后顿了
+/// 一下才清空"。新实现：本地立即插入 temp todo + 清 input，invoke 后台跑。
+/// 后端 emit todos-changed 会用真 todo 替换 temp；invoke 失败才回滚。
+/// 真正的 todo 工具掉电崩溃概率极低，丢最后一条的风险 vs 用户感知
+/// 顿挫的收益，倾向后者。`persist-failed` 事件作为兜底提示。
+function newTempTodo(title: string): Todo {
+  return {
+    id: `__temp__${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    title,
+    status: "pending",
+    priority: "P2",
+    created_at: Date.now(),
+    updated_at: Date.now(),
+    due_at: null,
+    tags: [],
+    // order 推到最末：避免真实 todo（order 从后端取）覆盖后位置跳变
+    order: Number.MAX_SAFE_INTEGER,
+    attachment: null,
+  };
+}
+
 async function addTodo(title: string): Promise<boolean> {
   const trimmed = title.trim();
   if (!trimmed) {
@@ -1108,11 +1170,31 @@ async function addTodo(title: string): Promise<boolean> {
     showMiniFlash(t("app.error.too_long", { max: 114514 }));
     return false;
   }
+  // A3：本地立即插入 temp todo，render 走 keyed diff 加到末尾。input 由调用方
+  // 在调 addTodo 之前已清空（Enter handler 已切到不 await 模式）。
+  const temp = newTempTodo(trimmed);
+  if (lastRenderedSnap) {
+    lastRenderedSnap = {
+      ...lastRenderedSnap,
+      todos: [...lastRenderedSnap.todos, temp],
+    };
+    render(lastRenderedSnap);
+  }
   try {
     await invoke("add_todo", { title: trimmed });
+    // 成功：后端 emit todos-changed 会用真 todo 替换 temp，**不**做额外
+    // 替换（避免双 render）。`persist-failed` listener 已显示 fsync 失败。
     return true;
   } catch (e) {
     console.error("[usticky] add_todo failed", e);
+    // 回滚：把 temp 从 lastRenderedSnap 摘掉，重 render
+    if (lastRenderedSnap) {
+      lastRenderedSnap = {
+        ...lastRenderedSnap,
+        todos: lastRenderedSnap.todos.filter((td) => td.id !== temp.id),
+      };
+      render(lastRenderedSnap);
+    }
     showMiniFlash(t("app.error.save_failed"));
     return false;
   }
@@ -1569,8 +1651,15 @@ function restoreSortableForCard(card: HTMLElement) {
 
 // ── 启动 ──
 async function init() {
+  // **Stage 4（PERF_AUDIT.md）**：冷启动打点起点。所有后续 perf mark
+  // 都以这个为基线，外部 baseline 脚本读 dump 文件换算 relative → absolute。
+  perfClear();
+  perfMark("boot-start");
+
   // i18n 必须在任何 t() 之前
   await initLocale();
+  perfMark("boot-locale");
+  perfMeasureEnd("boot-locale", "boot-start", "boot-locale");
   document.title = t("app.title");
 
   onLocaleChange(() => {
@@ -1667,6 +1756,7 @@ async function init() {
   wForFocus
     .onResized(() => {
       syncNarrowMode();
+      invalidateScrollable();
     })
     .then((fn) => (unlistenResized = fn))
     .catch((e) => console.error("[usticky] onResized failed", e));
@@ -1906,16 +1996,30 @@ async function init() {
   //
   // 频率 50ms × ~20Hz，每 tick 调一次 elementFromPoint。开销 ~微秒，
   // 不会触发任何 layout（elementFromPoint 走 hit test 不强制 reflow）。
+  // **S3 fix（PERF_AUDIT.md）**：listener 改为"存最新 payload + 排 rAF"，
+  // 真正处理挪到 processHoverPos() 单 rAF 消费。50ms tick 在 16ms 帧
+  // 边界偶发叠到 2 次 / 帧，旧实现直接跑 2 次 elementFromPoint；现在
+  // 折叠到 1 次 / 帧。静止 10 秒事件上限仍是 ~200，但 handler wall
+  // time 摊到帧边界（与本帧其它 layout 合并，不产生额外 layout pass）。
+  // **修正注释**：elementFromPoint 实际在 layout dirty 时**会**强制同步
+  // reflow（DOM Living Standard：getElementFromPoint spec 要求返回的
+  // 元素必须在当前 visual viewport 内可见，需要 layout box）—— 旧注释
+  // 说"不强制 reflow"是错的。rAF 合并后 elementFromPoint 仍可能触发
+  // layout，但与本帧其它渲染工作合并，不增加额外 layout pass。
   //
   // **激活判定**：hover-pos 只在 Rust 判定 inside=true 时才发送，收到即
   // 代表 hover 路径激活 —— 不需要 floating-hover 边沿事件先维护开关
   // （vite HMR 刷新后即便状态丢失，靠这里也能自愈，不用等鼠标重新进出）。
   let unlistenHoverPos: UnlistenFn | null = null;
 
-  listen<{ x: number; y: number; over_preview?: boolean }>(
-    "usticky://floating-hover-pos",
-    (e) => {
-    if (!pageVisible) return;
+  // S3：rAF 合并状态。listener 只写 latestHoverPos，processHoverPos 消费。
+  let latestHoverPos: { x: number; y: number; over_preview?: boolean } | null = null;
+  let hoverPosRafHandle: number | null = null;
+  function processHoverPos() {
+    hoverPosRafHandle = null;
+    const payload = latestHoverPos;
+    latestHoverPos = null;
+    if (!payload || !pageVisible) return;
     const appEl = document.getElementById("app");
     if (!appEl) return;
 
@@ -1929,7 +2033,7 @@ async function init() {
     // 注意这里**只**置
     // previewMouseInside（阻止自动关闭），不置 previewPinnedId ——
     // 路过预览窗不该把内容锁死，回到浮窗 hover 别的卡仍要跟上。
-    if (e.payload.over_preview) {
+    if (payload.over_preview) {
       previewMouseInside = true;
       cancelPreviewDwell();
       cancelPreviewClose();
@@ -1956,8 +2060,8 @@ async function init() {
     previewMouseInside = false;
 
     // payload 已是视口相对坐标（Rust 端换算），直接喂 elementFromPoint
-    const relX = e.payload.x;
-    const relY = e.payload.y;
+    const relX = payload.x;
+    const relY = payload.y;
     if (relX < 0 || relY < 0) {
       // Rust 报 inside=true 但坐标落在浮窗外（极少见，理论上 windowNumberAtPoint
       // 命中浮窗就一定在 frame 内），保守视为"没命中卡"。
@@ -1996,7 +2100,18 @@ async function init() {
     // 排 grace close（pinned / 鼠标在预览窗上时 schedule 内部守卫跳过；
     // 450ms 内 hover 到新卡会被 hoverCard cancel —— 跟手切换不闪断）。
     if (!newId) schedulePreviewClose();
-  })
+  }
+
+  listen<{ x: number; y: number; over_preview?: boolean }>(
+    "usticky://floating-hover-pos",
+    (e) => {
+      if (!pageVisible) return;
+      // S3：只存最新 payload，rAF 内折叠
+      latestHoverPos = e.payload;
+      if (hoverPosRafHandle === null) {
+        hoverPosRafHandle = requestAnimationFrame(processHoverPos);
+      }
+    })
     .then((fn) => (unlistenHoverPos = fn))
     .catch((e) => console.error("[usticky] listen floating-hover-pos failed", e));
 
@@ -2055,43 +2170,53 @@ async function init() {
   // 在拉 quick_add_shortcut 之前调，确保 hint 元素存在；拉到 shortcut 后再 updateInputHint 刷
   ensureInputBar();
 
-  // ── 启动时拉一次 quick-add 快捷键 —— input hint 用 ──
-  try {
-    currentShortcut = await invoke<string>("get_quick_add_shortcut");
-    // 用当前档位刷（窗口可能已经窄到 tier 2，hint 文字应是 '⌘⇧'）
-    updateInputHint(computeNarrowTier());
-  } catch (e) {
-    console.error("[usticky] get_quick_add_shortcut failed", e);
-  }
-
-  // ── 启动时拉一次 pin mode —— 必须在首次 render 之前完成，
-  //    否则 foot 的 pin-ctrl 会用默认 pin_top 渲染一次再被覆盖（视觉闪烁）。
+  // ── **S1 fix**（PERF_AUDIT.md）：启动 4 个串行 invoke 改 1 个 Promise.all + 1 个 get_todos ──
+  //
+  // 旧实现 4 个 await 串行排队（shortcut → pin_mode → attachments_dir → get_todos），
+  // locale 之后还要 ~4 个 IPC 往返头才能进首次 render。3 个配置读取彼此独立，
+  // 唯一硬依赖是 get_todos（驱动 render）必须最后。改 Promise.all 后临界路径
+  // 从 4 段串行压到 2 段（Promise.all + get_todos），节省 ~3 个 IPC 往返头。
+  //
+  // **attachments_dir 不能拖后**：buildTodoRow 给 <img> 挂 src 依赖它
+  // （v0.2.6 修复"首启粘贴图片显示空白框"根因之一）。Promise.all 三项必须在
+  // get_todos 之前全部 resolve。
+  //
+  // **副作用**：Promise.all catch 链不再走 console.error 走 flash，但 invoke
+  // 失败意味着后端没起来（极少见），启动就该有 console 痕迹；fallback 值保证
+  // 渲染不退化。
   let unlistenPinMode: UnlistenFn | null = null;
-  try {
-    currentPinMode = await invoke<PinMode>("get_pin_mode");
-  } catch (e) {
-    console.error("[usticky] get_pin_mode failed", e);
-  }
+  perfMark("invoke-parallel-start");
+  const [shortcut, pinMode, attDir] = await Promise.all([
+    invoke<string>("get_quick_add_shortcut")
+      .catch((e) => { console.error("[usticky] get_quick_add_shortcut failed", e); return "Cmd+Shift+Space"; }),
+    invoke<PinMode>("get_pin_mode")
+      .catch((e) => { console.error("[usticky] get_pin_mode failed", e); return "pin_bottom" as PinMode; }),
+    invoke<string>("get_attachments_dir")
+      .catch((e) => { console.error("[usticky] get_attachments_dir failed", e); return null; }),
+  ]);
+  perfMark("invoke-parallel-end");
+  perfMeasureEnd("invoke-parallel", "invoke-parallel-start", "invoke-parallel-end");
+  currentShortcut = shortcut;
+  currentPinMode = pinMode;
+  attachmentsDir = attDir;
+  // 用当前档位刷（窗口可能已经窄到 tier 2，hint 文字应是 '⌘⇧'）
+  updateInputHint(computeNarrowTier());
   // sync 到 body[data-pin-mode] —— CSS 据此在 PinBottom idle 进一步淡化 done 卡
   document.body.dataset.pinMode = currentPinMode;
 
-  // ── v0.2 附件目录：缩略图 / convertFileSrc 拼 URL 用，拉一次即可 ──
-  // **必须在首次 render 之前拿到**：buildTodoRow 给 <img> 挂 src 依赖
-  // attachmentsDir，若首次 render（下方 get_todos）先跑，已存在附件的 todo
-  // 首屏 <img> 无 src -> 空白框（v0.2.6 修复"粘贴图片显示空白框"根因之一）。
-  try {
-    attachmentsDir = await invoke<string>("get_attachments_dir");
-  } catch (e) {
-    console.error("[usticky] get_attachments_dir failed", e);
-  }
-
   // ── 启动时拉一次 snapshot ──
+  perfMark("invoke-todos-start");
   try {
     const snap = await invoke<TodoSnapshot>("get_todos");
+    perfMark("invoke-todos-end");
+    perfMeasureEnd("invoke-todos", "invoke-todos-start", "invoke-todos-end");
     render(snap);
+    perfMark("boot-first-render");
+    perfMeasureEnd("boot-total", "boot-start", "boot-first-render");
   } catch (e) {
     console.error("[usticky] get_todos failed", e);
     renderEmptyState();
+    perfMark("boot-first-render");
   }
   // pin mode 已稳定，绑定 hover-raise 监听（仅 PinBottom 模式实际挂）
   setupPinModeHoverRaise(currentPinMode);
@@ -2306,11 +2431,124 @@ async function init() {
   document.body.addEventListener("mouseenter", onBodyMouseEnterActive);
 
   // ── 事件代理：empty state CTA / due label click ──
-  app.addEventListener("click", async (e) => {
+  //
+  // **A1 fix（PERF_AUDIT.md）**：扩展为统一委托 —— empty state CTA +
+  // 卡片所有 click + mouseover/mouseout 全部从 buildTodoRow 移到这里。
+  // 旧实现每张 .todo-card 在 buildTodoRow 里挂 10 个 addEventListener
+  // （check / title / copy / del 各 1 click + copy / del 各 mouseenter +
+  // mouseleave + card mouseenter + mouseleave），N=100 时首屏 1000 个匿名
+  // listener + 闭包。委托到 #app 上 3 个 handler 后 N=1000 仍是 3 个。
+  //
+  // 委托约定：
+  //   - click：closest() 找最近 .todo-card / .focus-input / .todo-paste-btn，
+  //     按"具体 → 一般"优先级匹配（thumb > check > copy > del > title）
+  //   - mouseover：找 .todo-card 和按钮，target 切到新卡时转 hoverCard
+  //   - mouseout：relatedTarget 判定"真离开"（不在当前 card/btn 内）
+  //
+  // **mouseenter/mouseleave 不冒泡**，必须用 mouseover/mouseout + relatedTarget
+  // 判定 —— 这是委托的主要复杂度。换来 1000 减到 3 监听器 + 零闭包捕获 id
+  // （id 现场从 dataset.todoId 查）。
+  app.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;
+    if (!target) return;
+
+    // empty state CTA / focus-input
     if (target.closest(".focus-input")) {
       const input = app.querySelector<HTMLInputElement>(".todo-input input");
       if (input) input.focus();
+      return;
+    }
+
+    // 粘贴按钮（独立于卡片，input 旁）
+    if (target.closest(".todo-paste-btn")) {
+      e.stopPropagation();
+      void pasteFromClipboard();
+      return;
+    }
+
+    // 卡片相关点击：thumb > check > copy > del > title（按具体度优先级）
+    const card = target.closest<HTMLElement>(".todo-card");
+    if (!card) return;
+    const id = card.dataset.todoId;
+    if (!id) return;
+    const todo = lookupTodo(id);
+    if (!todo) return;
+
+    if (target.closest(".todo-thumb")) {
+      e.stopPropagation();
+      void openPreviewFromThumbClick(id);
+      return;
+    }
+    if (target.closest(".todo-check")) {
+      e.stopPropagation();
+      toggleDone(todo);
+      return;
+    }
+    if (target.closest(".todo-copy")) {
+      e.stopPropagation();
+      void copyTodoText(todo);
+      return;
+    }
+    if (target.closest(".todo-delete")) {
+      e.stopPropagation();
+      const del = target.closest<HTMLElement>(".todo-delete")!;
+      if (del.dataset.confirm === "1") {
+        resetDeleteConfirm(id);
+        void deleteTodo(todo);
+      } else {
+        armDeleteConfirm(id, del);
+      }
+      return;
+    }
+    if (target.closest(".todo-title")) {
+      e.stopPropagation();
+      enterEditMode(card, todo);
+      return;
+    }
+  });
+
+  // mouseover 委托：卡 / 按钮 hover 状态机
+  app.addEventListener("mouseover", (e) => {
+    const target = e.target as HTMLElement;
+    if (!target) return;
+
+    // 卡片 hover
+    const card = target.closest<HTMLElement>(".todo-card");
+    if (card && card !== currentHoveredCardEl) {
+      if (currentHoveredCardEl) unhoverCard(currentHoveredCardEl);
+      currentHoveredCardEl = card;
+      hoverCard(card);
+    }
+
+    // 按钮 hover（copy / del / paste）
+    const btn = target.closest<HTMLElement>(".todo-copy, .todo-delete, .todo-paste-btn");
+    if (btn) setBtnHover(btn);
+  });
+
+  // mouseout 委托：relatedTarget 判定"真离开"（不在当前 card/btn 内）
+  app.addEventListener("mouseout", (e) => {
+    const target = e.target as HTMLElement;
+    const related = e.relatedTarget as HTMLElement | null;
+    if (!target) return;
+
+    // 卡片 transition：当前 hover 卡是 target，且 related 不在卡内
+    const card = target.closest<HTMLElement>(".todo-card");
+    if (card && card === currentHoveredCardEl) {
+      if (!related || !card.contains(related)) {
+        unhoverCard(card);
+        currentHoveredCardEl = null;
+      }
+    }
+
+    // 按钮 transition：当前 hover 按钮是 target，且 related 不在按钮内
+    const btn = target.closest<HTMLElement>(".todo-copy, .todo-delete, .todo-paste-btn");
+    if (btn && btn === btnHoveredEl) {
+      if (!related || !btn.contains(related)) {
+        // 移到另一个按钮？让 mouseover 处理；移出整个按钮体系 → null
+        const newBtn = related?.closest<HTMLElement>(".todo-copy, .todo-delete, .todo-paste-btn");
+        if (!newBtn) setBtnHover(null);
+        // newBtn 由紧随的 mouseover 设
+      }
     }
   });
 
@@ -2338,8 +2576,10 @@ async function init() {
       pendingDeltaY = 0;
       return;
     }
+    // B3：flush 时也重算一次，捕获 wheel 事件到 flush 之间窗口的 layout 变更
+    const maxScroll = recomputeScrollable();
+    cachedScrollable = maxScroll;
     const before = appEl.scrollTop;
-    const maxScroll = appEl.scrollHeight - appEl.clientHeight;
     // clamp 到 [0, maxScroll]：超过停止位时把剩余 delta 丢进"被吸收"路径
     // （不传给外层，因为我们已经 preventDefault 了 —— 体感上等同于
     // "滚到顶/底后边滚动边阻力"）。
@@ -2347,10 +2587,8 @@ async function init() {
     pendingDeltaY = 0;
   };
   app.addEventListener("wheel", (e) => {
-    const appEl = document.getElementById("app");
-    if (!appEl) return;
-    const scrollable = appEl.scrollHeight - appEl.clientHeight;
-    if (scrollable <= 0) return;  // 没溢出 → 不拦，放过 wheel
+    if (cachedScrollable < 0) cachedScrollable = recomputeScrollable();
+    if (cachedScrollable <= 0) return;  // 没溢出 → 不拦，放过 wheel
     // 横滚也放过 —— #app 不能横滚，浮窗本身能横滚更不该
     if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
     e.preventDefault();
@@ -2389,6 +2627,23 @@ async function init() {
     document.body.removeEventListener("mouseenter", onPinBottomHoverEnter);
     document.body.removeEventListener("mouseleave", onPinBottomHoverLeave);
   });
+
+  // **Stage 4（PERF_AUDIT.md）**：冷启动测量落盘。USTICKY_PERF_OUT 由外部
+  // baseline 脚本（scripts/perf-baseline.ts）注入，普通用户运行下为空
+  // 字符串，dump 内部短路。await 不挡后续代码：dump 后浮窗继续常驻，
+  // 等待用户交互。
+  // 通过后端 get_perf_path 命令拿 runtime env（USTICKY_PERF_OUT）—— 比
+  // import.meta.env 更灵活，runtime 可注入不用重新构建。
+  void (async () => {
+    try {
+      const perfOut = await invoke<string | null>("get_perf_path");
+      if (perfOut) {
+        await perfDump(perfOut, { ready: Date.now(), version: "0.2.0" });
+      }
+    } catch (e) {
+      console.debug("[usticky] perf dump skipped:", e);
+    }
+  })();
 }
 
 /// PinBottom 模式挂 body mouseenter/mouseleave → 调 set_floating_hover_raise。
@@ -2441,17 +2696,14 @@ function ensureInputBar() {
   // v0.2 粘贴按钮：读剪贴板 → 文本/图片直接落成 pending todo。
   // 与 input 内 Cmd+V 的区别：粘贴按钮不要求浮窗聚焦（后端读剪贴板无焦点要求），
   // input Cmd+V 需浮窗聚焦（窗口为 key window 才派 paste）；v0.2.6 起两者都能粘图片。
-  const pasteBtn = bar.querySelector<HTMLButtonElement>(".todo-paste-btn")!;
-  pasteBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    void pasteFromClipboard();
-  });
+  // **A1 fix**：粘贴按钮 click 已删 —— 走 init() 末尾 #app 委托
+  // （target.closest(".todo-paste-btn") 命中）。原独立 listener 还在的
+  // 话会与委托双触发。
   // 手型光标 + hover 反馈：聚焦路径走这里的 mouseenter/leave（未聚焦路径
   // 由 hover-pos 的 btnHit 命中驱动 —— 选择器已含 .todo-paste-btn）。
   // 非聚焦 WKWebView 不更新 CSS cursor，setBtnHover → set_cursor_pointer
   // 是唯一的指针切换通道（v0.2.4 修复"直接 hover 粘贴键不变手型"）。
-  pasteBtn.addEventListener("mouseenter", () => setBtnHover(pasteBtn));
-  pasteBtn.addEventListener("mouseleave", () => setBtnHover(null));
+  // **A1 fix**：btn hover 也走委托（target.closest(".todo-copy, .todo-delete, .todo-paste-btn")）。
 
   const input = bar.querySelector<HTMLInputElement>("input")!;
   input.addEventListener("keydown", async (e) => {
@@ -2471,10 +2723,11 @@ function ensureInputBar() {
       // **P1-9 fix**：addTodo 失败时回填 input.value，保留用户输入。
       // addTodo 自身已包含持久化 + 失败 mini-flash。返回值: true=成功
       // 提交并清空，false=失败并保留 input 内容。
+      // **A3 fix**：先清空 input，再 await —— addTodo 内部已插 temp todo，
+      // 用户感知不到 IPC 往返。失败时回填。
+      input.value = "";
       const ok = await addTodo(trimmed);
-      if (ok) {
-        input.value = "";
-      } else {
+      if (!ok) {
         input.value = v;
       }
     } else if (e.key === "Escape") {

@@ -368,6 +368,19 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
             loop {
                 thread::sleep(Duration::from_millis(50));
 
+                // **B6 fix（PERF_AUDIT.md）**：窗口隐藏时跳过 Win32 hit-test。
+                // macOS 路径（platform/macos.rs）已天然有 is_visible gate，
+                // Win 这边漏了。隐藏态：鼠标不在窗口上，每 tick 跑
+                // GetCursorPos + WindowFromPoint + GetAncestor(GA_ROOT) 一次
+                // 完整 Win32 hit-test = pure waste。线程仍会按 50ms sleep
+                // 唤醒（不能写成 CPU 归零），但唤醒后立刻 continue，省掉
+                // hit-test + 应用 z-order。
+                if let Some(win) = &win_opt {
+                    if !win.is_visible().unwrap_or(false) {
+                        continue;
+                    }
+                }
+
                 let Some((raw_inside, over_preview, pt, rect)) = is_cursor_inside_floating(&app) else {
                     continue;
                 };

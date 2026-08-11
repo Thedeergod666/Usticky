@@ -701,7 +701,11 @@ pub struct PasteOutcome {
 }
 
 /// 附件目录绝对路径（前端 convertFileSrc 拼缩略图 / 预览图 URL 用）。
-/// 顺带 create_dir_all —— 首次粘贴前目录可能不存在。
+/// **B5 fix（PERF_AUDIT.md）**：移除 create_dir_all —— 纯返回路径，不触盘。
+/// 旧实现每次启动浮窗 init 调 get_attachments_dir 都跑一次 syscall，拖慢
+/// 启动且不必要（用户不粘图的话目录根本用不到）。实际写文件的入口
+/// （paste_from_clipboard 的 image 分支）仍保留 create_dir_all，确保首次
+/// 粘图时目录就位。
 #[tauri::command]
 pub async fn get_attachments_dir(store: State<'_, SharedStore>) -> Result<String, String> {
     let dir = store
@@ -709,7 +713,6 @@ pub async fn get_attachments_dir(store: State<'_, SharedStore>) -> Result<String
         .await
         .attachments_dir()
         .ok_or_else(|| rust_i18n::t!("commands.error.no_attachments_dir").to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create attachments dir: {e}"))?;
     Ok(dir.to_string_lossy().into_owned())
 }
 
@@ -1215,5 +1218,42 @@ pub async fn close_preview_window(app: AppHandle, force: Option<bool>) -> Result
         // 再 emit 一次，listener 幂等无副作用。
         let _ = app.emit("usticky://preview-closed", ());
     }
+    Ok(())
+}
+
+/// **Stage 4（PERF_AUDIT.md）**：性能埋点落盘。
+///
+
+/// 配套：get_perf_path 命令让 webview 拿到 USTICKY_PERF_OUT 运行时 env。
+/// Vite import.meta.env 走构建期注入，runtime env（Tauri 应用启动时设）
+/// 必须经 Rust 命令桥接。
+#[tauri::command]
+pub async fn get_perf_path() -> Option<String> {
+    std::env::var("USTICKY_PERF_OUT").ok().filter(|s| !s.is_empty())
+}
+
+/// 由 src/perf.ts 的 dump() 调：webview 收集完所有 performance.mark /
+/// performance.measure 后，把数据传过来写盘。**只**在 USTICKY_PERF_OUT
+/// 环境变量被设置时被外部 baseline 脚本（scripts/perf-baseline.ts）唤起，
+/// 普通用户运行下不会触发（perf.ts 内部短路 env 为空字符串的 dump 调用）。
+///
+/// 写盘走**原子写**（tmp + rename）—— 多 webview 几乎不会同时 dump
+/// （init 完成时只浮窗会调一次），但保险起见仍然走原子路径，避免半截
+/// JSON 让 baseline 脚本的 JSON.parse 抛错归零整次测量。
+#[tauri::command]
+pub async fn dump_perf(path: String, data: serde_json::Value) -> Result<(), String> {
+    use std::io::Write;
+    let target = std::path::PathBuf::from(&path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create parent: {e}"))?;
+    }
+    let tmp = target.with_extension("json.partial");
+    let json = serde_json::to_vec(&data).map_err(|e| e.to_string())?;
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
+        f.write_all(&json).map_err(|e| format!("write tmp: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync tmp: {e}"))?;
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| format!("atomic rename: {e}"))?;
     Ok(())
 }

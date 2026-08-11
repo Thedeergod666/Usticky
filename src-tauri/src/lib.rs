@@ -622,6 +622,8 @@ pub fn run() {
             commands::take_pending_preview_todo,
             commands::pin_preview,
             commands::close_pinned_preview,
+            commands::dump_perf,
+            commands::get_perf_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Usticky");
