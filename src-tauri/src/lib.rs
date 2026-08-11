@@ -279,6 +279,13 @@ pub fn quick_show_floating_window(app: &tauri::AppHandle, _store: &SharedStore) 
     QUICK_ADD_ACTIVE.store(true, Ordering::SeqCst);
     let _ = w.show();
     let _ = w.set_focus();
+    // **P4 perf fix**：通知 hover emitter 窗口已显示 → 恢复 tick。必须在 show()
+    // 之后调用，因为 emitter 下次 tick 会读 WINDOW_VISIBLE。
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering;
+        crate::platform::macos::WINDOW_VISIBLE.store(true, Ordering::SeqCst);
+    }
     let _ = app.emit("usticky://quick-add", ());
 }
 
@@ -308,6 +315,13 @@ pub fn hide_dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore)
     let was_active = QUICK_ADD_ACTIVE.swap(false, Ordering::SeqCst);
     if let Some(w) = app.get_webview_window("floating") {
         let _ = w.hide();
+    }
+    // **P4 perf fix**：通知 hover emitter 窗口已隐藏 → 跳过整个 tick（详见
+    // platform::macos::WINDOW_VISIBLE 注释）。
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering;
+        crate::platform::macos::WINDOW_VISIBLE.store(false, Ordering::SeqCst);
     }
     // v0.2：浮窗 hide 时预览窗口一并收掉 —— always-on-top 的预览留在
     // 屏幕上而宿主浮窗消失，是无依孤儿窗。
@@ -351,6 +365,12 @@ pub fn show_floating_window_normal(app: &tauri::AppHandle) {
     QUICK_ADD_ACTIVE.store(false, Ordering::SeqCst);
     let _ = w.show();
     let _ = w.set_focus();
+    // **P4 perf fix**：同 quick_show_floating_window —— 通知 hover emitter 恢复 tick。
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering;
+        crate::platform::macos::WINDOW_VISIBLE.store(true, Ordering::SeqCst);
+    }
     // **不** emit usticky://quick-add —— 那是"快捷键唤起"专用的视觉激活
     // 信号，普通 show 不该触发（避免用户从设置面板打开浮窗时意外触发
     // active 90s timeout 状态机）。

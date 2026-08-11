@@ -75,6 +75,24 @@ pub const LEVEL_FLOATING: CGWindowLevel = kCGFloatingWindowLevel;
 /// 不参与运行时控制 —— 真正想动行为请改 [`LEVEL_SWITCHING_ACTIVE`]。
 static TRACKER_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// **P4 perf fix**：浮动窗口可见性门控。hide_floating_window / tray toggle hide
+/// 时置 false；quick_show / show_normal / tray toggle show 时置 true。
+///
+/// 背景：hover emitter 默认 50ms tick + NSEvent.mouseLocation + run_on_main_thread
+/// 命中测试。每 tick 都在用户态 + main thread 做功。当浮窗被 hide() 后，WKWebView
+/// 不再合成隐藏窗口 -> 用户看不到 hover 状态 -> 所有 hover 检测对用户而言无意义。
+/// 但旧实现仍每 50ms 唤醒 main thread 做命中测试，纯属浪费。
+///
+/// 门控后：窗口隐藏时跳过整个 tick，只保留 50ms sleep（用户呼出时下一 tick 立刻
+/// 恢复——唤醒延迟不变）。同时重置状态机 last_inside / pending_ticks / pending_value，
+/// 避免隐藏期间累积的 stale "inside=true" 状态污染显示后第一帧。
+///
+/// 为什么不直接 thread::park + notify：park 需要另起一个唤醒通道，反而要写更多
+/// 跨线程状态。简单的"50ms sleep + is_visible 检查"开销低（一次 get_webview_window +
+/// is_visible），却完全避免了 run_on_main_thread dispatch。隐藏窗口的 WKWebView 路径
+/// 上，节约的开销远比多花的检查多。
+pub(crate) static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(true);
+
 /// **P2-5 fix**：强制下一 tick 强制 emit 一次当前 hover 状态。
 ///
 /// 场景：用户在 PinTop/Normal 模式时鼠标已在浮窗内 → 切到 PinBottom →
@@ -394,6 +412,19 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 
                 loop {
                     thread::sleep(Duration::from_millis(50));
+
+                    // **P4 perf fix**：浮动窗口隐藏时跳过整个 tick（hide_floating_window
+                    // / tray toggle / 失窗口关闭时设置 WINDOW_VISIBLE=false）。详见该
+                    // static 的注释：50ms sleep 保留作为快速唤醒 latency，跳过 NSEvent /
+                    // run_on_main_thread / 全部 emit。
+                    if !WINDOW_VISIBLE.load(Ordering::SeqCst) {
+                        // 重置状态机：隐藏期间不可知 inside 状态，唤醒时干净
+                        last_inside = false;
+                        pending_ticks = 0;
+                        pending_value = false;
+                        consecutive_dispatch_failures = 0;
+                        continue;
+                    }
 
                     let mouse = NSEvent::mouseLocation();
 

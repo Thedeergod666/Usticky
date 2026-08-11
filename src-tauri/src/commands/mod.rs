@@ -730,7 +730,18 @@ pub async fn paste_from_clipboard(
     store: State<'_, SharedStore>,
     title: Option<String>,
 ) -> Result<PasteOutcome, String> {
-    match crate::clipboard::read(&app) {
+    // **P5 perf fix**：clipboard::read 是同步重活（macOS NSPasteboard 原字节
+    // 镜像 / TIFF 解码转 PNG / RGBA->PNG 编码 / Finder 文件 slurp），4K 截图
+    // RGBA ~67MB 编码能跑几十~上百 ms。直接在 async command worker 上跑会
+    // 阻塞 Tauri 共享 IPC 池 -> 粘大图期间其它 invoke（get_todos / hover
+    // 相关）排队卡顿。挪到 spawn_blocking 专用线程，async 池立即让出。
+    let content = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        move || crate::clipboard::read(&app)
+    })
+    .await
+    .map_err(|e| format!("clipboard read: {e}"))?;
+    match content {
         crate::clipboard::ClipboardContent::Text(text) => {
             let title = validate_title(&text)?;
             let todo = {
