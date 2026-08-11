@@ -1465,7 +1465,17 @@ async function init() {
   let unlistenResized: UnlistenFn | null = null;
   wForFocus
     .onFocusChanged(({ payload: f }) => {
-      if (!f) setHoverAttr(false);
+      if (!f) {
+        // 预览开着且非编辑态时不摘玻璃 -- 浮窗失焦多半是 preview 抢了
+        // key（点缩略图 pinned:true 开预览），预览是 todo 的一部分，卡片
+        // 强调态该保持。与 onBodyMouseLeave 同款守卫（穿缝 GAP 不摘）。
+        // 否则点缩略图后浮窗失焦 -> 玻璃摘掉 -> floating-hover(true) 因
+        // dedup（lastHoverPayload 已 true）不重设 -> 玻璃卡 OFF，窗口仍
+        // always_on_top -> "依旧置顶但失强调"（用户反馈）。
+        // 预览关掉后 preview-closed / floating-hover(false) 按鼠标真实位置收尾。
+        if (previewTodoId !== null && previewPinnedId === null) return;
+        setHoverAttr(false);
+      }
     })
     .then((fn) => (unlistenFocusChanged = fn))
     .catch((e) => console.error("[usticky] onFocusChanged failed", e));

@@ -421,9 +421,12 @@ async function init() {
   const initialId = params.get("id");
   if (initialId) {
     await loadTodo(initialId);
-  } else {
-    renderMissing();
   }
+  // else: prewarm 创建的隐藏窗（URL 无 ?id=）-- **不**渲染 missing。
+  // prewarm 时窗隐藏无所谓，但 reuse 时 Rust 先 w.show() 后 emit
+  // preview-todo，show 到 loadTodo 完成（异步 IPC 往返）之间会闪现
+  // "该任务已不存在"。留空 appEl（窗 transparent）让闪现变透明 -> 内容，
+  // 不再误报 missing。真正的 missing 由 loadTodo 找不到 todo 时自己渲染。
 
   // 后端复用 hover 预览窗：emit 换 todo（hover 在卡间移动时复用同一预览窗）。
   // 固定窗 label 不同，收不到这个 emit（w.emit 只发给 "preview"），这里加
