@@ -2,7 +2,7 @@
 //
 // 渲染策略：增量 DOM diff（按 data-todo-id），避免 innerHTML 全量替换闪烁。
 // 设计要点（详见 AGENTS.md 第 3 节）：
-//   1. 绝不用 innerHTML 全量替换 → 走 buildTodoSkeleton + updateTodo diff
+//   1. 绝不用 innerHTML 全量替换 → 走 buildTodoRow + updateTodoRow diff
 //   2. #app.scrollHeight 自适应（不用 documentElement.scrollHeight，否则反馈环涨高）
 //   3. contentFingerprint 去重：数据刷新不动尺寸，只结构变化才 fit
 //   4. 拖拽 todo 行 ≠ 拖窗：mousedown target 检查 .todo-card 才让 SortableJS 处理
@@ -356,6 +356,48 @@ function dueLabel(dueAt: number): { text: string; cls: string } {
 }
 
 // ── 渲染 ──
+//
+// 渲染策略（v0.2.7 重写）：keyed diff 按 data-todo-id 复用 DOM 节点，不再
+// 每次 todos-changed 全量重建整棵 .todo-list。旧实现每次 render 都
+// oldList.remove() + 逐行 buildTodoRow（N×~8 监听器）+ 销毁重建两个 Sortable
+// 实例 -- todo 一多就卡。Musage 早已是增量渲染，这里对齐。
+//
+// 复用粒度：.todo-list / .todo-section-pending / .todo-section-done 三个容器
+// + 各自的 Sortable 实例跨 render 复用；行级按 id diff（建新 / 就地更新 /
+// 删孤儿 / 重排）。监听器只在新行 buildTodoRow 时挂一次，后续 render 走
+// updateTodoRow 只动文本 / 类名 / 可选子节点（thumb / due）。
+
+type SectionKind = "pending" | "done";
+
+/// SortableJS 选项（pending / done 两个 section 共用一份）。
+/// 提到模块作用域：keyed diff 后 section + Sortable 实例跨 render 复用，
+/// 不再每次 render new Sortable × 2。
+///
+/// 关键选项：
+///   - `forceFallback: true`：用 SortableJS 自己的 mousedown/move/up，不用
+///     HTML5 drag-and-drop。Tauri WKWebView + macOS 上 HTML5 dragstart 在拖出
+///     卡片边缘时被样式吃掉，onEnd 不触发 / 延迟；fallback 走纯鼠标事件 +
+///     ghost 元素，跨平台一致。
+///   - `ghostClass: "dragging"`：拖拽占位元素加 .dragging（半透明 + 微缩）。
+///   - `animation: 150`：松手后归位动画。
+///   - `onEnd: handleDragEnd`：发 reorder_todos IPC。
+///   - `filter: NON_DRAGGABLE_SELECTORS`：mousedown 命中这些选择器（check /
+///     delete / copy / edit-input）时 SortableJS 立即终止拖拽候选，不进
+///     .sortable-chosen 态 -- 修复"完成/删除被拖拽吞掉"。preventOnFilter: true
+///     让原生 click 仍能派发到按钮。
+const sortableOpts: Sortable.Options = {
+  animation: 150,
+  ghostClass: "dragging",
+  forceFallback: true,
+  fallbackOnBody: true,
+  filter: NON_DRAGGABLE_SELECTORS,
+  preventOnFilter: true,
+  onStart: () => { isDragging = true; },
+  onEnd: (evt) => {
+    isDragging = false;
+    void handleDragEnd(evt);
+  },
+};
 
 function render(snap: TodoSnapshot) {
   lastRenderedSnap = snap;
@@ -366,136 +408,83 @@ function render(snap: TodoSnapshot) {
     return;
   }
 
-  // 拖拽期间跳过一次重建，待 onEnd 后由 emit("todos-changed") 走下
-  // 一次 render 统一刷新。自己跟踪 `isDragging` 而不是读 SortableJS
-  // 的 `dragEl` —— forceFallback 下 dragEl 时序跟 DOM 事件不同步，
-  // 上一版用 `sortableInstances[i].dragEl` 偶尔会被 SortableJS 留在
-  // 旧状态卡住，导致后续 render 全部被挡。
+  // 拖拽期间跳过一次重建，待 onEnd 后由 emit("todos-changed") 走下一次
+  // render 统一刷新。自己跟踪 isDragging 而不是读 SortableJS 的 dragEl
+  // -- forceFallback 下 dragEl 时序跟 DOM 事件不同步，偶尔会被留在旧状态
+  // 卡住导致后续 render 全部被挡。
   if (isDragging) return;
 
-  // **P1-1 fix**：编辑模式期间跳过整窗重建。
-  // 外部 todos-changed 事件（设置面板切 pin mode / tray 菜单等链路）走
-  // render() 会把 .todo-edit-input 整个干掉 → 用户未保存输入直接丢。
-  // 编辑期间数据快照已存到 lastRenderedSnap；用户提交后下次 render 自然会
-  // 反映新 title，所以这里安全跳过。**不**刷新 isDragging/rustHoveredCardId
-  // 等次态（这些跟编辑态无冲突）。
+  // **P1-1 fix**：编辑模式期间跳过整窗重建。外部 todos-changed（设置面板
+  // 切 pin mode / tray 菜单等）走 render 会把 .todo-edit-input 干掉 ->
+  // 用户未保存输入直接丢。编辑期间快照已存到 lastRenderedSnap，用户提交
+  // 后下次 render 反映新 title，这里安全跳过。
   if (isEditing) return;
 
-  // **P1-7 fix**：render 重建 DOM 后重置 rustHoveredCardId。
-  //
-  // 旧实现只 hover-leave 时清空，render 重建后**不**重置。场景：
-  //   1. Rust 路径激活，hover 卡 A → rustHoveredCardId = "A"
-  //   2. 外部 todos-changed 触发 render，DOM 重建
-  //   3. 下一个 hover-pos 事件：`newId === rustHoveredCardId`（都是 "A"）→
-  //      短路 return，不调 hoverCard
-  //   4. 新建卡 A 永远进不了 hover 态（按钮不显 / 预览 dwell 不起），
-  //      直到鼠标移到别的卡
-  //
-  // 类似地（次要）isDragging 已由 cleanupSortables 清，这里不必重做。
-  rustHoveredCardId = null;
-  // render 重建后卡在 DOM 里的 hover 态丢失，dwell 中的预览若仍指向
-  // 旧卡 id 也无害（open_preview_window 按 id 工作，与 DOM 节点无关）。
-  cancelPreviewDwell();
+  // **keyed diff**：不再 reset rustHoveredCardId / cancelPreviewDwell。
+  // 旧全量重建这两步是因为重建后 DOM 节点全换：rustHoveredCardId 指向的旧
+  // 节点已死（P1-7），dwell 闭包捕获的 card 也 detached（开预览会拿 0 坐标）。
+  // 现在节点复用 -> rustHoveredCardId 仍指向同一个幸存节点，dwell 闭包的
+  // card 也在 DOM 里 -- 两者都还有效，保留即可，hover 态跨 render 不再闪断
+  // （actions 按钮不会每次 CRUD 闪一下）。唯一要清的是被删 / 跨 section
+  // 移走的卡（孤儿），在 diffSection / removeSection 摘节点时就地 reset。
 
-  // 清掉旧内容（保留 input / foot）
-  cleanupSortables();
-  const oldList = app.querySelector<HTMLElement>(".todo-list");
-  if (oldList) oldList.remove();
-  // 切到非空时把空态引导页摘掉
-  app.querySelector<HTMLElement>(".empty-state")?.remove();
-
-  const list = document.createElement("div");
-  list.className = "todo-list";
-  list.style.display = "flex";
-  list.style.flexDirection = "column";
-  list.style.gap = "6px";
+  // 确保 .todo-list 骨架存在（首启 / 从空态回来时建）
+  let list = app.querySelector<HTMLElement>(".todo-list");
+  if (!list) {
+    app.querySelector<HTMLElement>(".empty-state")?.remove();
+    list = document.createElement("div");
+    list.className = "todo-list";
+    list.style.display = "flex";
+    list.style.flexDirection = "column";
+    list.style.gap = "6px";
+    app.appendChild(list);
+  }
 
   const pending = snap.todos.filter((t) => t.status === "pending");
   const done = snap.todos.filter((t) => t.status === "done");
 
+  // pending header：始终保留一个元素，文本随 count / 空态切换
+  let pendingHeader = list.querySelector<HTMLElement>(
+    ".section-header:not(.section-header-done)",
+  );
+  if (!pendingHeader) {
+    pendingHeader = document.createElement("div");
+    pendingHeader.className = "section-header";
+    list.appendChild(pendingHeader);
+  }
+  pendingHeader.textContent = pending.length > 0
+    ? `${t("app.section.pending")} · ${pending.length}`
+    : t("app.empty.pending");
+
+  // pending section + 行 diff
   if (pending.length > 0) {
-    const header = document.createElement("div");
-    header.className = "section-header";
-    header.textContent = `${t("app.section.pending")} · ${pending.length}`;
-    list.appendChild(header);
-    const ul = document.createElement("div");
-    ul.className = "todo-section todo-section-pending";
-    ul.style.display = "flex";
-    ul.style.flexDirection = "column";
-    ul.style.gap = "6px";
-    for (const todo of pending) ul.appendChild(buildTodoRow(todo));
-    list.appendChild(ul);
+    const section = ensureSection(list, "pending");
+    diffSection(section, pending);
   } else {
-    const empty = document.createElement("div");
-    empty.className = "section-header";
-    empty.textContent = t("app.empty.pending");
-    list.appendChild(empty);
+    removeSection("pending");
   }
 
+  // done header + section
+  let doneHeader = list.querySelector<HTMLElement>(".section-header-done");
   if (done.length > 0) {
-    const header = document.createElement("div");
-    // 多加 .section-header-done —— idle（未 hover）下 CSS 把这条 header
-    // 完全透明（包括 "DONE · N" 文字），让 done 区块在浮窗静止时彻底
-    // "折叠"到背景里（标题文字也已划掉且弱化，header 自身再隐藏
-    // = 完成区几乎只剩几道勾圈痕迹）。hover 时回归可见。
-    header.className = "section-header section-header-done";
-    header.textContent = `${t("app.section.done")} · ${done.length}`;
-    list.appendChild(header);
-    const ul = document.createElement("div");
-    ul.className = "todo-section todo-section-done";
-    ul.style.display = "flex";
-    ul.style.flexDirection = "column";
-    ul.style.gap = "6px";
-    for (const todo of done) ul.appendChild(buildTodoRow(todo));
-    list.appendChild(ul);
+    if (!doneHeader) {
+      doneHeader = document.createElement("div");
+      doneHeader.className = "section-header section-header-done";
+      list.appendChild(doneHeader);
+    }
+    doneHeader.textContent = `${t("app.section.done")} · ${done.length}`;
+    const section = ensureSection(list, "done");
+    diffSection(section, done);
+  } else {
+    doneHeader?.remove();
+    removeSection("done");
   }
 
-  app.appendChild(list);
+  // 维持 .todo-list 子节点顺序：pendingHeader, pendingSection, doneHeader, doneSection
+  orderListChildren(list);
 
-  // 挂 SortableJS。
-  //
-  // 关键选项：
-  //   - `forceFallback: true`：用 SortableJS 自己的 mousedown/move/up
-  //     实现，不用 HTML5 drag-and-drop。原因：Tauri WKWebView + macOS
-  //     上 HTML5 dragstart 在拖出卡片边缘时被 `-webkit-user-drag` /
-  //     `cursor: grab` 等样式吃掉，导致 `onEnd` 不触发 / 延迟触发；
-  //     fallback 路径走纯鼠标事件 + ghost 元素，跨平台一致。
-  //   - `ghostClass: "dragging"`：拖拽时占位元素加 `.dragging` class，
-  //     styles.css 把它设成半透明 + 微缩，提醒用户"这张是 ghost"。
-  //   - `animation: 150`：松手后归位动画（CSS transform）。
-  //   - `onEnd: handleDragEnd`：发 reorder_todos IPC。
-  //   - `filter: NON_DRAGGABLE_SELECTORS`：在 mousedown 阶段如果 target 命中这些
-  //     选择器，SortableJS 立即终止当前拖拽候选，**不**进入 `.sortable-chosen`
-  //     态。这是修复"完成/取消完成/删除被吞"的关键：原版 SortableJS 在
-  //     mousedown 阶段会 preventDefault 后续 click 事件，且把整个 .todo-card
-  //     切到 chosen 态（即便用户其实是想点 check/delete 按钮）。filter 让
-  //     SortableJS 在按钮 mousedown 时直接放手，click 正常派发到按钮。
-  //   - `preventOnFilter: true`：命中 filter 时让原生事件继续走（click 仍能
-  //     派发到 checkbox / delete），而不是被 SortableJS 拦死。
-  const sortableOpts: Sortable.Options = {
-    animation: 150,
-    ghostClass: "dragging",
-    forceFallback: true,
-    fallbackOnBody: true,
-    filter: NON_DRAGGABLE_SELECTORS,
-    preventOnFilter: true,
-    onStart: () => { isDragging = true; },
-    onEnd: (evt) => {
-      isDragging = false;
-      void handleDragEnd(evt);
-    },
-  };
-  const pendingSection = list.querySelector<HTMLElement>(".todo-section-pending");
-  if (pendingSection) {
-    sortableInstances.push(new Sortable(pendingSection, sortableOpts));
-  }
-  const doneSection = list.querySelector<HTMLElement>(".todo-section-done");
-  if (doneSection) {
-    sortableInstances.push(new Sortable(doneSection, sortableOpts));
-  }
-
-  // 输入中禁止 autoResize —— scrollHeight 跳变会打断输入（AGENTS.md #18）
-  // 但"输入中"的判定是 input 有内容（正在打字），不是聚焦本身 ——
+  // 输入中禁止 autoResize -- scrollHeight 跳变会打断输入（AGENTS.md #18）
+  // 但"输入中"的判定是 input 有内容（正在打字），不是聚焦本身 --
   // Enter 添加后 input 仍聚焦但已清空，此时 resize 是安全的，否则
   // "添加新 todo"永远等不到 resize（用户每次按 Enter 都被这里挡掉）。
   // **P2-2 fix**：用 isUserTyping() helper，涵盖 .todo-edit-input。
@@ -504,92 +493,206 @@ function render(snap: TodoSnapshot) {
   }
 }
 
+/// 拿或建某 section。keyed diff 下 section + Sortable 实例跨 render 复用，
+/// 不再每次 render 重建。
+function ensureSection(list: HTMLElement, kind: SectionKind): HTMLElement {
+  const sel = kind === "pending" ? ".todo-section-pending" : ".todo-section-done";
+  let section = list.querySelector<HTMLElement>(sel);
+  if (!section) {
+    section = document.createElement("div");
+    section.className = kind === "pending"
+      ? "todo-section todo-section-pending"
+      : "todo-section todo-section-done";
+    section.style.display = "flex";
+    section.style.flexDirection = "column";
+    section.style.gap = "6px";
+    list.appendChild(section);
+    sortableInstances.push(new Sortable(section, sortableOpts));
+  }
+  return section;
+}
+
+/// section 为空时拆掉（连 Sortable 实例一起 destroy）。
+function removeSection(kind: SectionKind) {
+  const sel = kind === "pending" ? ".todo-section-pending" : ".todo-section-done";
+  const section = app.querySelector<HTMLElement>(sel);
+  if (!section) return;
+  // section 整体摘除前：若当前 hover 卡在其中，reset hover + 取消 dwell
+  // （dwell 闭包捕获的 row 节点随 section 一起 detached，不取消会拿 0 坐标
+  // 开预览）。这跟 diffSection 的孤儿处理是同一回事的"整段"版。
+  forgetHoverInSection(section);
+  const idx = sortableInstances.findIndex((s) => (s as any).el === section);
+  if (idx >= 0) {
+    sortableInstances[idx].destroy();
+    sortableInstances.splice(idx, 1);
+  }
+  section.remove();
+}
+
+/// 若 id 正是当前 hover 卡 -> reset hover + 取消 dwell（该节点要被摘掉）。
+/// 用于 diffSection 的孤儿摘除。
+function forgetHoverForId(id: string) {
+  if (rustHoveredCardId === id) {
+    rustHoveredCardId = null;
+    cancelPreviewDwell();
+  }
+}
+
+/// section 整体摘除前调：hover 卡在其中就 reset（query descendant）。
+function forgetHoverInSection(container: HTMLElement) {
+  if (!rustHoveredCardId) return;
+  const hovered = container.querySelector<HTMLElement>(
+    `.todo-card[data-todo-id="${cssEscape(rustHoveredCardId)}"]`,
+  );
+  if (hovered) {
+    rustHoveredCardId = null;
+    cancelPreviewDwell();
+  }
+}
+
+/// 维持 .todo-list 四个子节点（部分可选）的固定顺序。
+/// section / header 随空态增删后位置可能错，末尾统一挪正。
+function orderListChildren(list: HTMLElement) {
+  const pendingHeader = list.querySelector<HTMLElement>(
+    ".section-header:not(.section-header-done)",
+  );
+  const pendingSection = list.querySelector<HTMLElement>(".todo-section-pending");
+  const doneHeader = list.querySelector<HTMLElement>(".section-header-done");
+  const doneSection = list.querySelector<HTMLElement>(".todo-section-done");
+  const order = [pendingHeader, pendingSection, doneHeader, doneSection];
+  let anchor: HTMLElement | null = null;
+  for (const el of order) {
+    if (!el) continue;
+    if (anchor) {
+      if (anchor.nextSibling !== el) list.insertBefore(el, anchor.nextSibling);
+    } else {
+      if (list.firstChild !== el) list.insertBefore(el, list.firstChild);
+    }
+    anchor = el;
+  }
+}
+
+/// section 内按 data-todo-id 做 keyed diff：
+///   1. 收集现有行（按 id）
+///   2. 逐条 snap todo：命中 -> 复用 + updateTodoRow；未命中 -> buildTodoRow
+///      + 插到 anchor 之后
+///   3. 摘孤儿（snap 里没有的）-- 孤儿若是当前 hover 卡就 reset
+///   4. 顺序变了 -> 按 snap 顺序挪（快速路径：顺序一致跳过）
+function diffSection(section: HTMLElement, todos: Todo[]) {
+  const existing = new Map<string, HTMLElement>();
+  section.querySelectorAll<HTMLElement>(".todo-card").forEach((el) => {
+    const id = el.dataset.todoId;
+    if (id) existing.set(id, el);
+  });
+
+  let anchor: HTMLElement | null = null;
+  for (const todo of todos) {
+    let row = existing.get(todo.id);
+    if (row) {
+      existing.delete(todo.id);
+    } else {
+      row = buildTodoRow(todo);
+      if (anchor) {
+        section.insertBefore(row, anchor.nextSibling);
+      } else {
+        section.insertBefore(row, section.firstChild);
+      }
+    }
+    updateTodoRow(row, todo);
+    anchor = row;
+  }
+
+  // 摘孤儿。若孤儿正是当前 hover 卡 -> reset hover + 取消 dwell
+  // （节点没了，dwell 闭包的 card 会变 detached）。
+  for (const orphan of existing.values()) {
+    const orphanId = orphan.dataset.todoId;
+    if (orphanId) forgetHoverForId(orphanId);
+    orphan.remove();
+  }
+
+  // 重排（快速路径：顺序一致就跳过，不触发 reflow）
+  const expected = todos.map((td) => td.id).join("|");
+  const actual = [...section.querySelectorAll<HTMLElement>(".todo-card")]
+    .map((el) => el.dataset.todoId ?? "").join("|");
+  if (expected !== actual) {
+    let reorderAnchor: HTMLElement | null = null;
+    for (const todo of todos) {
+      const row = section.querySelector<HTMLElement>(
+        `.todo-card[data-todo-id="${cssEscape(todo.id)}"]`,
+      );
+      if (!row) continue;
+      if (reorderAnchor == null) {
+        if (row !== section.firstChild) section.insertBefore(row, section.firstChild);
+      } else {
+        const desiredNext: Node | null = reorderAnchor.nextSibling;
+        if (row !== desiredNext) section.insertBefore(row, desiredNext);
+      }
+      reorderAnchor = row;
+    }
+  }
+}
+
 function buildTodoRow(todo: Todo): HTMLElement {
+  // **keyed diff**：buildTodoRow 只在"新行"（snap 里新出现的 id）时调一次。
+  // 监听器只在这里挂一次，后续 render 走 updateTodoRow 复用节点 -- 不再
+  // 每次 todos-changed 重绑 N×~8 监听器。监听器闭包只捕获稳定 todo.id，
+  // click 时 lookupTodo(id) 查 lastRenderedSnap 拿当前真相（title / status
+  // 可能已被外部变更刷新，闭包里的 todo 对象会 stale）。
+  const id = todo.id;
   const row = document.createElement("div");
-  row.className = `todo-card${todo.status === "done" ? " done" : ""}`;
-  row.dataset.todoId = todo.id;
-  row.dataset.status = todo.status;
+  row.className = "todo-card";
+  row.dataset.todoId = id;
 
   const check = document.createElement("div");
   check.className = "todo-check";
-  check.title = todo.status === "done" ? t("app.action.undo") : t("app.action.complete");
   check.addEventListener("click", (e) => {
     e.stopPropagation();
-    toggleDone(todo);
+    const t = lookupTodo(id);
+    if (t) toggleDone(t);
   });
   row.appendChild(check);
 
-  // v0.2.6 图片附件内联缩略图：check 与 title 之间。flex:1 1 0 跟 title 1:1
-  // 各占一半宽；无标题时 .todo-title:empty 折叠，图片独占整宽。高度一行不变。
-  // GIF 原生动画，点击 -> 聚焦预览窗看全图。加载失败摘节点不留裂图。
-  if (todo.attachment) {
-    const thumb = document.createElement("img");
-    thumb.className = "todo-thumb";
-    thumb.alt = "";
-    thumb.draggable = false;
-    const url = attachmentUrl(todo.attachment.file);
-    if (url) thumb.src = url;
-    thumb.setAttribute("aria-label", t("app.action.preview"));
-    thumb.addEventListener("error", () => thumb.remove());
-    thumb.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void openPreviewFromThumbClick(todo.id);
-    });
-    row.appendChild(thumb);
-  }
-
   const title = document.createElement("div");
   title.className = "todo-title";
-  title.textContent = todo.title;
-  // 注意：不挂原生 title= tooltip —— hover 停留 ~1-2s 后 macOS 弹白色
-  // 小条，跟 QuickLook 预览窗视觉打架（用户误报"有时显示小弹窗"）。
-  // 长文预览统一走 dwell → open_preview_window。
-  // 点击 title 区域进入编辑态（不要影响 .todo-check / .todo-delete 上的
-  // 完成/删除按钮 —— 它们各自 stopPropagation 已在上面挂好）。
-  // 单击即触发；不用 dblclick，避免"先点没反应"的体感。
+  // 不挂原生 title= tooltip -- hover 停留 ~1-2s 后 macOS 弹白色小条，跟
+  // QuickLook 预览窗视觉打架。长文预览统一走 dwell -> open_preview_window。
+  // 单击进编辑态；不用 dblclick 避免"先点没反应"的体感。
   title.addEventListener("click", (e) => {
     e.stopPropagation();
-    enterEditMode(row, todo);
+    const t = lookupTodo(id);
+    if (t) enterEditMode(row, t);
   });
   row.appendChild(title);
-
-  if (todo.due_at) {
-    const due = document.createElement("div");
-    const { text, cls } = dueLabel(todo.due_at);
-    due.className = `todo-due ${cls}`;
-    due.textContent = text;
-    row.appendChild(due);
-  }
 
   const actions = document.createElement("div");
   actions.className = "todo-actions";
 
   const copyBtn = document.createElement("button");
   copyBtn.className = "todo-copy";
-  // **P3-5 fix**：aria-label 让屏幕阅读器可读。SVG 内部去掉了
-  // aria-hidden（见 COPY_ICON_SVG 定义），让父按钮的 aria-label 生效。
-  // 注意：不挂 title= —— v0.2.1 规则：浮窗内不准用原生 tooltip。
-  copyBtn.setAttribute("aria-label", t("app.action.copy"));
+  // **P3-5 fix**：aria-label 让屏幕阅读器可读。不挂 title=（v0.2.1 规则：
+  // 浮窗内不准原生 tooltip）。
   copyBtn.innerHTML = COPY_ICON_SVG;
   copyBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    void copyTodoText(todo);
+    const t = lookupTodo(id);
+    if (t) void copyTodoText(t);
   });
   actions.appendChild(copyBtn);
 
   const del = document.createElement("button");
   del.className = "todo-delete";
-  del.setAttribute("aria-label", t("app.action.delete"));
   del.innerHTML = TRASH_ICON_SVG;  // v0.2.4：垃圾桶图标（原 "×" 文字）
   del.addEventListener("click", (e) => {
     e.stopPropagation();
-    // 二次确认：第一次点击只进入确认态（按钮变红），3s 内第二次点击
-    // 才真正删除。超时 / hover 结束自动撤销确认态。
+    const t = lookupTodo(id);
+    if (!t) return;
+    // 二次确认：第一次点击只进入确认态（按钮变红），3s 内第二次点击才真删。
+    // 超时 / hover 结束自动撤销确认态。
     if (del.dataset.confirm === "1") {
-      resetDeleteConfirm(todo.id);
-      void deleteTodo(todo);
+      resetDeleteConfirm(t.id);
+      void deleteTodo(t);
     } else {
-      armDeleteConfirm(todo.id, del);
+      armDeleteConfirm(t.id, del);
     }
   });
   actions.appendChild(del);
@@ -602,18 +705,97 @@ function buildTodoRow(todo: Todo): HTMLElement {
   }
 
   // 卡片 hover：挂 .card-hover（操作按钮显隐）+ 启动 QuickLook 预览 dwell
-  // （截断长文 / 图片卡），离开时收回。聚焦走这里的 mouseenter/leave，
-  // 未聚焦走 Rust hover-pos（同一对 hoverCard/unhoverCard，单一状态机，
-  // 不依赖 CSS :hover —— 非 key window 的 WKWebView :hover 不可靠且会
-  // stuck 残留）。
-  row.addEventListener("mouseenter", () => {
-    hoverCard(row);
-  });
-  row.addEventListener("mouseleave", () => {
-    unhoverCard(row);
-  });
+  // （截断长文 / 图片卡），离开时收回。聚焦走这里的 mouseenter/leave，未聚焦
+  // 走 Rust hover-pos（同一对 hoverCard/unhoverCard，单一状态机，不依赖 CSS
+  // :hover -- 非 key window 的 WKWebView :hover 不可靠且会 stuck 残留）。
+  row.addEventListener("mouseenter", () => hoverCard(row));
+  row.addEventListener("mouseleave", () => unhoverCard(row));
 
+  // 填可变内容（status class / check title / thumb / title text / due / aria）。
+  // buildTodoRow 只调一次；后续 render 走 updateTodoRow 复用节点。
+  updateTodoRow(row, todo);
   return row;
+}
+
+/// 查 lastRenderedSnap 拿当前 todo 真相。监听器闭包只捕获稳定 id，每次
+/// click 重新查最新快照 -- keyed diff 下行节点跨 render 复用，监听器只挂
+/// 一次，不能用 render 时的 todo 闭包（会 stale：title 被改后点复制仍复制
+/// 旧文本）。
+function lookupTodo(todoId: string): Todo | null {
+  return lastRenderedSnap?.todos.find((t) => t.id === todoId) ?? null;
+}
+
+/// 就地更新行的可变内容。稳定骨架（check / title / actions + 监听器）只建
+/// 一次（buildTodoRow），updateTodoRow 只动文本 / 类名 / 可选子节点
+/// （thumb / due）。每次 render 对每条幸存 todo 调一次。
+function updateTodoRow(row: HTMLElement, todo: Todo) {
+  if (todo.status === "done") row.classList.add("done");
+  else row.classList.remove("done");
+  row.dataset.status = todo.status;
+
+  const check = row.querySelector<HTMLElement>(".todo-check");
+  if (check) {
+    check.title = todo.status === "done" ? t("app.action.undo") : t("app.action.complete");
+  }
+
+  const titleEl = row.querySelector<HTMLElement>(".todo-title");
+
+  // 缩略图（check 与 title 之间）：attachment 有则建 / 更新 src，无则摘。
+  // v0.2.6 图片附件内联：flex:1 1 0 跟 title 1:1 各占一半宽；无标题时
+  // .todo-title:empty 折叠，图片独占整宽。GIF 原生动画，点击 -> 聚焦预览窗。
+  let thumb = row.querySelector<HTMLImageElement>(".todo-thumb");
+  if (todo.attachment) {
+    if (!thumb) {
+      const newThumb = document.createElement("img");
+      newThumb.className = "todo-thumb";
+      newThumb.alt = "";
+      newThumb.draggable = false;
+      newThumb.setAttribute("aria-label", t("app.action.preview"));
+      newThumb.addEventListener("error", () => newThumb.remove());
+      newThumb.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void openPreviewFromThumbClick(todo.id);
+      });
+      // 插到 check 之后、title 之前（与旧 buildTodoRow 顺序一致）
+      row.insertBefore(newThumb, titleEl);
+      thumb = newThumb;
+    }
+    const url = attachmentUrl(todo.attachment.file);
+    if (url && thumb.getAttribute("src") !== url) thumb.src = url;
+    const label = t("app.action.preview");
+    if (thumb.getAttribute("aria-label") !== label) {
+      thumb.setAttribute("aria-label", label);
+    }
+  } else if (thumb) {
+    thumb.remove();
+  }
+
+  // title 文本
+  if (titleEl) titleEl.textContent = todo.title;
+
+  // due 标签（title 与 actions 之间）：有则建 / 更新，无则摘
+  const actions = row.querySelector<HTMLElement>(".todo-actions");
+  let due = row.querySelector<HTMLElement>(".todo-due");
+  if (todo.due_at) {
+    const { text, cls } = dueLabel(todo.due_at);
+    if (!due) {
+      due = document.createElement("div");
+      due.className = `todo-due ${cls}`;
+      due.textContent = text;
+      row.insertBefore(due, actions);
+    } else {
+      due.className = `todo-due ${cls}`;
+      due.textContent = text;
+    }
+  } else if (due) {
+    due.remove();
+  }
+
+  // aria-label 随 locale 刷（onLocaleChange -> render -> updateTodoRow）
+  const copyBtn = row.querySelector<HTMLElement>(".todo-copy");
+  if (copyBtn) copyBtn.setAttribute("aria-label", t("app.action.copy"));
+  const delBtn = row.querySelector<HTMLElement>(".todo-delete");
+  if (delBtn) delBtn.setAttribute("aria-label", t("app.action.delete"));
 }
 
 function renderEmptyState() {
