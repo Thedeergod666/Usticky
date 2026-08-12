@@ -930,7 +930,9 @@ function measurePreviewTextHeight(text: string): number {
     document.body.appendChild(previewMeasurer);
   }
   previewMeasurer.style.width = `${PREVIEW_TEXT_W - 28}px`;
-  previewMeasurer.textContent = text;
+  // 末尾换行补零宽空格：div 不排结尾空行盒、textarea 排 —— 不补的话
+  // 以 "\n" 结尾的标题开窗就少一行高（与 preview.ts measureTextH 同源修法）。
+  previewMeasurer.textContent = text.endsWith("\n") ? `${text}\u200b` : text;
   return previewMeasurer.scrollHeight;
 }
 

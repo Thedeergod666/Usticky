@@ -73,6 +73,53 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let closing = false;
 const SAVE_DEBOUNCE_MS = 700;
 
+// ── 内容高度自适应（编辑时窗高跟着行数走） ──
+//
+// **绝对式**算高，不是 delta 式（`innerHeight + (H - T)`）：
+//   纯文本卡：W = H + PV_CHROME_TEXT_H
+//   图片卡  ：W = I_nat + H + PV_CHROME_IMAGE_H
+// delta 式对图片卡是错的 —— .preview-image 是 flex:0 1 auto + max-height:100%，
+// 它的实测高本身就是窗高的函数（窗一长图就长回去），delta 每次按键都被
+// 图片吃掉一截 → 逐键阶梯式长高。绝对式不依赖上一帧布局，天然收敛。
+//
+// 常量与 Rust preview_logical_size / preview.css 同源，改一处必须全改：
+//   app padding 6×2 = 12 | panel border 1×2 = 2 | panel padding 14×2 = 28
+//   footer 22 | gap 10（纯文本一个）/ 20（有图两个）
+//   纯文本 12+2+28+22+10 = 74；有图 12+2+28+22+20 = 84
+const PV_CHROME_TEXT_H = 74;
+const PV_CHROME_IMAGE_H = 84;
+/// 与 preview.css .preview-text 的 min-height 对齐 —— 目标低于它时 flex
+/// 压不下去，窗口反而会被 body overflow:hidden 把 footer 裁掉。
+const PV_TEXT_MIN_H = 64;
+/// 窗高下限 = 64 + 74。Rust 那边同值（preview_logical_size 的 130 已改 138）。
+const PV_MIN_WINDOW_H = 138;
+/// 窗高上限，与 preview_logical_size 的 clamp 上界一致。
+const PV_MAX_WINDOW_H = 720;
+/// resize 尾沿防抖。**不是** rAF —— rAF 只是帧边界不是节流，连续打字
+/// 每帧照样发一次 IPC，窗口逐行抖（AGENTS.md #18「输入中禁止 autoResize」
+/// 的预览窗等价物）。160ms：一次打字停顿只 resize 一次。
+const RESIZE_DEBOUNCE_MS = 160;
+/// 小于此差值不发 IPC。3px 吃掉 border-box/scrollHeight 口径残差 +
+/// Retina 物理像素 round-trip 的亚像素抖动；一行文字约 19.5px，不会漏。
+const RESIZE_MIN_DELTA_PX = 3;
+
+let measurerEl: HTMLDivElement | null = null;
+let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+/// IME 组合中（中文拼音 / 日文假名）：WebKit 在候选未上屏时就派发 input，
+/// 此时 textarea.value 是临时串（"nihao"），照它 resize 会在组合期间抖，
+/// 且上屏后（"你好"）没有新的 input 事件来收窄 → 窗口停在错误高度。
+/// 组合期间完全跳过，compositionend 补一次。
+let imeComposing = false;
+/// 换 todo / 重载后作废在途的 debounce 回调 —— prewarm show→loadTodo
+/// 之间的排队回调会拿旧内容量出旧高度，正好落在"show 后再 resize"的
+/// 闪烁窗口里。
+let fitGeneration = 0;
+/// 上次请求的目标高 / 后端实际生效高。两者不等 = 被 work_area 或
+/// 138-720 clamp 了；此时同一目标高不再重复发 IPC（否则贴屏幕底编辑
+/// 时每次输入都空转一次 IPC）。
+let lastDesiredH: number | null = null;
+let lastAchievedH: number | null = null;
+
 /// hint 行的"静止文案"：固定窗显示「已固定 · Esc 关闭」提示如何释放，
 /// hover 预览回默认 hint。flashHint 反馈完仍回到这里。
 function hintRestingText(): string {
@@ -148,7 +195,23 @@ function ensureSkeleton() {
       saveTimer = null;
       void saveTitle(textarea.value, hintEl);
     }, SAVE_DEBOUNCE_MS);
+    // IME 组合中不 resize（临时串会让窗口在组合期间抖），compositionend 补。
+    if (!imeComposing) scheduleFit();
   });
+  textarea.addEventListener("compositionstart", () => {
+    imeComposing = true;
+  });
+  textarea.addEventListener("compositionend", () => {
+    imeComposing = false;
+    scheduleFit();
+  });
+  // WKWebView 已知行为：从外部拖文本进 textarea **不**派发 input，
+  // 只在 blur 时补 change。两个都挂上兜底。drop 时 value 还没更新，
+  // 延到下一个宏任务再量。
+  textarea.addEventListener("drop", () => {
+    setTimeout(() => scheduleFit(), 0);
+  });
+  textarea.addEventListener("change", () => scheduleFit());
   textarea.addEventListener("focus", () => {
     if (!isPinned && currentTodoId) {
       emit("usticky://preview-editing", { id: currentTodoId }).catch(() => {});
@@ -196,7 +259,11 @@ function render(todo: Todo) {
       img.addEventListener("error", () => {
         img.remove();
         imageEl = null;
+        // 图没了 -> 布局从"有图 84"退回"纯文本 74"，重量一次。
+        scheduleFit();
       });
+      // 图片解码完 naturalW/H 才可用，也才知道它占多高 -> 补一次 fit。
+      img.addEventListener("load", () => scheduleFit());
       panelEl!.insertBefore(img, textareaEl);
       imageEl = img;
     }
@@ -302,6 +369,117 @@ function flushPendingSave() {
   }
 }
 
+// ── 内容高度自适应 ──
+
+/// 量出「装下这段文字，textarea 需要多高（border-box）」。
+///
+/// 为什么不用 textarea.scrollHeight：textarea 的 scrollHeight 不会小于
+/// clientHeight，删行时它一直报着当前高 → 只能长不能缩。
+/// 为什么 +2：scrollHeight 含 padding **不含 border**，而我们要的是
+/// border-box 高（.preview-text 是 border-box + 1px transparent border）。
+/// 少这 2px 每次都欠一点，稳态下最后一行永远被切掉 2px。
+/// widthPx 传 textarea 的 **border-box 宽**（getBoundingClientRect().width）
+/// 而不是 clientWidth：Win/Linux 经典滚动条占宽时 clientWidth 是"有滚动条
+/// 的窄宽"，按它换行会多算行；rect.width 对应的是 resize 完成后（无滚动条）
+/// 的目标态，一次到位不来回振荡。
+function measureTextH(text: string, widthPx: number): number {
+  if (!measurerEl) {
+    measurerEl = document.createElement("div");
+    measurerEl.className = "preview-measurer";
+    document.body.appendChild(measurerEl);
+  }
+  measurerEl.style.width = `${widthPx}px`;
+  // 末尾换行补零宽空格：div 不会为结尾的 "\n" 排出空行盒，textarea 会
+  // （光标那一行）。不补的话「按回车换到新行」量不出变化，窗口不动，
+  // 等用户敲下一个字才突然跳一整行。
+  measurerEl.textContent = text.endsWith("\n") ? `${text}\u200b` : text;
+  return measurerEl.scrollHeight + 2;
+}
+
+/// 算目标窗高并发 IPC。绝对式，见文件上方常量注释。
+async function fitWindowToText() {
+  if (closing || !currentTodoId) return;
+  // prewarm 隐藏窗 / 已被摘掉的 textarea：量不准也没意义。
+  if (document.visibilityState === "hidden") return;
+  const textarea = textareaEl;
+  if (!textarea || !textarea.isConnected) return;
+
+  const rect = textarea.getBoundingClientRect();
+  if (rect.width <= 0) return;
+
+  let need = measureTextH(textarea.value, rect.width);
+  // textarea 压不到 64 以下（CSS min-height），目标高必须认这个下限，
+  // 否则每次输入都算出一个"比布局能给的更矮"的目标 → 每次都发一遍
+  // 缩窗 IPC，窗口一路被走矮到 clamp，footer 被裁掉。
+  if (need < PV_TEXT_MIN_H) need = PV_TEXT_MIN_H;
+
+  let desired: number;
+  const img = imageEl;
+  if (img && img.isConnected && img.naturalWidth > 0 && img.naturalHeight > 0) {
+    // 图片的**自然**布局高：按内容宽等比缩放 naturalW/H。
+    // **不**读 img.getBoundingClientRect().height —— 图片 max-height:100%
+    // 是相对 panel 内容盒（= 窗高的函数），拿实测高进公式会自激。
+    const contentW = rect.width;
+    const natH =
+      img.naturalWidth <= contentW
+        ? img.naturalHeight
+        : (img.naturalHeight * contentW) / img.naturalWidth;
+    desired = Math.round(natH + need + PV_CHROME_IMAGE_H);
+  } else if (img && img.isConnected) {
+    // 图片还没解码出 naturalSize：等 load 事件再来一次，别用半成品量。
+    return;
+  } else {
+    desired = Math.round(need + PV_CHROME_TEXT_H);
+  }
+  desired = Math.min(Math.max(desired, PV_MIN_WINDOW_H), PV_MAX_WINDOW_H);
+
+  // 已经就是这个高 -> 不发。
+  if (Math.abs(desired - window.innerHeight) < RESIZE_MIN_DELTA_PX) return;
+  // 上次就是这个目标、后端 clamp 到了 lastAchievedH、窗口至今没被用户
+  // 手动改过 -> 再发也是原地踏步，跳过（贴屏幕底编辑时的 IPC 空转）。
+  if (
+    lastDesiredH !== null &&
+    lastAchievedH !== null &&
+    Math.abs(desired - lastDesiredH) < RESIZE_MIN_DELTA_PX &&
+    Math.abs(window.innerHeight - lastAchievedH) < RESIZE_MIN_DELTA_PX
+  ) {
+    return;
+  }
+
+  lastDesiredH = desired;
+  try {
+    // 后端返回**实际生效**的逻辑高（可能被 work_area / 138-720 clamp）。
+    lastAchievedH = await invoke<number>("resize_preview_window", { height: desired });
+  } catch (e) {
+    // 关窗竞态下 set_size 会失败，无需上报。
+    lastAchievedH = null;
+    console.debug("[preview] resize_preview_window failed", e);
+  }
+}
+
+/// 尾沿防抖排一次 fit。generation 不匹配（期间换了 todo）就丢弃。
+function scheduleFit() {
+  if (closing) return;
+  const gen = fitGeneration;
+  if (resizeTimer) clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    resizeTimer = null;
+    if (gen !== fitGeneration) return;
+    void fitWindowToText();
+  }, RESIZE_DEBOUNCE_MS);
+}
+
+/// 换 todo / 关窗：作废在途 fit 并清掉 clamp 记忆。
+function cancelFit() {
+  fitGeneration += 1;
+  if (resizeTimer) {
+    clearTimeout(resizeTimer);
+    resizeTimer = null;
+  }
+  lastDesiredH = null;
+  lastAchievedH = null;
+}
+
 // ── footer 按钮动作（v0.2.4） ──
 
 /// hint 行短暂换文案做反馈（mini-flash 的预览窗等价物）。
@@ -372,6 +550,7 @@ function closeSelf() {
   if (closing) return;
   closing = true;
   flushPendingSave();
+  cancelFit();
   // 固定窗是独立的 -- 关掉不广播 preview-closed（那是浮窗 hover 状态机的
   // 复位信号，固定窗不归它管）。hover 预览关掉要广播让浮窗复位。
   if (!isPinned) {
@@ -405,6 +584,10 @@ function closeSelf() {
 
 async function loadTodo(id: string) {
   perfMark("preview-load-start");
+  // 换 todo：作废在途 fit。hover 预览的新尺寸由 Rust open_preview_window
+  // 的 reuse 路径一次给到位，这里**不**主动 fit（show 后再 resize 是闪的
+  // 根源之一 —— commands/mod.rs preview_logical_size 的 doc comment）。
+  cancelFit();
   try {
     const snap = await invoke<TodoSnapshot>("get_todos");
     perfMark("preview-get-todos-end");
@@ -443,6 +626,8 @@ async function init() {
     if (pinBtn) {
       pinBtn.setAttribute("aria-label", t(isPinned ? "app.action.unpin" : "app.action.pin"));
     }
+    // 中英切换会换字体族（PingFang SC ↔ SF Pro Text），同样的文字换行不同。
+    scheduleFit();
   });
 
   let unlistenLocale: UnlistenFn | null = null;
@@ -465,6 +650,11 @@ async function init() {
   const initialId = params.get("id");
   if (initialId) {
     await loadTodo(initialId);
+    // **仅固定窗**开窗后主动量一次。hover 预览的尺寸由 Rust 预测量一次
+    // 开到位，不能再 resize；固定窗（pin_preview）在没有 hover 预览可
+    // 抄尺寸时会退到硬编码 460×340（commands/mod.rs pin_preview 兜底），
+    // 长文会被截在窗内滚动 —— 这一次校正就是给这条路径的。
+    if (isPinned) scheduleFit();
   }
   // else: prewarm 创建的隐藏窗（URL 无 ?id=）-- **不**渲染 missing。
   // prewarm 时窗隐藏无所谓，但 reuse 时 Rust 先 w.show() 后 emit
@@ -497,8 +687,12 @@ async function init() {
     }
     currentTodo = todo;
     const textarea = appEl.querySelector<HTMLTextAreaElement>(".preview-text");
+    // **KEEP**：这个 :focus 守卫是 save → todos-changed → 回填 → resize
+    // 回声环的断点。聚焦中不回填 = 不产生新的内容变化 = 不再排 fit。
+    // 谁要把它放松成"实时同步"，必须同时给 fit 加内容指纹去重。
     if (textarea && !textarea.matches(":focus") && textarea.value !== todo.title) {
       textarea.value = todo.title;
+      scheduleFit();
     }
   })
     .then((fn) => (unlistenTodos = fn))
@@ -560,6 +754,7 @@ async function init() {
   // 固定窗不会被浮窗 hide 收掉（hide_dismiss 只关 label="preview"），故不补发。
   window.addEventListener("beforeunload", () => {
     flushPendingSave();
+    cancelFit();
     if (!isPinned) {
       emit("usticky://preview-closed", {}).catch(() => {});
     }

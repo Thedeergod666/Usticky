@@ -602,6 +602,7 @@ pub fn run() {
             commands::purge_attachment,
             commands::reorder_todos,
             commands::resize_floating_window,
+            commands::resize_preview_window,
             commands::reset_floating_window,
             commands::hide_floating_window,
             commands::show_floating_window,

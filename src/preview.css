@@ -94,18 +94,42 @@ html, body {
   width: 100%;
   resize: none;
   background: rgba(255, 255, 255, 0.06);
+  color: var(--pv-text);
+  outline: none;
+  caret-color: var(--pv-accent);
+  overflow-y: auto;
+  transition: border-color 0.18s ease-out, background-color 0.18s ease-out;
+}
+
+/* 换行/行高度量的**唯一来源**：真实 textarea 与 preview.ts 的 offscreen
+ * 测量镜像（.preview-measurer）共用这一组属性 —— 写成选择器组，改一处
+ * 两边同步，杜绝"量出来的高和实际排出来的高对不上"。
+ * 注意：main.ts 的 previewMeasurer 是内联 style 硬编码的另一份，它只服务
+ * "开窗一次性定尺寸"，**别**跨文件复用这份 class。 */
+.preview-text,
+.preview-measurer {
   border: 1px solid transparent;
   border-radius: 10px;
   padding: 10px 12px;
   font: inherit;
   font-size: 13px;
   line-height: 1.5;
-  color: var(--pv-text);
-  outline: none;
-  caret-color: var(--pv-accent);
-  overflow-y: auto;
   word-break: break-word;
-  transition: border-color 0.18s ease-out, background-color 0.18s ease-out;
+}
+
+/* offscreen 测量镜像：离屏 + 不可见 + 不吃事件，高度自然塌到内容高。
+ * white-space 显式写 pre-wrap —— textarea 是 UA 默认 pre-wrap，div 不是。
+ * overflow:visible 保证 scrollHeight 就是内容高，且不会长出滚动条改宽度。 */
+.preview-measurer {
+  position: absolute;
+  left: -10000px;
+  top: 0;
+  visibility: hidden;
+  pointer-events: none;
+  height: auto;
+  min-height: 0;
+  white-space: pre-wrap;
+  overflow: visible;
 }
 .preview-text:focus {
   border-color: rgba(10, 132, 255, 0.45);

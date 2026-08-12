@@ -473,6 +473,92 @@ pub async fn resize_floating_window(app: AppHandle, height: f64) -> Result<(), S
     Ok(())
 }
 
+/// 预览窗内容自适应高度（编辑 textarea 时按行数改窗高）。
+/// preview.ts 用绝对式算好**逻辑**目标高传进来，这里只负责换算 + clamp + 落地。
+///
+/// 与 [`resize_floating_window`] 共享的三条铁律：
+///   - **只改高不改宽**（宽沿用 outer_size），**不**调 `set_position` ——
+///     顶部钉死是用户预期，resize 不能改 y；
+///   - 逻辑 px → 物理 px 用**现取**的 `scale_factor()`（**不**缓存），
+///     否则 Retina 上只长一半；
+///   - 底部 clamp 用 `work_area()` 不用 `monitor.size()`（v0.2.4 Dock 修复：
+///     全屏高会让窗底滑进 Dock / 任务栏下面被遮住）。
+///
+/// 与浮窗不同的两点：
+///   - 取**调用窗**（`window: WebviewWindow`）而不是按 label 查 —— hover
+///     预览 `preview` 与固定窗 `preview-pin-<id>` 共用 preview.html，label
+///     是动态的，只有调用方知道自己是谁。防御性校验 label 前缀，杜绝别的
+///     窗口（floating/settings）误调本命令改自己尺寸。
+///   - clamp 138..=720，与 [`preview_logical_size`] 同源：138 = .preview-text
+///     的 min-height 64 + CHROME_H 74。低于 138 时 flex 内容压不下去，而
+///     preview.css 的 `body { overflow: hidden }` 没有滚动兜底 —— 直接把
+///     footer（复制/删除/pin 按钮）裁掉，按钮点不到。
+///
+/// 返回**实际生效**的逻辑高度：被 work_area 或 138/720 clamp 时前端据此
+/// 记住"这个目标发过且没达成"，同一目标不再重复发 IPC（否则贴屏幕底编辑
+/// 时每次输入都空转一次往返）。
+///
+/// **不** emit `usticky://backdrop-refresh` —— 可见窗口的尺寸变化不刷玻璃
+/// （v0.2.2 消闪三板斧：只在隐藏→上屏 / 关闭时刷）。
+#[tauri::command]
+pub async fn resize_preview_window(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    height: f64,
+) -> Result<f64, String> {
+    const PREVIEW_MIN_H: f64 = 138.0;
+    const PREVIEW_MAX_H: f64 = 720.0;
+    const BOTTOM_MARGIN_PX: i32 = 12;
+
+    if !height.is_finite() {
+        return Err("resize_preview_window: height 不是有限值".to_string());
+    }
+    let label = window.label().to_string();
+    if !label.starts_with("preview") {
+        return Err(format!("resize_preview_window: 非预览窗 label={label}"));
+    }
+
+    let target_logical = height.clamp(PREVIEW_MIN_H, PREVIEW_MAX_H);
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let cur = window.outer_size().map_err(|e| e.to_string())?;
+    let cur_y = window.outer_position().map_err(|e| e.to_string())?.y;
+
+    // current → primary → available.first()（Wayland 等场景 primary 返 None）
+    let mon = window
+        .current_monitor()
+        .map_err(|e| e.to_string())?
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .or_else(|| {
+            app.available_monitors()
+                .ok()
+                .and_then(|ms| ms.into_iter().next())
+        });
+    let (wa_y, wa_h) = mon
+        .map(|m| {
+            let wa = m.work_area();
+            (wa.position.y, wa.size.height as i32)
+        })
+        .unwrap_or((0, 1080));
+
+    let min_phys = (PREVIEW_MIN_H * scale).round() as i32;
+    // 顶部（cur_y）不动，底部最多到 work_area 底 - 12px 喘息。
+    // min(wa_h) 防御 cur_y 被拖到屏幕上沿外时越界；max(min_phys) 兜底
+    // 不让窗口被压到 footer 被裁的高度以下。
+    let max_h_in_mon = ((wa_y + wa_h - BOTTOM_MARGIN_PX - cur_y)
+        .min(wa_h)
+        .max(min_phys)) as u32;
+    let final_h = ((target_logical * scale).round() as u32).min(max_h_in_mon);
+
+    if final_h != cur.height {
+        // 关窗 / 合成层重排竞态下 set_size 可能返 Err —— 吞掉即可，前端
+        // 已经要关窗了，往上抛只会在 console 里刷噪音。
+        if let Err(e) = window.set_size(tauri::PhysicalSize::new(cur.width, final_h)) {
+            tracing::debug!(error = %e, label = %label, "resize_preview_window set_size 失败（窗口可能正在关闭）");
+        }
+    }
+    Ok(final_h as f64 / scale)
+}
+
 // ── i18n ──
 
 #[tauri::command]
@@ -904,6 +990,10 @@ pub async fn pin_preview(app: AppHandle, todo_id: String) -> Result<(), String> 
     let _win = WebviewWindowBuilder::new(&app, &label, url)
         .title(title)
         .inner_size(w_logical, h_logical)
+        // 显式 OS 级最小尺寸：resize_preview_window 的 138 下限必须是**生效**
+        // 的下限。不设的话平台默认最小值（macOS NSPanel 更矮）会先接管，
+        // set_size 被静默 clamp 到比 138 更矮 -> footer 被裁掉且前端察觉不到。
+        .min_inner_size(240.0, 138.0)
         .position(pos_x_logical, pos_y_logical)
         .resizable(true)
         .decorations(false)
@@ -960,6 +1050,8 @@ pub async fn prewarm_preview_window(app: AppHandle) -> Result<(), String> {
     let _win = WebviewWindowBuilder::new(&app, "preview", WebviewUrl::App("preview.html".into()))
         .title(title)
         .inner_size(460.0, 340.0)
+        // 同 pin_preview：显式 OS 级最小尺寸，保证 138 下限真正生效。
+        .min_inner_size(240.0, 138.0)
         .resizable(true)
         .decorations(false)
         .transparent(true)
@@ -1001,7 +1093,10 @@ fn preview_logical_size(todo: &Todo, text_h: Option<f64>) -> (f64, f64) {
             (w, h)
         }
         None => {
-            let h = text_h.map_or(TEXT_FALLBACK_H, |t| (t + CHROME_H).clamp(130.0, 720.0));
+            // 下限 138 = .preview-text 的 min-height 64 + CHROME_H 74。
+            // 曾经是 130 —— 比 CSS 真实最小无溢出高度还矮 8px，贴着下限
+            // 开窗时 footer 被 body overflow:hidden 裁掉一截。
+            let h = text_h.map_or(TEXT_FALLBACK_H, |t| (t + CHROME_H).clamp(138.0, 720.0));
             (TEXT_W, h)
         }
     }
@@ -1149,11 +1244,16 @@ pub async fn open_preview_window(
             crate::platform::show_window_no_activate(&app, "preview");
         }
         {
-            let mut pending = pending_preview_todo().lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = pending_preview_todo()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *pending = Some(todo_id.clone());
         }
-        w.emit("usticky://preview-todo", serde_json::json!({ "id": todo_id }))
-            .map_err(|e| e.to_string())?;
+        w.emit(
+            "usticky://preview-todo",
+            serde_json::json!({ "id": todo_id }),
+        )
+        .map_err(|e| e.to_string())?;
         // 只在隐藏→上屏时刷新浮窗玻璃（见 doc comment）
         if !was_visible {
             let _ = app.emit("usticky://backdrop-refresh", ());
@@ -1166,6 +1266,8 @@ pub async fn open_preview_window(
     let _win = WebviewWindowBuilder::new(&app, "preview", url)
         .title(title)
         .inner_size(w_logical, h_logical)
+        // 同 pin_preview：显式 OS 级最小尺寸，保证 138 下限真正生效。
+        .min_inner_size(240.0, 138.0)
         // builder position 是逻辑坐标（x/y 两个 f64），pos_x/pos_y 算的是
         // 物理像素 —— 除 scale 换回逻辑，Retina 上否则偏一倍。
         .position(pos_x as f64 / scale, pos_y as f64 / scale)
@@ -1229,7 +1331,9 @@ pub async fn close_preview_window(app: AppHandle, force: Option<bool>) -> Result
 /// 必须经 Rust 命令桥接。
 #[tauri::command]
 pub async fn get_perf_path() -> Option<String> {
-    std::env::var("USTICKY_PERF_OUT").ok().filter(|s| !s.is_empty())
+    std::env::var("USTICKY_PERF_OUT")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// 由 src/perf.ts 的 dump() 调：webview 收集完所有 performance.mark /
