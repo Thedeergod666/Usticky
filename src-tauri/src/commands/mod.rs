@@ -5,6 +5,7 @@
 //
 // DTO 全部 #[serde(rename_all = "camelCase")] —— Tauri 2 对 struct 字段
 // 也走 camelCase 转换（Musage PR 1b 实测坑）。
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::todo::{PinMode, Todo, TodoSnapshot, TodoStatus};
@@ -1381,17 +1382,18 @@ pub async fn close_preview_window(app: AppHandle, force: Option<bool>) -> Result
             tracing::debug!(error = %e, "preview w.close failed, hide 兜底 + 仍 emit preview-closed");
             let _ = w.hide();
         }
-        // 关窗同样触发合成层重排 → 浮窗玻璃重采样（见 open 的注释）
-        let _ = app.emit("usticky://backdrop-refresh", ());
-        // 兜底直接 emit preview-closed：w.close() 在 Tauri 2 / WKWebView 下
-        // 可能不触发 webview beforeunload，preview.ts 的 beforeunload 监听不来，
-        // 浮窗收不到 preview-closed，穿缝期间保留的强调无法释放（卡死，只有
-        // 点别的应用触发 onFocusChanged 才摘）。preview.ts beforeunload 仍会
-        // 再 emit 一次，listener 幂等无副作用。
-        let _ = app.emit("usticky://preview-closed", ());
-        // **P1-4 fix**：清空 PENDING_PREVIEW_TODO，避免下次 fresh-create 时
-        // 陈旧槽位覆盖新 todo id（见 [`clear_pending_preview_todo`]）。
-        clear_pending_preview_todo();
+        // **P3-4 fix（2026-08-13 全量审查）**：Rust 直关预览前 emit
+        // preview-flush + 200ms 延迟，让 preview.ts 把 <700ms 防抖窗口内
+        // 的 update_todo invoke 走完（beforeunload 不一定派发的兜底）。
+        let _ = app.emit("usticky://preview-flush", ());
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = app2.emit("usticky://preview-closed", ());
+            let _ = app2.emit("usticky://backdrop-refresh", ());
+            clear_pending_preview_todo();
+        });
+        return Ok(());
     }
     Ok(())
 }

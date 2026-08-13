@@ -114,6 +114,11 @@ let imeComposing = false;
 /// 之间的排队回调会拿旧内容量出旧高度，正好落在"show 后再 resize"的
 /// 闪烁窗口里。
 let fitGeneration = 0;
+/// **P2-8 fix（2026-08-13 全量审查）**：loadTodo 代际。hover A→B→C 快速
+/// 切换时三个 loadTodo 并发，`await invoke("get_todos")` 响应可能乱序
+/// → 后发的先回 → 内容回跳 + currentTodoId 停在旧值，后续保存打到错误
+/// 对象。每进 loadTodo 时 ++loadGeneration，在途 await 后校验，stale 早退。
+let loadGeneration = 0;
 /// 上次请求的目标高 / 后端实际生效高。两者不等 = 被 work_area 或
 /// 138-720 clamp 了；此时同一目标高不再重复发 IPC（否则贴屏幕底编辑
 /// 时每次输入都空转一次 IPC）。
@@ -216,6 +221,15 @@ function ensureSkeleton() {
     if (!isPinned && currentTodoId) {
       emit("usticky://preview-editing", { id: currentTodoId }).catch(() => {});
     }
+  });
+  // **P2-7 fix（2026-08-13 全量审查）**：blur 立即 flush 防抖中未落盘编辑。
+  // 固定窗（isPinned=true）blur 不自关 → 防抖窗口内的编辑若没人 flush 会被
+  // 外部 todos-changed 回填覆盖 + saveTitle 短路静默丢弃（trimmed ===
+  // currentTodo.title）。blur 时显式 flush 让存盘跟上 → 后续回填不影响。
+  // hover 窗：blur→onFocusChanged(false)→closeSelf→flushPendingSave
+  // 链路已存在，但显式 blur→flush 让两条路径收敛、不依赖焦点事件到达顺序。
+  textarea.addEventListener("blur", () => {
+    flushPendingSave();
   });
   panel.addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
@@ -344,7 +358,11 @@ async function saveTitle(value: string, hint?: HTMLElement | null) {
   if (!trimmed || trimmed === currentTodo?.title) return;
   try {
     await invoke("update_todo", { id, title: trimmed });
-    if (currentTodo) currentTodo.title = trimmed;
+    // **P3-23 fix（2026-08-13 全量审查）**：await 期间用户可能已切到其他
+    // todo（hover B）→ currentTodoId 变了，currentTodo 也是新对象。
+    // 旧实现无条件写 `currentTodo.title = trimmed` 会污染新 todo 的
+    // 内存态。校验本 saveTitle 的 id 还对应当前 currentTodoId 才写。
+    if (currentTodoId === id && currentTodo) currentTodo.title = trimmed;
   } catch (e) {
     console.error("[preview] save title failed", e);
     const h = hint ?? appEl.querySelector<HTMLElement>(".preview-hint");
@@ -586,6 +604,7 @@ function closeSelf() {
 /// 跳过 get_todos 全列表往返直接 render；缺省时（初始 URL 加载 /
 /// take_pending_preview_todo 只有 id）才走 get_todos。
 async function loadTodo(id: string, todo?: Todo) {
+  const gen = ++loadGeneration; // **P2-8 fix**：本 loadTodo 代际；await 后 stale 早退
   perfMark("preview-load-start");
   // 换 todo：作废在途 fit。hover 预览的新尺寸由 Rust open_preview_window
   // 的 reuse 路径一次给到位，这里**不**主动 fit（show 后再 resize 是闪的
@@ -595,16 +614,20 @@ async function loadTodo(id: string, todo?: Todo) {
     let resolved = todo ?? null;
     if (!resolved) {
       const snap = await invoke<TodoSnapshot>("get_todos");
+      // P2-8：被新 loadTodo 抢代际 → stale 跳过
+      if (gen !== loadGeneration) return;
       perfMark("preview-get-todos-end");
       perfMeasureEnd("preview-get-todos", "preview-load-start", "preview-get-todos-end");
       resolved = snap.todos.find((x) => x.id === id) ?? null;
     }
     if (!resolved) {
+      if (gen !== loadGeneration) return;
       renderMissing();
       // todo 被删 -> 窗口没有存在意义
       closeSelf();
       return;
     }
+    // 所有 await 后才 set state + render —— 路上 stale 的早就 bail 了
     currentTodoId = id;
     perfMark("preview-render-start");
     render(resolved);
@@ -612,6 +635,7 @@ async function loadTodo(id: string, todo?: Todo) {
     perfMeasureEnd("preview-render", "preview-render-start", "preview-render-end");
     perfMeasureEnd("preview-load-total", "preview-load-start");
   } catch (e) {
+    if (gen !== loadGeneration) return;
     console.error("[preview] get_todos failed", e);
     renderMissing();
   }
@@ -631,6 +655,15 @@ async function init() {
     const pinBtn = appEl.querySelector<HTMLElement>(".preview-pin");
     if (pinBtn) {
       pinBtn.setAttribute("aria-label", t(isPinned ? "app.action.unpin" : "app.action.pin"));
+    }
+    // **P3-26 fix（2026-08-13 全量审查）**：日期随 locale 重渲染。formatDate
+    // 走 getLocale()，onLocaleChange 之前只刷 title/hint/aria-label，footer
+    // 日期停在旧 locale 格式直到下次换 todo。补刷 created/doneAt 文本。
+    if (currentTodo && createdEl) {
+      createdEl.textContent = `${t("preview.created")} ${formatDate(currentTodo.created_at)}`;
+    }
+    if (currentTodo && doneAtEl) {
+      doneAtEl.textContent = `${t("preview.completed")} ${formatDate(currentTodo.updated_at)}`;
     }
     // 中英切换会换字体族（PingFang SC ↔ SF Pro Text），同样的文字换行不同。
     scheduleFit();
@@ -737,6 +770,19 @@ async function init() {
     .then((fn) => (unlistenFocus = fn))
     .catch((e) => console.error("[preview] onFocusChanged failed", e));
 
+  // **P3-4 fix（2026-08-13 全量审查）**：后端直接 close 预览窗的兜底 flush
+  // 信号。hide_dismiss_floating_window / CloseRequested 路径里 lib.rs
+  // 直接 `p.close()`，Tauri 2 在 macOS WKWebView 下偶发不触发 webview
+  // beforeunload（v0.2.6 实证）→ 防抖窗口内的 <700ms 编辑随 webview 销毁
+  // 丢失。后端 close 前 emit `preview-flush` + 延时 200ms 再 close，本端
+  // 听到立即 flushPendingSave 把 invoke 走完。
+  let unlistenFlush: UnlistenFn | null = null;
+  listen("usticky://preview-flush", () => {
+    flushPendingSave();
+  })
+    .then((fn) => (unlistenFlush = fn))
+    .catch((e) => console.error("[preview] listen preview-flush failed", e));
+
   // 鼠标进出 -> 浮窗 pinned 状态机（仅 hover 预览）。固定窗不参与 -- 它独立，
   // 鼠标进/出不该触发浮窗 grace close 重排。
   document.body.addEventListener("mouseenter", () => {
@@ -769,6 +815,7 @@ async function init() {
     unlistenSetTodo?.();
     unlistenTodos?.();
     unlistenFocus?.();
+    unlistenFlush?.();
   });
 
   // prewarm 竞态防线（仅 hover 预览）：prewarm 隐藏创建的 webview 可能还没

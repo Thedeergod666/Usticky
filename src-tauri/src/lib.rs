@@ -321,13 +321,28 @@ pub fn hide_dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore)
     }
     // v0.2：浮窗 hide 时预览窗口一并收掉 —— always-on-top 的预览留在
     // 屏幕上而宿主浮窗消失，是无依孤儿窗。
-    if let Some(p) = app.get_webview_window("preview") {
-        let _ = p.close();
+    if app.get_webview_window("preview").is_some() {
+        // **P3-4 fix（2026-08-13 全量审查）**：close 前先 emit preview-flush
+        // + 200ms 延迟，让 preview.ts 把防抖中未落盘的 update_todo invoke
+        // 走完。Tauri 2 在 macOS WKWebView 下偶发不触发 webview beforeunload
+        // （v0.2.6 实证）→ 不 flush 会丢 <700ms 编辑。emit 后 spawn 异步
+        // 延迟关闭，主路径立即返回。
+        let _ = app.emit("usticky://preview-flush", ());
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Some(p) = app2.get_webview_window("preview") {
+                let _ = p.close();
+            }
+            let _ = app2.emit("usticky://preview-closed", ());
+            let _ = app2.emit("usticky://backdrop-refresh", ());
+            // **P1-4 fix（2026-08-13 全量审查）**：hide 路径直接 `p.close()`
+            //  预览，不走 close_preview_window 命令（IPC 多跳），必须主动
+            //  清 PENDING 槽位，否则下次 fresh-create 时陈旧 slot 致显示/
+            //  编辑错误 todo。
+            crate::commands::clear_pending_preview_todo();
+        });
     }
-    // **P1-4 fix（2026-08-13 全量审查）**：hide 路径直接 `p.close()` 预览，
-    // 不走 close_preview_window 命令（IPC 多跳），必须主动清 PENDING 槽位，
-    // 否则下次 fresh-create 时陈旧 slot 致显示/编辑错误 todo。
-    crate::commands::clear_pending_preview_todo();
     if was_active {
         let mode = store.blocking_read().pin_mode();
         platform::restore_level_after_quick_add(app, mode);
