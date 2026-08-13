@@ -153,11 +153,15 @@ pub fn set_window_pin_bottom<R: Runtime>(app: &AppHandle<R>) {
         let app2 = app.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
-            // 再次确认：50ms 期间鼠标可能已经移出浮窗，emitter 会把
-            // LAST_INSIDE 翻成 false。如果鼠标已经离开，正常 LOWER。
-            // 如果还在浮窗内（emitter 已 re-raise 到 FLOATING），跳过 LOWER
-            // 让 emitter 继续维持 FLOATING，避免把它再打回去。
-            if !LAST_INSIDE.load(Ordering::SeqCst) {
+            // **P3-9 fix（2026-08-13 全量审查）**：50ms 内用户可能已切到
+            // PinTop / Normal（LEVEL_SWITCHING_ACTIVE 被关），此时不该 LOWER，
+            // 否则 stale 线程会把 PinTop 的 FLOATING 窗口压回 BELOW_NORMAL
+            // 直到下一次任何 level 操作才能自愈。同时再校一次 LAST_INSIDE：
+            // 隐藏门控（lib.rs hide_dismiss 触发 WINDOW_VISIBLE=false 后下一
+            // tick）会把它置 false，鼠标移出场景下让 LOWER 走通。
+            if !LAST_INSIDE.load(Ordering::SeqCst)
+                && LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst)
+            {
                 set_window_level(&app2, LEVEL_BELOW_NORMAL, false);
             }
         });
@@ -434,6 +438,17 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                         consecutive_dispatch_failures = 0;
                         // P3：清 hover-pos 去重缓存 —— 重新上屏后第一帧要重发坐标
                         last_emitted_pos = None;
+                        // **P1-5 fix（2026-08-13 全量审查）**：同步重置全局
+                        // LAST_INSIDE。set_window_pin_bottom 的 deferred LOWER
+                        // 线程 50ms 后会读 LAST_INSIDE 决定是否 LOWER；
+                        // 若隐藏时鼠标在浮窗内（LAST_INSIDE=true），不重置
+                        // → 50ms 后 deferred 线程仍认为鼠标在 → 跳过 LOWER
+                        // → 窗口带着 FLOATING level 进入隐藏态 → 下次普通 show
+                        // 浮窗永久卡在恒置顶（level 不还原、PinBottom 失效）。
+                        // 注意：这里重置与 set_window_pin_bottom 启动的 deferred
+                        // 线程存在竞态 —— 但 deferred 线程检查的是 50ms 后的值，
+                        // 若本 tick 先把它置 false，deferred 线程读到 false → LOWER。
+                        LAST_INSIDE.store(false, Ordering::SeqCst);
                         continue;
                     }
 
@@ -706,14 +721,30 @@ pub fn show_window_no_activate<R: Runtime>(app: &AppHandle<R>, label: &str) {
 ///   dispatch 失败时为 None。
 /// - `over_preview`：命中的是预览窗（此时 frame 仍是浮窗的，x/y 对前端
 ///   elementFromPoint 无意义，前端只看这个 flag 做 pinned 转换）。
+/// **P3-10 fix（2026-08-13 全量审查）**：tick 代际计数器。上一 tick 的
+/// dispatch 闭包若因 main thread 忙卡住延迟运行，本 tick 的 wait 可能被
+/// 那条 stale 写入唤醒并当作本次结果消费 —— 让 dispatch_failed 兜底
+/// 计数器被错误清零、3-tick 防线漏记。给 SLOT 的每条 payload 打 gen
+/// 标签，wait 只消费本 tick gen 的写入，stale 直接忽略。
+static TICK_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn is_floating_topmost_at_with_status<R: Runtime>(
     app: &AppHandle<R>,
     point: NSPoint,
 ) -> (bool, bool, Option<(f64, f64, f64, f64)>, bool) {
     use std::sync::{Arc, Condvar, Mutex};
 
+    #[derive(Clone)]
+    struct SlotData {
+        inside: bool,
+        dispatch_failed: bool,
+        frame: Option<(f64, f64, f64, f64)>,
+        over_preview: bool,
+    }
     struct OneSlot {
-        slot: Mutex<Option<(bool, bool, Option<(f64, f64, f64, f64)>, bool)>>, // (inside, dispatch_failed, frame, over_preview)
+        // (gen, payload)：只有 gen == my_gen 的写入才是本 tick 的结果，
+        // 否则视为 stale（上 tick 残留闭包延后执行）。
+        slot: Mutex<Option<(u64, SlotData)>>,
         cvar: Condvar,
     }
     static SLOT: OnceLock<Arc<OneSlot>> = OnceLock::new();
@@ -746,6 +777,8 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
         let mut g = slot.slot.lock().unwrap_or_else(|e| e.into_inner());
         *g = None;
     }
+    // **P3-10 fix**：本 tick 代际 —— dispatch 闭包捕获并写入，wait 校验。
+    let my_gen = TICK_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let dispatch_result = app.run_on_main_thread(move || {
         let result = (|| -> Option<(bool, bool, (f64, f64, f64, f64))> {
             let win = app2.get_webview_window("floating")?;
@@ -785,16 +818,15 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
             let inside = topmost == our_id || over_preview;
             Some((inside, over_preview, frame))
         })();
-        // (inside, dispatch_failed, frame, over_preview) 区分"真实判定"和"未知"：
-        //   - Some((inside, over_preview, frame)) → (inside, false, Some(frame), over_preview)
-        //   - None（窗口未上屏 / MTM 不可用）→ (false, true, None, false)
+        // **P3-10 fix**：写本 tick 的 gen 标签。晚到的 stale 闭包即便写到
+        // 这里，gen 也是旧的（不等于新 tick 的 my_gen），会被 wait 校验拒绝。
         let payload = match result {
-            Some((inside, over_preview, frame)) => (inside, false, Some(frame), over_preview),
-            None => (false, true, None, false),
+            Some((inside, over_preview, frame)) => SlotData { inside, dispatch_failed: false, frame: Some(frame), over_preview },
+            None => SlotData { inside: false, dispatch_failed: true, frame: None, over_preview: false },
         };
         {
             let mut g = slot2.slot.lock().unwrap_or_else(|e| e.into_inner());
-            *g = Some(payload);
+            *g = Some((my_gen, payload));
         }
         slot2.cvar.notify_all();
     });
@@ -806,27 +838,33 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
         {
             let mut g = slot.slot.lock().unwrap_or_else(|e| e.into_inner());
             if g.is_none() {
-                *g = Some((false, true, None, false));
+                *g = Some((my_gen, SlotData { inside: false, dispatch_failed: true, frame: None, over_preview: false }));
             }
         }
         slot.cvar.notify_all();
     }
 
-    // 50ms 超时兜底：main thread 卡住时 hover 轮询不至于一起卡住
+    // 50ms 超时兜底：main thread 卡住时 hover 轮询不至于一起卡住。
+    // **P3-10 fix**：wait 唤醒后校验 gen —— 不等于 my_gen 视为 stale
+    // （上 tick 残留闭包延后写入），继续等下一个 wakeup 或 deadline。
     let started = std::time::Instant::now();
     let deadline = Duration::from_millis(50);
     let mut guard = slot.slot.lock().unwrap_or_else(|e| e.into_inner());
-    while guard.is_none() && started.elapsed() < deadline {
+    loop {
+        let matches = matches!(guard.as_ref(), Some((g,_)) if *g == my_gen);
+        if matches { break; }
         let remaining = deadline.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            break;
-        }
+        if remaining.is_zero() { break; }
         let (g, _wait_timeout) = slot
             .cvar
             .wait_timeout(guard, remaining)
             .unwrap_or_else(|e| e.into_inner());
         guard = g;
     }
-    // 超时仍 None → (false, true, None, false) 兜底（dispatch 失败的语义，让 hover emitter 走"未知"路径）
-    guard.unwrap_or((false, true, None, false))
+    // 超时仍 None 或 stale（gen 不匹配）→ (false, true, None, false) 兜底
+    let data = guard.as_ref().and_then(|(gen, data)| if *gen == my_gen { Some(data.clone()) } else { None });
+    match data {
+        Some(d) => (d.inside, d.dispatch_failed, d.frame, d.over_preview),
+        None => (false, true, None, false),
+    }
 }
