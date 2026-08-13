@@ -33,7 +33,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc:; font-src 'self' data:; frame-ancestors 'none'",
+      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc:; font-src 'self'; frame-ancestors 'none'",
       "assetProtocol": {
         "enable": true,
         "scope": ["$APPDATA/attachments/**"]

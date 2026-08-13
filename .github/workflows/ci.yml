@@ -71,9 +71,9 @@ jobs:
         with:
           workspaces: src-tauri
       # 显式跑一次 sync-version（即便 pnpm build 的 prebuild 钩子已经跑过也无所谓，
-      # sync-version.cjs 是幂等的）—— 主要价值是后面 verify 那步：在 cargo check --locked
-      # 之前就 fail-fast "package.json ↔ Cargo.toml 不一致"，避免 lockfile mismatch
-      # 触发难定位的 cargo 错误。
+      # sync-version.cjs 是幂等的）—— 主要价值是后面 verify 那步：在 cargo check
+      # 之前就 fail-fast "package.json ↔ Cargo.toml 不一致"，避免晦涩的 lockfile
+      # mismatch 误导排查。
       - name: Sync version early
         run: pnpm sync-version
       # 跨平台版本一致性检查 —— 独立 Node 脚本（inline node -e 会被 yaml
@@ -82,5 +82,12 @@ jobs:
         run: node scripts/verify-versions.cjs
       - name: cargo check
         working-directory: src-tauri
-        # --locked 必加：防 fresh cargo 在不同平台重解析依赖树
-        run: cargo check --locked --all-targets
+        # **P2-9 fix（2026-08-13 全量审查）**：**不带** --locked。sync-version
+        # 改 Cargo.toml version 但**从不更新 Cargo.lock**（其中 `[[package]]
+        # name = "usticky" version = "0.2.0"`）—— bump 版本后提交 main，
+        # cargo check --locked 必然报 "lock file needs to be updated"，
+        # 而 AGENTS.md v0.1.5 P1-13 明确记录过这个坑（"CI 改 cargo check
+        # 去 --locked：prebuild 改 Cargo.toml 后 lockfile 同步失败误导"）。
+        # 不带 --locked：cargo 自动刷新 lockfile，唯一代价是版本 bump 那一次
+        # 会多解析几秒。
+        run: cargo check --all-targets

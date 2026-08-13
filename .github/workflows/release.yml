@@ -124,11 +124,21 @@ jobs:
       # 也必须放在 `tauri build` 之前：sync-version 改的 Cargo.toml / tauri.conf.json
       # 会被 build 直接消费
       - name: Sync version
+        id: sync
         env:
           # tag 触发时 github.ref_name 是 "v0.2.0"；手动触发时取 inputs.version
           VERSION: ${{ inputs.version || github.ref_name }}
         run: |
           echo "Building Usticky v${VERSION} for ${{ matrix.target }}"
+
+          # **P3-29 fix（2026-08-13 全量审查）**：release tag 名统一走这里计算。
+          # 手动触发输入 "v0.2.1"（用户按 git tag 习惯）时，GitHub Actions
+          # 表达式层没有字符串 replace —— 旧 `format('v{0}', inputs.version)`
+          # 会产出 "vv0.2.1" 怪 tag。bash 里规整：带 v 前缀的直接用，不带的补上。
+          # 后续 tauri-action 的 tagName / verify job 都引用这个 output。
+          TAG="${VERSION}"
+          [[ "$TAG" != v* ]] && TAG="v${TAG}"
+          echo "release_tag=${TAG}" >> "$GITHUB_OUTPUT"
 
           # 写 package.json（不再直接写 tauri.conf.json —— 让 sync-version.cjs 成为
           # 唯一传播路径，三处 version 永远一致）
@@ -158,9 +168,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # 不让 action 自己写 tagName：用本 workflow 触发的 tag
-          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', inputs.version) }}
-          releaseName: "Usticky ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', inputs.version) }}"
+          # 不让 action 自己写 tagName：用本 workflow 触发的 tag（P3-29 统一
+          # 从 sync step 的 output 取，避免 vv 前缀）
+          tagName: ${{ steps.sync.outputs.release_tag }}
+          releaseName: "Usticky ${{ steps.sync.outputs.release_tag }}"
           releaseDraft: true
           releaseBody: .github/RELEASE_TEMPLATE.md
           # 不走 tauri-plugin-updater，不上传 latest.json（defense-in-depth）
@@ -176,16 +187,28 @@ jobs:
     name: verify release assets
     needs: build
     runs-on: ubuntu-22.04
-    if: success()
+    # **P2-10 fix（2026-08-13 全量审查）**：`if: success()` → `always() && !cancelled()`。
+    # 矩阵 `fail-fast: false` 下任一平台失败，其余平台仍会上传 bundle 到 draft
+    # release —— 旧 if: success() 会让 verify 整体跳过，缺平台产物没有任何自动化
+    # 信号。现在 verify 照跑，在脚本里检查 needs.build.result，失败时显式 exit 1。
+    if: always() && !cancelled()
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Fail if any platform build failed
+        if: needs.build.result != 'success'
+        run: |
+          echo "::error::至少一个平台 build job 失败（result=${{ needs.build.result }}），release 产物不齐，不可发布"
+          exit 1
       # 轮询等待 release assets 全部就位（tauri-action 第一个 job 完成后才建 release，
       # 后续 job 完成后才追加 asset）—— 12 次 × 15s = 3 分钟上限，失败早返
       - name: Wait for release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', inputs.version) }}
+          VERSION: ${{ inputs.version || github.ref_name }}
         run: |
+          # 与 build job 的 Sync version step 同款 tag 规整（P3-29：输入可能带 v 前缀）
+          TAG="${VERSION}"
+          [[ "$TAG" != v* ]] && TAG="v${TAG}"
           for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
             echo "Poll attempt $i (waiting for release $TAG to have all 5 assets)"
             ASSETS=$(gh release view "$TAG" --json assets --jq '.assets | length' 2>/dev/null || echo "0")
@@ -199,8 +222,10 @@ jobs:
       - name: Verify release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version || github.ref_name }}
         run: |
-          TAG="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', inputs.version) }}"
+          TAG="${VERSION}"
+          [[ "$TAG" != v* ]] && TAG="v${TAG}"
           echo "验证 release $TAG 所有平台的 bundle 都齐了"
           # 期望产物（按平台）：
           #   macOS arm64: *_aarch64.dmg

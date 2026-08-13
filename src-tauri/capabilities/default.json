@@ -1,21 +1,17 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "permissions shared by floating + settings + preview windows — core IPC + opener (GitHub link); clipboard image attachments served via assetProtocol scope in tauri.conf.json (no core:asset permission in Tauri 2)",
-  "windows": ["floating", "settings", "preview", "preview-pin-*"],
+  "description": "permissions shared by floating + settings + preview windows — core IPC + opener (GitHub link, settings only); clipboard image attachments served via assetProtocol scope in tauri.conf.json (no core:asset permission in Tauri 2)",
+  "windows": [
+    "floating",
+    "settings",
+    "preview",
+    "preview-pin-*"
+  ],
   "permissions": [
     "core:default",
-    "core:window:allow-show",
-    "core:window:allow-hide",
-    "core:window:allow-set-always-on-top",
-    "core:window:allow-set-position",
-    "core:window:allow-set-size",
     "core:window:allow-start-dragging",
     "core:window:allow-close",
-    "core:window:allow-set-focus",
-    "core:tray:default",
-    "core:menu:default",
-    "core:app:default",
     "opener:default"
   ]
 }

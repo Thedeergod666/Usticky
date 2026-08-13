@@ -15,7 +15,7 @@
 // 或 pnpm tauri:build --debug 先跑）。脚本直接 spawn 二进制，不调 tauri dev
 // —— 避免 dev 模式 HMR / 调试包拖慢冷启。
 
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import {
   existsSync,
   readFileSync,
@@ -42,6 +42,33 @@ if (!existsSync(BINARY)) {
       `  请先跑：pnpm tauri:build${PROFILE === "debug" ? " --debug" : ""}`,
   );
   process.exit(1);
+}
+
+/// **P3-30 fix（2026-08-13 全量审查）**：检测已运行的 Usticky 实例。
+///
+/// tauri-plugin-single-instance（v0.1.5 集成）会让第二次启动的进程把请求
+/// 转发给已运行实例后立即退出 —— 用户开着 Usticky（常驻应用，概率很高）
+/// 再跑 baseline：每轮 spawn 的进程都被转发 + 退出，永远写不出
+/// USTICKY_PERF_OUT → 每轮 20s 超时标记 FAILED、20 轮 400s+ 全灭且无
+/// 任何报错指引。提前用 pgrep / tasklist 探测，命中直接给明确指引。
+function detectRunningUsticky() {
+  try {
+    if (process.platform === "win32") {
+      const out = execSync('tasklist /FI "IMAGENAME eq usticky.exe" /FO CSV /NH', {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      return /usticky\.exe/i.test(out);
+    }
+    const out = execSync("pgrep -x usticky", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.trim().length > 0;
+  } catch {
+    // pgrep 无匹配 = exit 1 → 没在跑；execSync 自身报错 = 工具不可用 → 不阻塞
+    return false;
+  }
 }
 
 function percentile(arr, p) {
@@ -105,6 +132,15 @@ function findMeasure(file, name) {
 }
 
 async function main() {
+  // P3-30：单实例冲突前置检查 —— 明确报错而不是 400s 静默全灭。
+  if (detectRunningUsticky()) {
+    console.error(
+      "[perf-baseline] 检测到 Usticky 已在运行（tauri-plugin-single-instance 会把新进程转发给已运行实例后退出，baseline 永远拿不到数据）。\n" +
+        "  请先退出 Usticky（tray 菜单 Quit / Cmd+Q）再跑本脚本。",
+    );
+    process.exit(1);
+  }
+
   console.log(`[perf-baseline] ${ITER} iterations against ${BINARY}`);
   console.log(`[perf-baseline] tmp dir: ${TMP_DIR}\n`);
 
