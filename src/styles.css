@@ -88,18 +88,24 @@
  * 触发 reflow → 立刻重新合成 backdrop sample，击穿 2s sample 失效窗口。
  *
  * 关键点：
- *   - 用 .force-reflow class 强制 reflow（不是简单加 transition）
+ *   - 用 .force-reflow class 强制重采样（不是简单加 transition）
  *   - 0.1s 后由 JS 移除 —— 短暂 flicker 但立刻恢复，肉眼几乎不可见
  *   - 不影响 hover 状态机（不触发 body[data-hover] 切换）
- *   - 用 filter（drop-shadow 微小）而不是 transform —— 心跳动画已经占
- *     了 transform 通道，再叠加会冲突 / 浪费合成预算
+ *   - **用 backdrop-filter 微动（blur +1px）而不是 filter** —— 旧实现
+ *     `filter: drop-shadow(0 0 0 transparent)` 会给元素叠一个 filter pass、
+ *     **重栅格化元素自身背景**，在 PinBottom hover 切 level 时与 220ms
+ *     的 background-color 过渡重叠，把过渡 cancel 掉 → 用户看到"背景透明
+ *     突然变深"的跳变（Musage 默认 PinTop 不切 level、不发 backdrop-refresh，
+ *     所以没这个问题）。backdrop-filter 微动只强制 backdrop layer 重采样，
+ *     不动元素自身背景 → 过渡照常走。
+ *   - +1px blur 差肉眼不可见（10px→11px），但足以让 WebKit 判定
+ *     backdrop-filter 变了 → 重采样。
  */
 .todo-card.force-reflow,
 .todo-input.force-reflow,
 .todo-paste-btn.force-reflow {
-  /* filter: drop-shadow 是 compositor 友好属性，1px blur 视觉无感但
-   * 触发 paint invalidation → backdrop layer 立刻重采样。 */
-  filter: drop-shadow(0 0 0 transparent);
+  backdrop-filter: blur(calc(var(--tile-blur) + 1px)) saturate(var(--tile-saturate));
+  -webkit-backdrop-filter: blur(calc(var(--tile-blur) + 1px)) saturate(var(--tile-saturate));
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }

@@ -30,18 +30,26 @@ fn emit_todos_changed(app: &AppHandle, snap: &TodoSnapshot) {
 /// invoke 拿到 Ok 后以为写成功了，下次启动数据全没。
 ///
 /// **P1-2 fix**：一次拿 TodoSnapshot + StoreData + path 三个 clone，**立刻**
-/// drop read guard，然后调裸 free function [`crate::todo::persist_to_disk`]
+/// drop guard，然后调裸 free function [`crate::todo::persist_to_disk`]
 /// 写盘。整段 I/O 不持任何 RwLock，旧实现里 RwLockReadGuard 跨 fs write +
 /// sync_all + rename（几十 ms）会让同时到来的 IPC 写命令排队等锁 ——
 /// 拖窗 ~60Hz spawn Moved/Resized 任务 + 用户同时 add_todo 时会感知卡顿。
+/// **P1-3 fix（2026-08-13）**：clone 挪进 write guard（bump_and_snapshot 原子
+/// 取快照 + epoch），见函数体注释。
 async fn persist_and_emit(app: &AppHandle, store: &SharedStore) -> TodoSnapshot {
-    let (snap, data, path) = {
-        let s = store.read().await;
-        (s.snapshot(), s.data_clone(), s.data_path_clone())
+    // **P1-3 fix（2026-08-13 全量审查）**：快照与 epoch 在**写锁**内原子取得
+    // （bump_and_snapshot）。PERSIST_LOCK 只串行化 I/O —— 旧实现 read guard
+    // 取快照 + 锁外写盘，与 geom debounce / 其他 CRUD persist 交错时旧快照
+    // 可能后写盘覆盖新数据（lost-update）。
+    let (snap, path, data, epoch) = {
+        let mut s = store.write().await;
+        let snap = s.snapshot();
+        let (path, data, epoch) = s.bump_and_snapshot();
+        (snap, path, data, epoch)
     };
     match path {
         Some(p) => {
-            if let Err(e) = crate::todo::persist_to_disk(&p, &data) {
+            if let Err(e) = crate::todo::persist_to_disk(&p, &data, epoch) {
                 tracing::error!("persist failed: {}", e);
                 let _ = app.emit("usticky://persist-failed", e.to_string());
             }
@@ -60,14 +68,16 @@ async fn persist_and_emit(app: &AppHandle, store: &SharedStore) -> TodoSnapshot 
 ///
 /// **P1-2 fix**：跟 [`persist_and_emit`] 共享同一份"clone snapshot → drop guard
 /// → 调裸 [`persist_to_disk`]"模板，零 RwLock 跨 I/O。
+/// **P1-3 fix**：clone 在 write guard 内（bump_and_snapshot）。
 async fn persist_only(app: &AppHandle, store: &SharedStore) {
-    let (path, data) = {
-        let s = store.read().await;
-        (s.data_path_clone(), s.data_clone())
+    // **P1-3 fix**：同 persist_and_emit —— 写锁内取快照 + epoch。
+    let (path, data, epoch) = {
+        let mut s = store.write().await;
+        s.bump_and_snapshot()
     };
     match path {
         Some(p) => {
-            if let Err(e) = crate::todo::persist_to_disk(&p, &data) {
+            if let Err(e) = crate::todo::persist_to_disk(&p, &data, epoch) {
                 tracing::error!("persist failed: {}", e);
                 let _ = app.emit("usticky://persist-failed", e.to_string());
             }
@@ -236,12 +246,15 @@ pub async fn restore_todo(
         }
     };
     // 实际插入了 -> persist。失败则回滚（删掉刚插入的，让内存跟磁盘一致）。
-    let (snap, data, path) = {
-        let s = store.read().await;
-        (s.snapshot(), s.data_clone(), s.data_path_clone())
+    // **P1-3 fix**：写锁内取快照 + epoch（同 persist_and_emit）。
+    let (snap, path, data, epoch) = {
+        let mut s = store.write().await;
+        let snap = s.snapshot();
+        let (path, data, epoch) = s.bump_and_snapshot();
+        (snap, path, data, epoch)
     };
     let persist_err: Option<String> = match path {
-        Some(p) => crate::todo::persist_to_disk(&p, &data)
+        Some(p) => crate::todo::persist_to_disk(&p, &data, epoch)
             .err()
             .map(|e| e.to_string()),
         None => Some("data path not initialized".to_string()),
@@ -717,12 +730,13 @@ pub async fn set_quick_add_shortcut(
     }
 
     // 3. **P1-2 fix**：裸 persist_only helper，零 RwLock 跨 I/O。
-    let (path, data) = {
-        let s = store.read().await;
-        (s.data_path_clone(), s.data_clone())
+    //    **P1-3 fix**：写锁内取快照 + epoch。
+    let (path, data, epoch) = {
+        let mut s = store.write().await;
+        s.bump_and_snapshot()
     };
     if let Some(p) = path {
-        if let Err(e) = crate::todo::persist_to_disk(&p, &data) {
+        if let Err(e) = crate::todo::persist_to_disk(&p, &data, epoch) {
             tracing::error!("set_quick_add_shortcut persist failed: {}", e);
             // 回滚 in-memory state 到 previous
             store.write().await.set_quick_add_shortcut(previous.clone());

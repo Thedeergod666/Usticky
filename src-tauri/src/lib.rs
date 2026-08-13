@@ -108,13 +108,18 @@ async fn geom_persist_loop(store: SharedStore, app: tauri::AppHandle) {
             }
         }
         // trailing edge → 落盘
-        let (path, data) = {
-            let s = store.read().await;
-            (s.data_path_clone(), s.data_clone())
+        // **P1-3 fix（2026-08-13 全量审查）**：写锁内取快照 + epoch。旧实现
+        // read guard 取快照 + 锁外写盘，与 add_todo 等 CRUD persist 交错时，
+        // 旧快照可能后写盘把刚添加的 todo 覆盖掉（内存有、磁盘没有，退出
+        // 后静默丢失）。bump_and_snapshot + persist_to_disk 的 epoch 比对
+        // 保证"最后一次写入必然携带最新状态"。
+        let (path, data, epoch) = {
+            let mut s = store.write().await;
+            s.bump_and_snapshot()
         };
         match path {
             Some(p) => {
-                if let Err(e) = crate::todo::persist_to_disk(&p, &data) {
+                if let Err(e) = crate::todo::persist_to_disk(&p, &data, epoch) {
                     tracing::error!("debounced geom persist failed: {}", e);
                     let _ = app.emit("usticky://persist-failed", e.to_string());
                 }

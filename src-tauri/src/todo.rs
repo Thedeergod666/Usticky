@@ -5,12 +5,14 @@
 //   - 原子写：write to tmp + rename（避免崩溃中途留下半截文件）
 //   - Unix 0600 权限（其它用户不能读你的 todo）
 //   - 解析失败 → backup 到 todos.json.bak.<ts>，用空 store 顶上
+//     （此时**跳过**孤儿附件扫描 —— 空 store 会把 attachments/ 全删光）
 //   - 内存态在 Store 里，IPC 走 &SharedStore (Arc<RwLock<Store>>)
 //
 // 不需要 polling / backoff —— todo 是被动存储，事件驱动。
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -156,12 +158,23 @@ impl Default for StoreData {
 pub struct Store {
     data: StoreData,
     data_path: Mutex<Option<PathBuf>>,
+    /// 变更代际（epoch）：每次 persist 快照在写锁内 +1，随快照一起传给
+    /// [`persist_to_disk`]。落盘时比对 [`LAST_PERSISTED_EPOCH`] —— 旧代际的
+    /// 快照直接跳过，杜绝"旧快照后写盘覆盖新数据"的 lost-update
+    /// （geom debounce 循环 / CRUD persist / restore 等并发路径共用）。
+    /// 不序列化进 todos.json。
+    epoch: u64,
 }
 
 impl Store {
     /// 加载或初始化 store。App 启动时调用一次。
     pub fn load_or_init(app: &AppHandle) -> Result<Self> {
         let data_path = resolve_data_path(app)?;
+        // 解析是否成功 —— 失败时用空 store 顶上，**必须跳过**孤儿附件扫描
+        // （空 store 的 live 集合为空，purge_orphan_attachments 会把
+        // attachments/ 里每一个文件当孤儿删掉；.bak 只备份了 todos.json
+        // 元数据，图片附件没有备份，不可逆）。
+        let mut loaded_ok = true;
         let data = if data_path.exists() {
             match load_from_disk(&data_path) {
                 Ok(d) => d,
@@ -169,6 +182,7 @@ impl Store {
                     // 解析失败 → backup 后用空 store 顶上，不阻塞启动
                     tracing::warn!("todos.json 解析失败 ({}), backup + 启动空 store", e);
                     backup_corrupt_file(&data_path)?;
+                    loaded_ok = false;
                     StoreData::default()
                 }
             }
@@ -188,27 +202,19 @@ impl Store {
         let store = Self {
             data,
             data_path: Mutex::new(Some(data_path)),
+            epoch: 0,
         };
         // 启动兜底：清掉上次崩溃/异常退出留下的孤儿附件文件
         // （删除已延后到前端 undo 栈，见 commands::purge_attachment）。
-        store.purge_orphan_attachments();
+        // 解析失败（loaded_ok=false）时跳过 —— 见上方注释。
+        if loaded_ok {
+            store.purge_orphan_attachments();
+        }
         Ok(store)
     }
 
     pub fn todos(&self) -> &[Todo] {
         &self.data.todos
-    }
-
-    pub fn todos_sorted(&self, status: TodoStatus) -> Vec<Todo> {
-        let mut v: Vec<Todo> = self
-            .data
-            .todos
-            .iter()
-            .filter(|t| t.status == status)
-            .cloned()
-            .collect();
-        v.sort_by_key(|t| t.order);
-        v
     }
 
     pub fn add(&mut self, title: String) -> Todo {
@@ -673,31 +679,24 @@ impl Store {
             .and_then(|p| p.parent().map(|d| d.join("attachments")))
     }
 
-    /// 拿 data_path（不可变引用版本）。给 [`persist`] 内部用。
-    fn data_path(&self) -> Result<PathBuf> {
-        self.data_path
+    /// 在写锁内 bump epoch + clone (path, data) —— persist 快照必须与 epoch
+    /// 原子。调用方**必须已持有 write guard**（本方法取 `&mut self`）。
+    ///
+    /// **P1-3 fix（2026-08-13 全量审查）**：旧实现是"read guard 内 clone 快照
+    /// → drop guard → 调 [`persist_to_disk`]"。PERSIST_LOCK 只串行化 I/O，不保护
+    /// 快照读取 —— 交错序列（geom 取旧快照 → add_todo 落盘新快照 → geom 用旧
+    /// 快照覆盖）会让磁盘最终缺新 todo，内存有、退出后静默丢失。
+    /// 现在快照与 epoch 都在写锁内取：任何后续 mutation 会拿到更新的 epoch，
+    /// 其快照是本次快照的超集；[`persist_to_disk`] 落盘时按 epoch 拒绝 stale
+    /// 写入 —— "最后一次写入必然携带最新状态"。
+    pub fn bump_and_snapshot(&mut self) -> (Option<PathBuf>, StoreData, u64) {
+        self.epoch += 1;
+        let path = self
+            .data_path
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .context("data_path not initialized")
-    }
-
-    /// 拿当前 data 的 clone —— 给调用方在 drop RwLock guard 后自己调 [`persist_to_disk`]。
-    /// 调用方应已 clone 出 path 后才调 [`persist_to_disk`]，否则 data 跟磁盘上的
-    /// 数据可能跨并发写不一致（但 [`persist_to_disk`] 内部的静态 `PERSIST_LOCK`
-    /// 串行化了实际 I/O，所以这是 OK 的）。
-    pub fn data_clone(&self) -> StoreData {
-        self.data.clone()
-    }
-
-    /// 持久化（带 data_path lookup 的便捷方法）。内部走 [`persist_to_disk`]，
-    /// 不持 RwLock 跨 I/O。
-    ///
-    /// **P1-2 fix**：之前用 self.persist_lock（每 store 一把），现在 [`persist_to_disk`]
-    /// 改成 process 级静态锁（`OnceLock<Mutex<()>>`）—— 同一进程内所有 store
-    /// 共享一把 I/O 锁，多 store 路径下也安全（v0.1 只一个 store，行为兼容）。
-    pub fn persist(&self, _app: &AppHandle) -> Result<()> {
-        persist_to_disk(&self.data_path()?, &self.data)
+            .clone();
+        (path, self.data.clone(), self.epoch)
     }
 }
 
@@ -731,8 +730,19 @@ fn load_from_disk(path: &Path) -> Result<StoreData> {
 /// 也能保证 tmp 文件名冲突时仍串行写。
 static PERSIST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-/// 裸 I/O 函数：拿 `data` + `path` 写盘，**不**访问 Store —— 调用方应已 drop
-/// 任何 RwLock guard 后再调本函数。
+/// 已成功落盘的最大 epoch —— 只在 [`persist_to_disk`] 的 PERSIST_LOCK
+/// 临界区内更新。**P1-3 fix**：stale 快照（epoch 更小）拒绝写盘，
+/// 见 [`Store::bump_and_snapshot`]。
+static LAST_PERSISTED_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// 裸 I/O 函数：拿 `data` + `path` + `epoch` 写盘，**不**访问 Store ——
+/// 调用方应已 drop 任何 RwLock guard 后再调本函数。
+///
+/// **P1-3 fix（2026-08-13 全量审查）**：新增 `epoch` 参数。快照与 epoch 在
+/// 写锁内原子取得（[`Store::bump_and_snapshot`]）；本函数在 PERSIST_LOCK
+/// 内先比对 [`LAST_PERSISTED_EPOCH`] —— 已有一份更新的快照落盘则直接
+/// 跳过本次写入（本次快照是那份的子集，写盘反而会用旧数据覆盖新数据）。
+/// epoch 在写锁内单调递增，不存在同代际并发写。
 ///
 /// 实现要点：
 ///   - **P2-1 fix**：tmp 文件用 `OpenOptions::mode(0o600)` 在 create 时直接定
@@ -745,9 +755,20 @@ static PERSIST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 ///     对目录是 no-op，省 cfg 掉。
 ///   - **P1-2 fix**：通过 `PERSIST_LOCK` 静态串行化所有并发的 tmp 写 + chmod +
 ///     rename，避免 60Hz Moved/Resized + 同时 add_todo 时 tmp 文件互相覆盖。
-pub fn persist_to_disk(path: &Path, data: &StoreData) -> Result<()> {
+pub fn persist_to_disk(path: &Path, data: &StoreData, epoch: u64) -> Result<()> {
     let lock = PERSIST_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    // **P1-3 fix**：stale 快照拒绝写盘。有更新代际的完整快照已落盘时，
+    // 本快照（其子集）写盘会把新数据覆盖回旧数据。
+    if epoch < LAST_PERSISTED_EPOCH.load(Ordering::SeqCst) {
+        tracing::debug!(
+            "persist skipped: stale epoch {} < last persisted {}",
+            epoch,
+            LAST_PERSISTED_EPOCH.load(Ordering::SeqCst)
+        );
+        return Ok(());
+    }
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("create data dir")?;
@@ -798,11 +819,14 @@ pub fn persist_to_disk(path: &Path, data: &StoreData) -> Result<()> {
             }
         }
     }
+    // 落盘成功才推进 epoch 水位（PERSIST_LOCK 临界区内，无并发窗口）。
+    LAST_PERSISTED_EPOCH.store(epoch, Ordering::SeqCst);
     Ok(())
 }
 
 fn backup_corrupt_file(path: &Path) -> Result<()> {
-    let ts = chrono::Utc::now().timestamp();
+    // 毫秒级时间戳：秒级会在同秒两次失败时互相覆盖（第一个损坏现场丢失）。
+    let ts = chrono::Utc::now().timestamp_millis();
     let backup = path.with_extension(format!("json.bak.{}", ts));
     fs::rename(path, backup).context("backup corrupt file")?;
     Ok(())
@@ -822,6 +846,7 @@ mod reorder_tests {
                 ..StoreData::default()
             },
             data_path: Mutex::new(None),
+            epoch: 0,
         }
     }
 
