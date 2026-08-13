@@ -304,7 +304,7 @@ pub fn restore_level_after_quick_add<R: Runtime>(app: &AppHandle<R>, mode: PinMo
 /// 与 macOS 端对齐：旧实现发屏幕坐标让前端换算，跨屏/缩放假设易碎）。
 /// Win 上 `GetCursorPos` / `GetWindowRect` 是 physical px，emit 前除 scale
 /// 转 logical（前端的 clientWidth/scrollHeight 都是 logical px）。
-#[derive(serde::Serialize, Clone, Copy)]
+#[derive(serde::Serialize, Clone, Copy, PartialEq)]
 struct HoverPos {
     x: f64,
     y: f64,
@@ -349,6 +349,10 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
             }
             let mut last_inside = false;
             let mut last_emitted = false;
+            // **P3 fix（PERF_AUDIT.md）**：hover-pos 静止去重。鼠标静止时
+            // (x,y,over_preview) 逐位相等，跳过 emit 把 20Hz IPC 归零。移动 /
+            // over_preview 变化即不同 → 照常 emit。窗口隐藏时清缓存（见下）。
+            let mut last_emitted_pos: Option<HoverPos> = None;
             // **P2-6 fix**：re-assert TopMost 节流计数器。每 50ms tick 加 1，
             // 每 10 tick（500ms）做一次 z-order 操作。
             let mut tick_count: u64 = 0;
@@ -377,6 +381,8 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                 // hit-test + 应用 z-order。
                 if let Some(win) = &win_opt {
                     if !win.is_visible().unwrap_or(false) {
+                        // P3：隐藏时清坐标去重缓存，重新上屏后第一帧重发坐标
+                        last_emitted_pos = None;
                         continue;
                     }
                 }
@@ -435,14 +441,16 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                 if inside && !hwnd_cache.is_null() {
                     let logical_x = (pt.x - rect.left) as f64 / scale;
                     let logical_y = (pt.y - rect.top) as f64 / scale;
-                    let _ = app.emit(
-                        "usticky://floating-hover-pos",
-                        HoverPos {
-                            x: logical_x,
-                            y: logical_y,
-                            over_preview,
-                        },
-                    );
+                    let pos = HoverPos {
+                        x: logical_x,
+                        y: logical_y,
+                        over_preview,
+                    };
+                    // P3：静止去重 —— 坐标不变就跳过，消掉 20Hz IPC + elementFromPoint
+                    if last_emitted_pos != Some(pos) {
+                        last_emitted_pos = Some(pos);
+                        let _ = app.emit("usticky://floating-hover-pos", pos);
+                    }
                 }
 
                 // (3) PinBottom 模式：切 z-order

@@ -582,18 +582,24 @@ function closeSelf() {
 
 // ── 加载指定 todo ──
 
-async function loadTodo(id: string) {
+/// 加载指定 todo。`todo` 传入了（preview-todo 事件已带完整对象，P1 fix）就
+/// 跳过 get_todos 全列表往返直接 render；缺省时（初始 URL 加载 /
+/// take_pending_preview_todo 只有 id）才走 get_todos。
+async function loadTodo(id: string, todo?: Todo) {
   perfMark("preview-load-start");
   // 换 todo：作废在途 fit。hover 预览的新尺寸由 Rust open_preview_window
   // 的 reuse 路径一次给到位，这里**不**主动 fit（show 后再 resize 是闪的
   // 根源之一 —— commands/mod.rs preview_logical_size 的 doc comment）。
   cancelFit();
   try {
-    const snap = await invoke<TodoSnapshot>("get_todos");
-    perfMark("preview-get-todos-end");
-    perfMeasureEnd("preview-get-todos", "preview-load-start", "preview-get-todos-end");
-    const todo = snap.todos.find((x) => x.id === id);
-    if (!todo) {
+    let resolved = todo ?? null;
+    if (!resolved) {
+      const snap = await invoke<TodoSnapshot>("get_todos");
+      perfMark("preview-get-todos-end");
+      perfMeasureEnd("preview-get-todos", "preview-load-start", "preview-get-todos-end");
+      resolved = snap.todos.find((x) => x.id === id) ?? null;
+    }
+    if (!resolved) {
       renderMissing();
       // todo 被删 -> 窗口没有存在意义
       closeSelf();
@@ -601,7 +607,7 @@ async function loadTodo(id: string) {
     }
     currentTodoId = id;
     perfMark("preview-render-start");
-    render(todo);
+    render(resolved);
     perfMark("preview-render-end");
     perfMeasureEnd("preview-render", "preview-render-start", "preview-render-end");
     perfMeasureEnd("preview-load-total", "preview-load-start");
@@ -666,11 +672,12 @@ async function init() {
   // 固定窗 label 不同，收不到这个 emit（w.emit 只发给 "preview"），这里加
   // isPinned 守卫只是防御。
   let unlistenSetTodo: UnlistenFn | null = null;
-  listen<{ id: string }>("usticky://preview-todo", (e) => {
+  listen<{ id: string; todo?: Todo }>("usticky://preview-todo", (e) => {
     if (isPinned) return;
     if (e.payload.id && e.payload.id !== currentTodoId) {
       flushPendingSave();
-      void loadTodo(e.payload.id);
+      // P1 fix：事件已带完整 todo，直接传进去省 get_todos 往返
+      void loadTodo(e.payload.id, e.payload.todo);
     }
   })
     .then((fn) => (unlistenSetTodo = fn))

@@ -295,7 +295,7 @@ pub fn restore_level_after_quick_add<R: Runtime>(app: &AppHandle<R>, mode: PinMo
 /// Rust 端同时持有 `NSEvent.mouseLocation` 和 `NSWindow.frame`，两者
 /// 同坐标系（global screen，bottom-left origin，logical points），
 /// 直接相减才是零假设的稳健做法。
-#[derive(serde::Serialize, Clone, Copy)]
+#[derive(serde::Serialize, Clone, Copy, PartialEq)]
 struct HoverPos {
     x: f64,
     y: f64,
@@ -410,6 +410,15 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                 let mut consecutive_dispatch_failures: u8 = 0;
                 const DISPATCH_FAILURE_THRESHOLD: u8 = 3; // 3 × 50ms = 150ms
 
+                // **P3 fix（PERF_AUDIT.md）**：hover-pos 静止去重。旧实现鼠标
+                // 静止在浮窗内也每 50ms emit 一次 hover-pos → 前端 20Hz
+                // elementFromPoint + IPC 解包。记录上次 emit 的 (x,y,over_preview)，
+                // 逐位相等（f64 静止时完全不变）就跳过，把静止态 IPC 归零。
+                // 鼠标移动 / over_preview 变化都会使值不同 → 照常 emit。
+                // 隐藏态 / dispatch 失败兜底重置成 None（见对应分支），保证
+                // 重新上屏 / 恢复后第一帧能重新发坐标。
+                let mut last_emitted_pos: Option<HoverPos> = None;
+
                 loop {
                     thread::sleep(Duration::from_millis(50));
 
@@ -423,6 +432,8 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                         pending_ticks = 0;
                         pending_value = false;
                         consecutive_dispatch_failures = 0;
+                        // P3：清 hover-pos 去重缓存 —— 重新上屏后第一帧要重发坐标
+                        last_emitted_pos = None;
                         continue;
                     }
 
@@ -460,6 +471,8 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                                 LAST_INSIDE.store(false, Ordering::SeqCst);
                                 pending_ticks = 0;
                                 pending_value = false;
+                                // P3：兜底采纳 false 时前端会 reset hover，清坐标缓存
+                                last_emitted_pos = None;
                                 if let Err(e) = app.emit("usticky://floating-hover", false) {
                                     tracing::trace!(error = %e, "emit hover 失败");
                                 }
@@ -500,11 +513,12 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                         // 不在每 tick emit 避免 CSS spring 反复重置起始点。
                         if inside {
                             if let Some(f) = frame {
-                                if let Err(e) = app.emit(
-                                    "usticky://floating-hover-pos",
-                                    viewport_hover_pos(mouse, f, over_preview),
-                                ) {
-                                    tracing::trace!(error = %e, "emit hover-pos 失败");
+                                let pos = viewport_hover_pos(mouse, f, over_preview);
+                                if last_emitted_pos != Some(pos) {
+                                    last_emitted_pos = Some(pos);
+                                    if let Err(e) = app.emit("usticky://floating-hover-pos", pos) {
+                                        tracing::trace!(error = %e, "emit hover-pos 失败");
+                                    }
                                 }
                             }
                         }
@@ -548,11 +562,12 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                     // 每 tick emit。
                     if inside {
                         if let Some(f) = frame {
-                            if let Err(e) = app.emit(
-                                "usticky://floating-hover-pos",
-                                viewport_hover_pos(mouse, f, over_preview),
-                            ) {
-                                tracing::trace!(error = %e, "emit hover-pos 失败");
+                            let pos = viewport_hover_pos(mouse, f, over_preview);
+                            if last_emitted_pos != Some(pos) {
+                                last_emitted_pos = Some(pos);
+                                if let Err(e) = app.emit("usticky://floating-hover-pos", pos) {
+                                    tracing::trace!(error = %e, "emit hover-pos 失败");
+                                }
                             }
                         }
                     }

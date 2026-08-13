@@ -939,8 +939,24 @@ function measurePreviewTextHeight(text: string): number {
 /// 打开 / 切换预览。anchorY = 卡片视口顶（Rust 换算屏幕坐标做跟手定位）；
 /// 文本卡附预测量高度 textH（图片卡由 Rust 按附件宽高比算）。
 /// invoke 失败回滚 previewTodoId/previewPinnedId，防状态卡死。
-function openPreviewFor(id: string, card: HTMLElement | null, pinned: boolean) {
-  previewTodoId = id;
+///
+/// **P2 fix（PERF_AUDIT.md）**：`getBoundingClientRect` + `measurePreviewTextHeight`
+/// （离屏 scrollHeight 读）是强制同步布局，旧实现在 hover 边沿（hoverCard /
+/// processHoverPos）同步跑，`.card-hover` 刚 add 就立刻 flush layout → 卡顿帧。
+/// 改为"存最新参数 + 排 rAF 单槽消费"：measurement 挪进 rAF，与本帧正常
+/// layout 合并（不产生额外同步 flush）；快速横扫换卡时单槽只保留最新一次。
+/// `previewTodoId = id` 仍同步置（状态机依赖它），只有测量 + invoke 延一帧。
+let pendingPreviewOpen: { id: string; card: HTMLElement | null; pinned: boolean } | null = null;
+let previewOpenRafHandle: number | null = null;
+function flushPreviewOpen() {
+  previewOpenRafHandle = null;
+  const req = pendingPreviewOpen;
+  pendingPreviewOpen = null;
+  if (!req) return;
+  const { id, card, pinned } = req;
+  // 期间预览已被关掉（preview-closed / schedulePreviewClose 清了 previewTodoId）
+  // → 放弃这次打开，避免"关了又重开"的竞态（defer 引入的 ~16ms 窗口）。
+  if (previewTodoId !== id) return;
   const args: Record<string, unknown> = { todoId: id, pinned };
   if (card) args.anchorY = card.getBoundingClientRect().top;
   const todo = lastRenderedSnap?.todos.find((t) => t.id === id);
@@ -950,6 +966,13 @@ function openPreviewFor(id: string, card: HTMLElement | null, pinned: boolean) {
     if (previewPinnedId === id) previewPinnedId = null;
     console.debug("[usticky] open_preview_window failed", e);
   });
+}
+function openPreviewFor(id: string, card: HTMLElement | null, pinned: boolean) {
+  previewTodoId = id;
+  pendingPreviewOpen = { id, card, pinned };
+  if (previewOpenRafHandle === null) {
+    previewOpenRafHandle = requestAnimationFrame(flushPreviewOpen);
+  }
 }
 
 /// 统一 grace close：450ms 内鼠标进预览窗（over_preview）/ 回卡片 /

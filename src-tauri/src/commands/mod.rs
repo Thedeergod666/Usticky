@@ -1249,9 +1249,13 @@ pub async fn open_preview_window(
                 .unwrap_or_else(|e| e.into_inner());
             *pending = Some(todo_id.clone());
         }
+        // **P1 perf fix（PERF_AUDIT.md）**：emit 完整 `Todo`，让 preview.ts
+        // 直接 render，省掉每次换卡一次 `get_todos` 全列表序列化 + IPC 往返。
+        // 旧实现只发 id，preview.ts loadTodo 每次都 invoke("get_todos") 拿全
+        // 列表再 find 单条 —— hover 在卡间横扫时每切换一次就全量往返一次。
         w.emit(
             "usticky://preview-todo",
-            serde_json::json!({ "id": todo_id }),
+            serde_json::json!({ "id": todo_id, "todo": todo }),
         )
         .map_err(|e| e.to_string())?;
         // 只在隐藏→上屏时刷新浮窗玻璃（见 doc comment）
