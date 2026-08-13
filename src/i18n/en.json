@@ -58,7 +58,6 @@
   "settings.language.option_en": "English",
   "settings.language.option_zh-CN": "中文",
   "settings.error.load_failed": "Failed to load settings",
-  "settings.error.retry": "Retry",
   "settings.about.tagline": "Local-only floating sticky note. No cloud, no sync.",
   "settings.error.save_failed": "Save failed",
   "settings.shortcut.label": "Quick Add Shortcut",
@@ -66,7 +65,6 @@
   "settings.shortcut.recording": "Press keys…",
   "settings.shortcut.cancel_hint": "Esc to cancel",
   "settings.shortcut.invalid": "Invalid shortcut, try again",
-  "settings.shortcut.save_failed": "Failed to save shortcut",
   "tray.settings": "Settings...",
   "tray.quit": "Quit Usticky"
 }

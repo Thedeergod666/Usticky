@@ -58,7 +58,6 @@
   "settings.language.option_en": "English",
   "settings.language.option_zh-CN": "中文",
   "settings.error.load_failed": "加载设置失败",
-  "settings.error.retry": "重试",
   "settings.about.tagline": "纯本地浮窗便签，不联网，不同步。",
   "settings.error.save_failed": "保存失败",
   "settings.shortcut.label": "快速唤出快捷键",
@@ -66,7 +65,6 @@
   "settings.shortcut.recording": "请按下组合键…",
   "settings.shortcut.cancel_hint": "按 Esc 取消",
   "settings.shortcut.invalid": "无效快捷键，请重试",
-  "settings.shortcut.save_failed": "保存快捷键失败",
   "tray.settings": "设置...",
   "tray.quit": "退出 Usticky"
 }

@@ -111,7 +111,7 @@ function keyEventToAccelerator(e: KeyboardEvent): string | null {
   // 规范化 key 名 → global-hotkey 接受的形式
   let key: string;
   if (e.key === " ") key = "Space";
-  else if (e.key.length === 1) key = e.key.toUpperCase();
+  else if (e.key.length === 1 && /[a-zA-Z0-9]/.test(e.key)) key = e.key.toUpperCase();
   else if (e.key === "Enter") key = "Enter";
   else if (e.key === "Escape") key = "Escape";
   else if (e.key === "Tab") key = "Tab";
@@ -126,7 +126,6 @@ function keyEventToAccelerator(e: KeyboardEvent): string | null {
   else if (e.key === "PageUp") key = "PageUp";
   else if (e.key === "PageDown") key = "PageDown";
   else if (/^F[1-9]$|^F1[0-9]$|^F2[0-4]$/.test(e.key)) key = e.key;
-  else if (e.key.length === 1 && /[a-zA-Z0-9]/.test(e.key)) key = e.key.toUpperCase();
   else return null;  // 不识别的键 → 不录入（避免存到 store 后 parse 失败）
   parts.push(key);
   return parts.join("+");
