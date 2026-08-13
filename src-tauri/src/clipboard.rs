@@ -209,6 +209,13 @@ mod macos_native {
         }
         let bytes = std::fs::read(p).ok()?;
         let (width, height) = super::probe_dims(&bytes);
+        // **P3-6 fix（2026-08-13 全量审查）**：扩展名白名单只按后缀放行，一个
+        // 重命名为 `x.png` 的文本文件（或非图片内容）仍会落盘成 todo。probe_dims
+        // 读格式 header 取尺寸，失败 = 非 image crate 能解码的图片 -> 拒绝，
+        // 走后续 TIFF / 文本路径，不生成裂图 todo。
+        if width.is_none() && height.is_none() {
+            return None;
+        }
         let name = p.file_stem()?.to_str().map(|s| s.to_string());
         Some(ClipboardImage {
             data: bytes,
@@ -223,10 +230,26 @@ mod macos_native {
     /// TIFF 字节 → PNG（image crate 解码 + 重编码）。预览窗口 / 缩略图的
     /// <img> 不认 TIFF，必须转。
     fn transcode_tiff_to_png(bytes: &[u8]) -> Option<ClipboardImage> {
-        let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        // **P2-3 fix（2026-08-13 全量审查）**：decode 前先 probe 像素尺寸。
+        // TIFF 等格式压缩比极高，~20MB 的合法 TIFF 可编码 100000×100000，
+        // `reader.decode()` 会按像素分配 ~40GB RGBA buffer → OOM（release 配置
+        // `panic = "abort"` 无恢复路径）。MAX_IMAGE_BYTES 只在编码字节侧拦，
+        // 拦不住解码后的像素体积 —— 插件路径（read_plugin_image）已有同款
+        // 预检，TIFF 路径之前漏了。consume 一次 reader 取尺寸，通过后再建一次 decode。
+        let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
+            .ok()?
+            .into_dimensions()
             .ok()?;
-        let img = reader.decode().ok()?;
+        let rgba_bytes = (w as u64).saturating_mul(h as u64).saturating_mul(4);
+        if rgba_bytes > MAX_IMAGE_BYTES as u64 {
+            return None;
+        }
+        let img = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?
+            .decode()
+            .ok()?;
         let (w, h) = (img.width(), img.height());
         let mut buf = std::io::Cursor::new(Vec::new());
         img.write_to(&mut buf, image::ImageFormat::Png).ok()?;

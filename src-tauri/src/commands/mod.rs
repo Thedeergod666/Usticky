@@ -160,29 +160,27 @@ pub async fn update_todo(
     };
     let maybe_updated = {
         let mut s = store.write().await;
-        // **P2-4 fix**：update 现在返 Result<Option<Todo>>。None = no-op
-        // （title/status 都是 None 的误用），跳过 persist + emit，省一次
-        // 磁盘 I/O 和一次 todos-changed 渲染。Some = 实际改了。
-        s.update(&id, title, status_enum)
-            .map_err(|e| e.to_string())?
+        // **P3-2 fix（2026-08-13 全量审查）**：在写锁内 clone 当前 todo。
+        // update() no-op 时返 Ok(None) 后旧实现**重新拿 read lock** find id，
+        // 该 find 与并发 delete 竞态落空 → 对一次本应静默成功的 no-op 调用
+        // 返回 not_found 错误（用户看到无中生有的错误提示）。clone 在写锁内
+        // 完成，与 update 的 index 查找原子一致 —— no-op 时直接返 clone。
+        let existing = s.todos().iter().find(|t| t.id == id).cloned();
+        // **P2-4 fix**：update 返 Result<Option<Todo>>。None = no-op，跳过
+        // persist + emit；Some = 实际改了。
+        let updated = s.update(&id, title, status_enum).map_err(|e| e.to_string())?;
+        (updated, existing)
     };
     match maybe_updated {
-        Some(updated) => {
+        (Some(updated), _) => {
             persist_and_emit(&app, &store).await;
             Ok(updated)
         }
-        None => {
-            // No-op：fetch current state 返给前端，**不**触发 persist / emit。
-            let cur = store
-                .read()
-                .await
-                .todos()
-                .iter()
-                .find(|t| t.id == id)
-                .cloned()
-                .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?;
+        (None, Some(cur)) => {
+            // No-op：返当前状态，**不**触发 persist / emit。
             Ok(cur)
         }
+        (None, None) => Err(rust_i18n::t!("commands.error.not_found").to_string()),
     }
 }
 
@@ -292,6 +290,25 @@ pub async fn purge_attachment(store: State<'_, SharedStore>, file: String) -> Re
         || file.contains('\0')
     {
         return Err("invalid attachment file name".to_string());
+    }
+    // **P2-2 + P3-2 fix（2026-08-13 全量审查）**：引用检查。delete_todo 持久化
+    // 失败时（磁盘满 / 权限被剥）内存已删、磁盘未删 + 前端 undo 栈 8s 超时
+    // 无条件 purge -> 重启后 todo 复活但图片永久丢失（破图）。同样地，
+    // "删 A → 撤销 A → 再删 A" 第二次删除触发 clearUndoEntry purge fA，
+    // 而 fA 已被第一次 restore 恢复回 store（live 引用）→ 撤销后再裂图。
+    // 引用仍在则跳过删除，让孤儿扫描或下次 delete 收尾。
+    {
+        let s = store.read().await;
+        let still_referenced = s
+            .todos()
+            .iter()
+            .any(|t| t.attachment.as_ref().map(|a| a.file == file).unwrap_or(false));
+        if still_referenced {
+            tracing::warn!(
+                "purge_attachment skipped: {file} 仍被 todo 引用（let purge_orphan_attachments 兜底）"
+            );
+            return Ok(());
+        }
     }
     let dir = store.read().await.attachments_dir();
     if let Some(dir) = dir {
@@ -439,6 +456,13 @@ pub async fn reset_floating_window(
 
 #[tauri::command]
 pub async fn resize_floating_window(app: AppHandle, height: f64) -> Result<(), String> {
+    // **P3-3 fix（2026-08-13 全量审查）**：拒绝 NaN/Inf。`(height * scale).round() as u32`
+    // 中 NaN → 0、+Inf → u32::MAX；max_h_in_mon.max(160) 只保护上限不保护下限，
+    // 最终 final_h 可能是 0，让浮窗塌掉。同文件 resize_preview_window 已有
+    // is_finite() 防御，这里对齐。
+    if !height.is_finite() {
+        return Err("resize_floating_window: height 不是有限值".to_string());
+    }
     if let Some(w) = app.get_webview_window("floating") {
         let cur = w.outer_size().map_err(|e| e.to_string())?;
         // 前端传的 height 是 CSS 像素（logical），PhysicalSize 期望物理像素。
@@ -858,6 +882,20 @@ pub async fn paste_from_clipboard(
             })
         }
         crate::clipboard::ClipboardContent::Image(img) => {
+            // **P3-5 fix（2026-08-13 全量审查）**：先决定 title 再写文件。
+            // 旧实现先 open/write 文件，再 validate_title。输入框 Cmd+V 传入
+            // 超长标题（>114514）会失败返 Err，但附件文件已落盘 → 残留 ≤25MB
+            // 孤儿文件只能等下次启动 purge_orphan_attachments 扫掉。把
+            // validate_title 前置，错误路径不接触磁盘。
+            let title = match title.as_deref().map(str::trim) {
+                Some(n) if !n.is_empty() => validate_title(n)?,
+                _ => match img.name.as_deref().map(str::trim) {
+                    Some(n) if !n.is_empty() => validate_title(n)?,
+                    // 纯图 todo：无标题。前端 buildTodoRow 见空标题让 .todo-title
+                    // 折叠（:empty），图片独占整宽（v0.2.6 inline 图片 1:1 布局）。
+                    _ => String::new(),
+                },
+            };
             let dir = store
                 .read()
                 .await
@@ -897,15 +935,6 @@ pub async fn paste_from_clipboard(
                 format!("write attachment: {e}")
             })?;
 
-            let title = match title.as_deref().map(str::trim) {
-                Some(n) if !n.is_empty() => validate_title(n)?,
-                _ => match img.name.as_deref().map(str::trim) {
-                    Some(n) if !n.is_empty() => validate_title(n)?,
-                    // 纯图 todo：无标题。前端 buildTodoRow 见空标题让 .todo-title
-                    // 折叠（:empty），图片独占整宽（v0.2.6 inline 图片 1:1 布局）。
-                    _ => String::new(),
-                },
-            };
             let attachment = crate::todo::TodoAttachment {
                 file,
                 mime: img.mime.to_string(),
@@ -937,6 +966,22 @@ static PENDING_PREVIEW_TODO: std::sync::OnceLock<std::sync::Mutex<Option<String>
 
 fn pending_preview_todo() -> &'static std::sync::Mutex<Option<String>> {
     PENDING_PREVIEW_TODO.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// **P1-4 fix（2026-08-13 全量审查）**：清空 PENDING_PREVIEW_TODO。
+///
+/// 旧实现只在 preview.ts init 末尾 take 时清空，窗口销毁 / hide / 浮窗
+/// CloseRequested 等路径下槽位残留旧实例最后一次 hover 的 id。之后
+/// `open_preview_window` 走 fresh-create 路径（URL 带正确 id）会被 take
+/// 到的陈旧 id 覆盖 → 预览显示错误 todo，编辑打到错误对象。
+///
+/// lib.rs 的 hide_dismiss / CloseRequested 也直接 `p.close()` 预览窗，
+/// 必须走同一份清槽入口。
+pub(crate) fn clear_pending_preview_todo() {
+    let mut pending = pending_preview_todo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *pending = None;
 }
 
 #[tauri::command]
@@ -1036,6 +1081,8 @@ fn close_hover_preview_for_pin(app: &AppHandle) {
     }
     let _ = app.emit("usticky://preview-closed", ());
     let _ = app.emit("usticky://backdrop-refresh", ());
+    // **P1-4 fix**：pin 路径关 hover 预览 → 清 pending 槽位。
+    clear_pending_preview_todo();
 }
 
 /// 固定窗的关窗兜底（preview.ts closeSelf 的 win.close 失败时调用）。
@@ -1281,6 +1328,11 @@ pub async fn open_preview_window(
 
     let title = rust_i18n::t!("window.preview").to_string();
     let url = WebviewUrl::App(format!("preview.html?id={}", todo_id).into());
+    // **P1-4 fix**：fresh-create 之前清掉陈旧 PENDING_PREVIEW_TODO。
+    // 理论上 close_preview_window / close_hover_preview_for_pin / lib.rs
+    // hide_dismiss / CloseRequested 已清，这里再次清兜底"任何遗漏路径"
+    // （prewarm 销毁、label dedup force close 等边缘路径）。
+    clear_pending_preview_todo();
     let _win = WebviewWindowBuilder::new(&app, "preview", url)
         .title(title)
         .inner_size(w_logical, h_logical)
@@ -1337,6 +1389,9 @@ pub async fn close_preview_window(app: AppHandle, force: Option<bool>) -> Result
         // 点别的应用触发 onFocusChanged 才摘）。preview.ts beforeunload 仍会
         // 再 emit 一次，listener 幂等无副作用。
         let _ = app.emit("usticky://preview-closed", ());
+        // **P1-4 fix**：清空 PENDING_PREVIEW_TODO，避免下次 fresh-create 时
+        // 陈旧槽位覆盖新 todo id（见 [`clear_pending_preview_todo`]）。
+        clear_pending_preview_todo();
     }
     Ok(())
 }
@@ -1365,17 +1420,53 @@ pub async fn get_perf_path() -> Option<String> {
 #[tauri::command]
 pub async fn dump_perf(path: String, data: serde_json::Value) -> Result<(), String> {
     use std::io::Write;
+    // **P1-2 fix（2026-08-13 全量审查）**：安全守卫。旧实现把调用方传入的
+    // 任意 path 当目标 + create_dir_all + rename，任意 webview 可写任意文件
+    // （`todos.json` / `~/.ssh/authorized_keys`），违背"最小攻击面"姿态。
+    // 现在要求：USTICKY_PERF_OUT 已设置 + target 的 canonical 路径必须落
+    // 在 USTICKY_PERF_OUT 目录之内。
+    let perf_out = std::env::var("USTICKY_PERF_OUT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "dump_perf: USTICKY_PERF_OUT not set".to_string())?;
     let target = std::path::PathBuf::from(&path);
-    if let Some(parent) = target.parent() {
+
+    // 允许 USTICKY_PERF_OUT 是目录或目标文件路径：取其 canonical 作为允许根。
+    // target 可能尚不存在 -> canonicalize 其 parent 再 join 文件名。
+    let allowed_root = std::path::Path::new(&perf_out);
+    let allowed_dir = if allowed_root.is_dir() {
+        std::fs::canonicalize(allowed_root)
+    } else {
+        allowed_root
+            .parent()
+            .map(|p| std::fs::canonicalize(p))
+            .unwrap_or_else(|| std::fs::canonicalize(std::path::Path::new(".")))
+    }
+    .map_err(|e| format!("dump_perf: invalid USTICKY_PERF_OUT {perf_out:?}: {e}"))?;
+
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let canon_parent =
+        std::fs::canonicalize(parent).map_err(|e| format!("dump_perf: invalid path {path:?}: {e}"))?;
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| "dump_perf: path has no file name".to_string())?;
+    let canon_target = canon_parent.join(file_name);
+    if !canon_target.starts_with(&allowed_dir) {
+        return Err(format!(
+            "dump_perf: target {path:?} outside USTICKY_PERF_OUT directory"
+        ));
+    }
+
+    if let Some(parent) = canon_target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create parent: {e}"))?;
     }
-    let tmp = target.with_extension("json.partial");
+    let tmp = canon_target.with_extension("json.partial");
     let json = serde_json::to_vec(&data).map_err(|e| e.to_string())?;
     {
         let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
         f.write_all(&json).map_err(|e| format!("write tmp: {e}"))?;
         f.sync_all().map_err(|e| format!("fsync tmp: {e}"))?;
     }
-    std::fs::rename(&tmp, &target).map_err(|e| format!("atomic rename: {e}"))?;
+    std::fs::rename(&tmp, &canon_target).map_err(|e| format!("atomic rename: {e}"))?;
     Ok(())
 }
