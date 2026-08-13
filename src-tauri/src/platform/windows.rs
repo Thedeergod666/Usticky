@@ -68,9 +68,9 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::{HWND as WIN_HWND, POINT, RECT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowRect, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WindowFromPoint, ASFW_ANY,
-    GA_ROOT, GWL_EXSTYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, WS_EX_TOPMOST,
+    GetWindowRect, IsWindow, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WindowFromPoint,
+    ASFW_ANY, GA_ROOT, GWL_EXSTYLE, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
 };
 
 use crate::todo::PinMode;
@@ -140,24 +140,46 @@ unsafe fn apply_z_order(hwnd: *mut core::ffi::c_void, z: ZOrder) {
     // 路 B：直接改 style bit
     // 64-bit 进程必须用 GetWindowLongPtrW / SetWindowLongPtrW（返回 LONG_PTR = i64），
     // 避免 LONG (i32) 截断。windows-sys 0.59 把两者放在同一 feature gate。
+    //
+    // **P3-13 fix（2026-08-13 全量审查）**：返回值检查。GetWindowLongPtrW 失败
+    // 返 0 → OR 退化成只含 TOPMOST 单 bit；若 SetWindowLongPtrW 碰巧成功
+    // 会 wipe 掉 WS_EX_LAYERED / WS_EX_NOREDIRECTIONBITMAP 等其它 ex-style，
+    // 透明玻璃窗变不透明黑块。失败时 log 后早返，不再做后续 SetWindowPos
+    // （避免 style 已改但 z-order 失败导致分叉）。
     match z {
         ZOrder::TopMost => {
             let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let new_style: isize = ex_style | (WS_EX_TOPMOST as isize);
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
+            if ex_style == 0 {
+                let err = unsafe { GetLastError() };
+                tracing::debug!(error = err, "apply_z_order: GetWindowLongPtrW 失败，跳过 style 写入");
+            } else {
+                let new_style: isize = ex_style | (WS_EX_TOPMOST as isize);
+                if SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style) == 0 {
+                    let err = unsafe { GetLastError() };
+                    tracing::debug!(error = err, "apply_z_order: SetWindowLongPtrW(TopMost) 失败");
+                }
+            }
         }
         ZOrder::Bottom | ZOrder::NotTopMost => {
             // Bottom + NotTopMost 都显式 AND-out WS_EX_TOPMOST。
             // WebView2 会在自己的 message handler 里 re-assert WS_EX_TOPMOST，
             // 不显式清的话 Normal 模式在 Win10/11 上不可靠。
             let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let new_style: isize = ex_style & !(WS_EX_TOPMOST as isize);
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
+            if ex_style == 0 {
+                let err = unsafe { GetLastError() };
+                tracing::debug!(error = err, "apply_z_order: GetWindowLongPtrW 失败，跳过 style 写入");
+            } else {
+                let new_style: isize = ex_style & !(WS_EX_TOPMOST as isize);
+                if SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style) == 0 {
+                    let err = unsafe { GetLastError() };
+                    tracing::debug!(error = err, "apply_z_order: SetWindowLongPtrW(clear TopMost) 失败");
+                }
+            }
         }
     }
 
     // 路 A：z-order API + flush 路 B 的 cache
-    SetWindowPos(
+    if SetWindowPos(
         hwnd,
         insert_after,
         0,
@@ -165,7 +187,11 @@ unsafe fn apply_z_order(hwnd: *mut core::ffi::c_void, z: ZOrder) {
         0,
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-    );
+    ) == 0
+    {
+        let err = unsafe { GetLastError() };
+        tracing::debug!(error = err, ?z, "apply_z_order: SetWindowPos 失败");
+    }
 }
 
 // ── 公开 API ──
@@ -265,13 +291,23 @@ pub fn activate_previous_app_after_quick_add() {
     if hwnd == 0 {
         return;
     }
-    // SAFETY: AllowSetForegroundWindow + SetForegroundWindow 都是 thread-safe
+    let hwnd_w = hwnd as WIN_HWND;
+    // SAFETY: AllowSetForegroundWindow + SetForegroundWindow + IsWindow 都是
+    // thread-safe Win32 API。
     unsafe {
+        // **P3-15 fix（2026-08-13 全量审查）**：HWND 复用校验。原 app 在
+        // quick-add 会话期间被关掉（Alt+F4 / 崩溃 / 退出），句柄被 OS
+        // 复用给完全无关的窗口 → SetForegroundWindow 静默把焦点甩给
+        // 那个窗口。IsWindow 0 即"句柄已失效"，提前 return。
+        if IsWindow(hwnd_w) == 0 {
+            tracing::trace!("activate_previous_app: saved hwnd 已失效（被关闭或复用），跳过");
+            return;
+        }
         // 放权让任何进程都能接 foreground —— 不调的话 SetForegroundWindow
         // 大概率被 OS 拒绝（除非 Usticky 此刻刚好是前台进程，那 dismiss 路径
         // 上调用方就是前台，可以直接调；保守起见还是放权）
         AllowSetForegroundWindow(ASFW_ANY);
-        let _ = SetForegroundWindow(hwnd as WIN_HWND);
+        let _ = SetForegroundWindow(hwnd_w);
     }
 }
 
@@ -381,8 +417,18 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                 // hit-test + 应用 z-order。
                 if let Some(win) = &win_opt {
                     if !win.is_visible().unwrap_or(false) {
-                        // P3：隐藏时清坐标去重缓存，重新上屏后第一帧重发坐标
+                        // **P3-11 fix（2026-08-13 全量审查）**：对 macOS 隐藏门控
+                        // 的对齐 —— Win 端漏重置 last_inside / last_emitted /
+                        // pending_inside / pending_count。隐藏期间不推进
+                        // tick_count，show 后首帧若恰逢 10 倍 tick 还会触发
+                        // 一次无意义 TopMost re-assert，残留 TopMost 上屏
+                        // 视觉"无故闪在最上层"。完全重置确保显示后从干净
+                        // 状态开始新一帧 hover 评估。
+                        last_inside = false;
+                        last_emitted = false;
                         last_emitted_pos = None;
+                        pending_inside = None;
+                        pending_count = 0;
                         continue;
                     }
                 }
@@ -416,13 +462,18 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                     let _ = app.emit("usticky://floating-hover", inside);
                 }
 
-                // **P1-8 fix**：刷新 scale 缓存。第一 tick 或每 60 tick（~3s）
-                // 重新从 WebviewWindow 取一次 scale_factor，捕获 DPI 切换 /
+                // **P1-8 fix**：刷新 scale 缓存。第一 tick 或每 60 tick（~3s）重新
+                // 从 WebviewWindow 取一次 scale_factor，捕获 DPI 切换 /
                 // 拖显示器等场景。win_opt 是 spawn 时取的，复用避免每 tick
                 // 调 Tauri handle 表。
+                //
+                // **P3-12 fix（2026-08-13 全量审查）**：60 tick (~3s) 在跨 DPI
+                // 屏移动后误差 = 33%~50%，整个"换卡/跟手"交互周期都落在
+                // stale 窗口内。收紧到 10 tick（~500ms），开销依然忽略，
+                // hover-pos 错位时间降一个数量级。
                 let scale = if let Some(win) = &win_opt {
                     let mut cache = SCALE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-                    if cache.is_none() || tick_count.is_multiple_of(60) {
+                    if cache.is_none() || tick_count.is_multiple_of(10) {
                         *cache = Some(win.scale_factor().unwrap_or(1.0));
                     }
                     *cache
@@ -469,9 +520,16 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                         // 500ms 间隔足够防 Win OS 把窗口 demote（OS z-order 调度
                         // 周期通常 ≥ 1s），但 z-order 调用频次降到 2 Hz，与
                         // macOS NSWindow 不需要 re-assert 的"被动"语义更接近。
-                        // 不改 edge-trigger（last_inside false → inside true），
-                        // 那一帧仍立即切 TopMost（用户进入浮窗时第一帧就该置顶）。
-                        if tick_count.is_multiple_of(10) {
+                        // **P2-5 fix（2026-08-13 全量审查）**：edge-trigger
+                        // （last_inside=false → inside=true）跳过节流判定。
+                        // 旧实现把 `tick_count.is_multiple_of(10)` 无条件放在
+                        // inside 分支里，fresh-entry 帧若不在 10 倍 tick 上
+                        // 就推迟到下个 10 倍 tick（最长 450ms）。PinBottom 默认
+                        // 模式下鼠标快速划过浮窗（< 500ms）→ 浮窗永远不置顶
+                        // —— 与代码自己的注释承诺不符，也跟 macOS 端立即置顶
+                        // 行为不一致。
+                        let edge_entry = !last_inside;
+                        if edge_entry || tick_count.is_multiple_of(10) {
                             unsafe {
                                 apply_z_order(hwnd_cache, ZOrder::TopMost);
                             }
@@ -563,7 +621,14 @@ fn is_cursor_inside_floating<R: Runtime>(
         let hit = if root.is_null() { topmost } else { root };
         // 预览窗优先判定：命中预览 → inside + over_preview
         if !preview_hwnd.is_null() && hit == preview_hwnd {
-            return Some((true, true, pt, rect));
+            // **P3-14 fix（2026-08-13 全量审查）**：HWND 复用校验。preview
+            // 窗口刚被 close / Tauri 注册表尚未移除的那一 tick，hwnd()
+            // 仍返可能已被 OS 复用的句柄值；该值恰好被光标下另一个无关
+            // 窗口继承 → 命中比较误判 over_preview。IsWindow 确认句柄
+            // 仍是同一窗口（destroy 后 OS 不再认）后再采纳。
+            if IsWindow(preview_hwnd as WIN_HWND) != 0 {
+                return Some((true, true, pt, rect));
+            }
         }
         if !point_in_rect(pt, &rect) {
             return Some((false, false, pt, rect));
