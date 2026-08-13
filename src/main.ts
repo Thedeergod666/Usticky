@@ -75,6 +75,33 @@ let isDragging = false;  // 自己跟踪 SortableJS 拖拽状态（比 sortableI
                           // SortableJS 偶尔会在某些边界场景里遗留 dragEl 不清，导致后续
                           // render 永远被 blocking）。进入 onStart 时置 true，onEnd 置 false。
 
+// ── due 标签周期刷新 ──
+//
+// **P3-21 fix（2026-08-13 全量审查）**：AGENTS.md #10 文档说"每秒 tick 走
+// data attribute" —— 实际没做，due 标签只在 render 时算一次。30s 扫一遍
+// .todo-due 子节点重写 textContent 就够（due 标分钟级精度，30s 无感）。
+// 与 AGENTS.md "每秒" 的差异：避免每秒全 .todo-card querySelector 抢
+// 动画预算，分钟级精度对 due 这种相对时间也合适。
+const DUE_TICK_MS = 30_000;
+/// setInterval handle，beforeunload 清理。与上一段 refreshDueLabels 共用。
+let dueTickerId: ReturnType<typeof setInterval> | null = null;
+function refreshDueLabels() {
+  if (!lastRenderedSnap) return;
+  const cards = document.querySelectorAll<HTMLElement>(".todo-card");
+  for (const row of cards) {
+    const id = row.dataset.todoId;
+    if (!id) continue;
+    const todo = lastRenderedSnap.todos.find((t) => t.id === id);
+    if (!todo || !todo.due_at) continue;
+    const dueEl = row.querySelector<HTMLElement>(".todo-due");
+    if (!dueEl) continue;
+    const { text, cls } = dueLabel(todo.due_at);
+    const newClass = `todo-due ${cls}`;
+    if (dueEl.className !== newClass) dueEl.className = newClass;
+    if (dueEl.textContent !== text) dueEl.textContent = text;
+  }
+}
+
 /// 标记当前是否有 todo 正在编辑（被 .todo-edit-input 占用）。
 ///
 /// render() 看到这个 flag 时**跳过整窗重建** —— 否则外部 todos-changed
@@ -85,6 +112,22 @@ let isDragging = false;  // 自己跟踪 SortableJS 拖拽状态（比 sortableI
 ///   - 用户提交（成功/失败/取消）：exitEditMode / cancelEdit / reenterEditOnFailure
 ///   - 切到空态：renderEmptyState 不需要守卫（输入框没了，无编辑可言）
 let isEditing = false;
+/// **P2-6 fix（2026-08-13 全量审查）**：render 守卫被跳过时的累积队列。
+/// 旧路径：render() 在 isEditing / isDragging 守卫下整体吞掉 todos-changed
+/// 触发 → 用户按 Esc 取消编辑（commit 失败 / 主动取消）→ exitEditMode 不
+/// 发 IPC、不调 render → 期间被吞的"被删/被完成"卡以 0 高幽灵行永久滞留。
+/// 现在 render() 在守卫下设 pendingRender=true，exitEditMode + onEnd 拖完
+/// 检查 + 重 render。
+let pendingRender = false;
+
+/// P2-6 helper：守卫期间累积的 render 一次跑掉。仅当 lastRenderedSnap 还在
+/// （不被外部 stale 引用）时才有意义。
+function flushPendingRender() {
+  if (pendingRender && lastRenderedSnap) {
+    pendingRender = false;
+    render(lastRenderedSnap);
+  }
+}
 
 /// Rust hover 路径当前 hover 的 todo id。render() 重建 DOM 时必须重置为 null，
 /// 否则下一帧 hover-pos 事件 `newId === rustHoveredCardId` 短路 return，
@@ -263,6 +306,12 @@ function hideMiniFlash(): void {
 
 function showMiniFlash(msg: string): void {
   const el = ensureMiniFlashEl();
+  // **P3-18 fix（2026-08-13 全量审查）**：撤销入口是唯一的 action flash
+  // 按钮；任何 showMiniFlash 直接 textContent 替换会把按钮换掉，8s 撤销
+  // 机会被静默剥夺。带 has-action 时跳过：让 action flash 的 timer
+  // 自然清掉，避免覆盖更高 stakes 的撤销 toast。代价是 copy/paste 反馈
+  // 在撤销期间不显示——可接受（用户在撤销期间做的事就是撤销）。
+  if (el.classList.contains("has-action")) return;
   el.textContent = msg;
   el.classList.remove("has-action");
   if (miniFlashTimer) clearTimeout(miniFlashTimer);
@@ -413,13 +462,13 @@ function render(snap: TodoSnapshot) {
   // render 统一刷新。自己跟踪 isDragging 而不是读 SortableJS 的 dragEl
   // -- forceFallback 下 dragEl 时序跟 DOM 事件不同步，偶尔会被留在旧状态
   // 卡住导致后续 render 全部被挡。
-  if (isDragging) return;
+  if (isDragging) { pendingRender = true; return; }
 
   // **P1-1 fix**：编辑模式期间跳过整窗重建。外部 todos-changed（设置面板
   // 切 pin mode / tray 菜单等）走 render 会把 .todo-edit-input 干掉 ->
   // 用户未保存输入直接丢。编辑期间快照已存到 lastRenderedSnap，用户提交
   // 后下次 render 反映新 title，这里安全跳过。
-  if (isEditing) return;
+  if (isEditing) { pendingRender = true; return; }
 
   // **keyed diff**：不再 reset rustHoveredCardId / cancelPreviewDwell。
   // 旧全量重建这两步是因为重建后 DOM 节点全换：rustHoveredCardId 指向的旧
@@ -732,6 +781,14 @@ function updateTodoRow(row: HTMLElement, todo: Todo) {
   row.dataset.status = todo.status;
 
   const refs = getRowStableRefs(row);
+  // **P3-20 fix（2026-08-13 全量审查）**：跨 render 清 data-confirm。
+  // 旧实现：keyed diff 复用行节点，data-confirm="1" 不随 render 清掉。
+  // 行被移到 done section 后仍是实红确认态 → 点删除跳过二次确认直接删。
+  // render 每次更新该行时主动 reset（无论 status / title / 等任何变化）。
+  if (refs.delBtn && refs.delBtn.dataset.confirm) {
+    delete refs.delBtn.dataset.confirm;
+    refs.delBtn.setAttribute("aria-label", t("app.action.delete"));
+  }
   const check = refs.check;
   if (check) {
     check.title = todo.status === "done" ? t("app.action.undo") : t("app.action.complete");
@@ -1350,7 +1407,13 @@ const deleteConfirmTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function armDeleteConfirm(todoId: string, del: HTMLElement) {
   del.dataset.confirm = "1";
-  del.title = t("app.action.confirm_delete");
+  // **P3-16 fix（2026-08-13 全量审查）**：删除 del.title = ... 写回。
+  // v0.2.1/v0.2.4 明令浮窗内不准用原生 title=（macOS hover 1-2s 弹白色
+  // 小条跟预览窗视觉打架），但 arm/reset 循环每次都会把 title 写回。
+  // 第一次交互后 title 永久残留，hover 该按钮 1s+ 弹原生 tooltip。
+  // 改用 aria-label 兜底：dataset.confirm 已带语义，aria-label 跟随 reset
+  // 切换"删除"/"确认删除"。
+  del.setAttribute("aria-label", t("app.action.confirm_delete"));
   const prev = deleteConfirmTimers.get(todoId);
   if (prev) clearTimeout(prev);
   deleteConfirmTimers.set(
@@ -1370,7 +1433,8 @@ function resetDeleteConfirm(todoId: string) {
   );
   if (del) {
     delete del.dataset.confirm;
-    del.title = t("app.action.delete");
+    // P3-16：aria-label 复位
+    del.setAttribute("aria-label", t("app.action.delete"));
   }
 }
 
@@ -1482,6 +1546,8 @@ function cleanupSortables() {
   // onEnd 已经处理，但跨 webview 某些边界 / 异常路径可能遗漏），重置，
   // 不让后续 render 永久被挡。
   isDragging = false;
+  // P2-6：拖拽期间被吞的 render 一次补掉。
+  flushPendingRender();
 }
 
 // ── 编辑 todo ──
@@ -1629,6 +1695,8 @@ function exitEditMode(card: HTMLElement, newTitle: string) {
   const input = card.querySelector<HTMLInputElement>("input.todo-edit-input");
   if (!input) {
     restoreSortableForCard(card);
+    // P2-6：编辑期间被吞的 render 一次补掉。
+    flushPendingRender();
     return;
   }
   // **P1-1 fix**：先释放守卫再 replaceWith。顺序很重要 —— 如果先摘 input
@@ -1636,6 +1704,8 @@ function exitEditMode(card: HTMLElement, newTitle: string) {
   // 会走"保留正在编辑卡"的路径（虽然现在我们用简单 return 跳过整窗，但语义上
   // exitEditMode 应当先表示"不再编辑"，再操作 DOM）。
   isEditing = false;
+  // P2-6：守卫已释放，补渲染。
+  flushPendingRender();
   const titleEl = document.createElement("div");
   titleEl.className = "todo-title";
   titleEl.textContent = newTitle;
@@ -2651,7 +2721,12 @@ async function init() {
     // 摘掉 hover-raise listener（仅在 PinBottom 模式注册过，需要命名引用）
     document.body.removeEventListener("mouseenter", onPinBottomHoverEnter);
     document.body.removeEventListener("mouseleave", onPinBottomHoverLeave);
+    // P3-21：清 due ticker interval
+    if (dueTickerId !== null) clearInterval(dueTickerId);
   });
+
+  // P3-21：启动 due 周期刷新。
+  dueTickerId = setInterval(refreshDueLabels, DUE_TICK_MS);
 
   // **Stage 4（PERF_AUDIT.md）**：冷启动测量落盘。USTICKY_PERF_OUT 由外部
   // baseline 脚本（scripts/perf-baseline.ts）注入，普通用户运行下为空
@@ -2731,9 +2806,17 @@ function ensureInputBar() {
   // **A1 fix**：btn hover 也走委托（target.closest(".todo-copy, .todo-delete, .todo-paste-btn")）。
 
   const input = bar.querySelector<HTMLInputElement>("input")!;
+  // **P3-22 fix（2026-08-13 全量审查）**：粘贴进行中标志。paste handler
+  // 异步走 pasteFromClipboard（IPC 往返 + 后端落盘）期间 input 仍是旧
+  // 文本，立即按 Enter 会被 Enter handler 同步读到 → 建文本 todo + 等
+  // paste resolve 又建图片 todo = 同标题双 todo。Enter handler 看到这个
+  // flag 直接 return，paste 完成（无论成功失败）再清旗。
+  let pastePending = false;
   input.addEventListener("keydown", async (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      // P3-22：paste in flight → 不抢建文本 todo，等 paste 自己完成。
+      if (pastePending) return;
       const v = input.value;
       // 校验通过后才清空 —— 失败时回填，保留用户输入
       const trimmed = v.trim();
@@ -2750,9 +2833,11 @@ function ensureInputBar() {
       // 提交并清空，false=失败并保留 input 内容。
       // **A3 fix**：先清空 input，再 await —— addTodo 内部已插 temp todo，
       // 用户感知不到 IPC 往返。失败时回填。
+      // **P3-19 fix（2026-08-13 全量审查）**：仅当 input 当前为空才回填
+      // 旧值。await 期间用户已敲入新内容的话，回填会覆盖新输入。
       input.value = "";
       const ok = await addTodo(trimmed);
-      if (!ok) {
+      if (!ok && !input.value) {
         input.value = v;
       }
     } else if (e.key === "Escape") {
@@ -2789,7 +2874,9 @@ function ensureInputBar() {
     if (!hasImage) return; // 纯文本 -> 走默认插入 input
     e.preventDefault();
     const typed = input.value.trim();
+    pastePending = true; // P3-22：期间 Enter handler 跳过
     void pasteFromClipboard(typed || null).then((res) => {
+      pastePending = false;
       // 图片成功落盘 + 用了输入框文字当标题 -> 清空输入框（文字已被消费进 todo）。
       // kind !== "image"（罕见：前端检测到图片但后端读到文本的竞态）不清空，
       // 保留用户文字不被吞。
