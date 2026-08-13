@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tauri::{Emitter, Listener, Manager};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use tokio::sync::Notify;
 
 // rust_i18n crate 级初始化 —— 让 commands / tray 等模块都能直接 t!("xxx")。
@@ -143,10 +143,30 @@ fn parse_shortcut(s: &str) -> Result<Shortcut, String> {
     Shortcut::try_from(s).map_err(|e| format!("parse shortcut {:?}: {}", s, e))
 }
 
-/// 注册当前 store 里的 quick-add 快捷键。`previous` 是回退用的——
-/// 当 `on_shortcut` 失败时（最常见：快捷键被别的 app 占用），best-effort
-/// 用同一 handler 把 `previous` 重新装回去，**不让用户失去快捷键能力**。
-/// `previous = None` 用于启动时（OS 上没旧绑定可回退）。
+/// 构造全局快捷键回调闭包。主注册 + fallback（previous）注册共用同一份
+/// **逻辑**，避免 inline 重复引入 check-then-act 非原子模式（v0.1.5 P1-9
+/// 已经在主路径用 compare_exchange 修了，回退路径 inline 时容易漏掉）。
+///
+/// **P3-7 fix（2026-08-13 全量审查）**：旧 fallback 路径用 `if QUICK_ADD_ACTIVE.load() {...} else {...}`
+/// 两步检查，正是 lib.rs:230-244 注释里修掉的"两个回调都看到 false → 双走
+/// show 分支"模式。现在两个分支都走 compare_exchange。
+fn make_quick_add_handler(
+    app: &tauri::AppHandle,
+    store: &SharedStore,
+) -> impl Fn(&tauri::AppHandle, &tauri_plugin_global_shortcut::Shortcut, tauri_plugin_global_shortcut::ShortcutEvent) + Send + Sync + 'static {
+    let app_handle = app.clone();
+    let store_ref = store.clone();
+    move |_app, _shortcut, event| {
+        if event.state() != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+            return;
+        }
+        // **P1-9 fix**：原子声明活跃位，与主路径一致。
+        match QUICK_ADD_ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => quick_show_floating_window(&app_handle, &store_ref),
+            Err(_) => toggle_dismiss_floating_window(&app_handle, &store_ref),
+        }
+    }
+}
 ///
 /// **P1-3 fix**：原流程是"unregister_all → parse → on_shortcut"，导致
 /// parse 失败时旧绑定已经被清掉。新流程"parse → unregister_all → on_shortcut"
@@ -174,56 +194,27 @@ fn register_quick_add_shortcut(
     let gs = app.global_shortcut();
     // 2. parse OK → 清掉旧绑定（plugin 范围内）
     let _ = gs.unregister_all();
-    // 3. 注册新绑定
-    let app_handle = app.clone();
-    let store_ref = store.clone();
-    let register_res = gs.on_shortcut(parsed, move |_app, _shortcut, event| {
-        if event.state() != ShortcutState::Pressed {
-            return;
-        }
-        // **P1-9 fix**：原子声明活跃位。compare_exchange(false, true) 成功 = 唯一
-        // 调用方，失败 = 已有别人持有活跃位（OS 抖动 / 重复触发 / 自己刚
-        // toggle dismiss 完还没彻底清状态都会触发）。失败时走 toggle dismiss
-        // 路径 —— 跟用户的"再次按 = 收起"心智模型一致。
-        match QUICK_ADD_ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => {
-                // ── show 分支：原子声明成功，独占 show_dismiss 状态机 ──
-                quick_show_floating_window(&app_handle, &store_ref);
-            }
-            Err(_) => {
-                // ── toggle dismiss 分支：别人持有活跃位 → 不隐藏窗口，
-                //    只还原 level + 切回原 app + 清状态。
-                toggle_dismiss_floating_window(&app_handle, &store_ref);
-            }
-        }
-    });
+    // 3. 注册新绑定（共用工厂函数，逻辑与 fallback 一致）
+    let register_res = gs.on_shortcut(parsed, make_quick_add_handler(app, store));
     if let Err(e) = register_res {
         tracing::error!("on_shortcut failed: {}", e);
         let _ = app.emit(
             "usticky://persist-failed",
             format!("register shortcut: {e}"),
         );
-        // 4. best-effort 装回 previous（用同一份 handler 闭包，inline 二次
+        // 4. best-effort 装回 previous（用同一 handler 闭包，inline 二次
         //    注册）。常见失败原因：快捷键被其他 app 占用 —— 此时装回
         //    previous 也很可能失败（previous 通常也冲突），但至少给用户
         //    一个可点开的 quick-add 入口（设置面板里有手动唤起路径）。
         if let Some(prev) = previous {
             if let Ok(parsed_prev) = parse_shortcut(prev) {
-                let app2 = app.clone();
-                let store2 = store.clone();
-                match gs.on_shortcut(parsed_prev, move |_app, _shortcut, event| {
-                    if event.state() != ShortcutState::Pressed { return; }
-                    if QUICK_ADD_ACTIVE.load(Ordering::SeqCst) {
-                        toggle_dismiss_floating_window(&app2, &store2);
-                        return;
-                    }
-                    quick_show_floating_window(&app2, &store2);
-                }) {
-                    Ok(_) => tracing::warn!("restored previous shortcut {}", prev),
-                    Err(e2) => tracing::error!(
+                if let Err(e2) = gs.on_shortcut(parsed_prev, make_quick_add_handler(app, store)) {
+                    tracing::error!(
                         "restore previous shortcut {} failed: {} (likely conflicting with another app)",
                         prev, e2
-                    ),
+                    );
+                } else {
+                    tracing::warn!("restored previous shortcut {}", prev);
                 }
             } else {
                 tracing::warn!("previous shortcut {} not parseable, cannot restore", prev);
@@ -333,6 +324,10 @@ pub fn hide_dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore)
     if let Some(p) = app.get_webview_window("preview") {
         let _ = p.close();
     }
+    // **P1-4 fix（2026-08-13 全量审查）**：hide 路径直接 `p.close()` 预览，
+    // 不走 close_preview_window 命令（IPC 多跳），必须主动清 PENDING 槽位，
+    // 否则下次 fresh-create 时陈旧 slot 致显示/编辑错误 todo。
+    crate::commands::clear_pending_preview_todo();
     if was_active {
         let mode = store.blocking_read().pin_mode();
         platform::restore_level_after_quick_add(app, mode);
@@ -406,12 +401,19 @@ pub fn run() {
         // 不做这个会触发两个并发进程同时持有 store / 同时写 todos.json 的
         // 灾难（macOS 上还会重复 dock 图标）。
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(w) = app.get_webview_window("floating") {
+            // **P2-4 fix（2026-08-13 全量审查）**：旧实现裸 `show + set_focus`，
+            // 默认 PinBottom（level=-1）下窗口被任何前台 app 盖住 —— 用户
+            // 双击 Dock 再启动时"什么都没发生"。走 quick_show_floating_window
+            // 先 raise 到 FLOATING 再 show。try_state 容错：setup 未完成时
+            // store 尚未 manage（理论上 single-instance 不会在 setup 之前
+            // 触发，但兜底）走 fallback bare-show。
+            if let Some(store) = app.try_state::<SharedStore>() {
+                quick_show_floating_window(app, store.inner());
+            } else if let Some(w) = app.get_webview_window("floating") {
+                tracing::warn!("single-instance callback: store not ready, bare show");
                 let _ = w.show();
                 let _ = w.set_focus();
             } else {
-                // 浮窗被 close-hide 后可能 webview handle 还在但 hide 状态 ——
-                // unminimize + set_focus 双保险。
                 tracing::warn!("single-instance callback: floating window not found");
             }
         }))
@@ -490,10 +492,10 @@ pub fn run() {
             // 6. 注册浮窗位置/尺寸持久化（Musage 经验：spawn 异步写，不阻塞 UI 线程，
             //    **关键**：spawn 里先 write guard 内 update 内存态 → drop guard →
             //    再 persist 磁盘。write guard 跨 I/O 会让 IPC add_todo 排队。
+            // **P2-8 fix**：启动 trailing-edge debounce geom persist 后台循环。
             if let Some(window) = app.get_webview_window("floating") {
                 let store_for_geom = store.clone();
                 let app_handle_geom = app.handle().clone();
-                let window_for_close = window.clone();
                 window.on_window_event(move |event| match event {
                     tauri::WindowEvent::Moved(pos) => {
                         // **P2-8 fix**：in-memory 写立即（write guard 短暂），
@@ -541,12 +543,21 @@ pub fn run() {
                         //   - 用户从 tray Quit → app.exit(0) → terminate
                         //   - 用户从 Cmd+Q（macOS） → app.exit(0) → terminate
                         // 这是有意设计，不是 bug。
+                        //
+                        // **P2-1 + P1-5 fix（2026-08-13 全量审查）**：旧实现只
+                        // `prevent_close + hide` + `p.close()`，但**不**清
+                        // QUICK_ADD_ACTIVE / WINDOW_VISIBLE / 不还原 level，
+                        // 导致：① 下次快捷键按一次无反应（flag 卡 true）；②
+                        // 隐藏期间 hover emitter 在 macOS 上满速空转；③ 若
+                        // 隐藏时是 hover-raised 状态（PinBottom），show 后浮窗
+                        // 永久卡在 FLOATING 恒置顶直到鼠标划过。统一调
+                        // `hide_dismiss_floating_window` 把 hide + 状态机复位
+                        // + 预览窗清理 + level 还原放到一条路径。
                         api.prevent_close();
-                        let _ = window_for_close.hide();
-                        // v0.2：同 hide_dismiss —— 浮窗 hide 时收掉预览窗（孤儿窗）。
-                        if let Some(p) = app_handle_geom.get_webview_window("preview") {
-                            let _ = p.close();
-                        }
+                        let app = app_handle_geom.clone();
+                        let store = store_for_geom.clone();
+                        // hide_dismiss 内部使用 blocking_read，**不**在 UI 线程上 await。
+                        crate::hide_dismiss_floating_window(&app, &store);
                     }
                     tauri::WindowEvent::Focused(false) => {
                         // 浮窗失焦 —— 若处于 quick-add 临时置顶状态，还原 level
@@ -631,6 +642,27 @@ pub fn run() {
             commands::dump_perf,
             commands::get_perf_path,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Usticky");
+        .build(tauri::generate_context!())
+        .inspect_err(|e| tracing::error!("tauri build failed: {e}"))
+        .expect("error while building Usticky")
+        .run(|app_handle, event| {
+            // **P3-8 fix（2026-08-13 全量审查）**：geom persist 是 trailing-edge
+            // 200ms 后台循环，app.exit(0) 后 tokio runtime drop、task 在 await
+            // 取消 —— 200ms 窗口内未落盘的几何位置静默丢弃。ExitRequested 阶段
+            // （用户从 tray Quit / Cmd+Q）同步 bump + 写盘最后一批状态，关闭前
+            // 完成持久化。
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                if let Some(store) = app_handle.try_state::<SharedStore>() {
+                    let (path, data, epoch) = {
+                        let mut s = store.blocking_write();
+                        s.bump_and_snapshot()
+                    };
+                    if let Some(p) = path {
+                        if let Err(e) = crate::todo::persist_to_disk(&p, &data, epoch) {
+                            tracing::warn!("exit flush persist failed: {e}");
+                        }
+                    }
+                }
+            }
+        });
 }
