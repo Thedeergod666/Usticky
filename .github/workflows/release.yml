@@ -99,12 +99,14 @@ jobs:
       # ── macOS objc2 需要明确最低部署版本 ──
       - name: Set macOS deployment target
         if: runner.os == 'macOS'
+        shell: bash
         run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> $GITHUB_ENV
 
       # ── Linux 系统依赖：webkit2gtk-4.1 + libappindicator3 + librsvg + patchelf ──
       # 跟 Tauri 2 官方 GitHub Actions 文档示例同一组包
       - name: Install Linux system deps
         if: runner.os == 'Linux'
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -117,14 +119,23 @@ jobs:
 
       # ── 前端依赖 ──
       - name: Install frontend deps
+        shell: bash
         run: pnpm install --frozen-lockfile
 
       # ── 把版本号写到 package.json，再让 sync-version.cjs 传播到 tauri.conf.json + Cargo.toml ──
       # 必须放在 pnpm install 之后：本 step 调 `pnpm sync-version` 需要 pnpm 已就绪
       # 也必须放在 `tauri build` 之前：sync-version 改的 Cargo.toml / tauri.conf.json
       # 会被 build 直接消费
+      #
+      # **P3-30 fix（2026-08-19 v0.2.5 release）**：`shell: bash` 显式指定。
+      # Windows runner 默认 shell 是 pwsh，`[[ ... ]]` / `&&` / `>> $GITHUB_ENV`
+      # 全是 bash 语法，PowerShell 解析失败（实际报错：ParserError:
+      # "Missing type name after '['"）→ windows build job 整段挂掉。
+      # macOS / Linux runner 默认就是 bash，这里显式指定不影响；显式指定
+      # 也避免未来 GH Actions 改默认值时再次踩坑。
       - name: Sync version
         id: sync
+        shell: bash
         env:
           # tag 触发时 github.ref_name 是 "v0.2.0"；手动触发时取 inputs.version
           VERSION: ${{ inputs.version || github.ref_name }}
@@ -196,12 +207,17 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Fail if any platform build failed
         if: needs.build.result != 'success'
+        shell: bash
         run: |
           echo "::error::至少一个平台 build job 失败（result=${{ needs.build.result }}），release 产物不齐，不可发布"
           exit 1
       # 轮询等待 release assets 全部就位（tauri-action 第一个 job 完成后才建 release，
       # 后续 job 完成后才追加 asset）—— 12 次 × 15s = 3 分钟上限，失败早返
+      #
+      # **P3-30 fix（2026-08-19 v0.2.5 release）**：`shell: bash` 显式指定
+      # （见 Sync version step 注释 —— ubuntu runner 默认 bash 但显式更稳）。
       - name: Wait for release assets
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version || github.ref_name }}
@@ -219,7 +235,9 @@ jobs:
             fi
             sleep 15
           done
+      # **P3-30 fix（2026-08-19 v0.2.5 release）**：`shell: bash` 显式指定
       - name: Verify release assets
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version || github.ref_name }}
