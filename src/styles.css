@@ -164,7 +164,14 @@ html, body {
    * 闲置观感与 Musage 接近但略轻。L1+L2 玻璃防丢失靠 will-change + 心跳 +
    * force-reflow，跟 blur 半径无关，10px 在安全区内（见文件头 L1-L3）。
    * 历史：2026-07-08 曾 0.62 → 0.55。 */
-  --tile-bg: rgba(28, 30, 38, 0.30);
+  /* 玻璃背景拆两个变量（2026-08-13 perf）：--tile-bg-rgb（固定色）+
+   * --tile-bg-alpha（透明度）。::before 用 rgb(var(--tile-bg-rgb)) 实色 +
+   * opacity: var(--tile-bg-alpha) 走 **opacity 过渡**（compositor-only，
+   * GPU 插值零重绘）—— 替代 background-color 过渡（paint，每帧重绘 N 层
+   * ::before，todo 一多 hover 过渡就掉帧卡顿）。视觉等价：
+   * rgb(28,30,38) × opacity 0.30 ≡ rgba(28,30,38,0.30)。 */
+  --tile-bg-rgb: 28, 30, 38;
+  --tile-bg-alpha: 0.30;
   --tile-blur: 10px;
   --tile-saturate: 180%;
   --tile-border: rgba(255, 255, 255, 0);
@@ -235,7 +242,7 @@ body[data-active] #app {
    * 本来就直接锁在 Musage hover 档。）
    * 不动 --tile-blur (10px 写死) —— 不踩 WKWebView backdrop throttling
    * 2 秒丢失根因。 */
-  --tile-bg: rgba(28, 30, 38, 0.82);
+  --tile-bg-alpha: 0.82;
   --tile-border: rgba(255, 255, 255, 0.10);
   --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.45),
                  0 0 0 0.5px rgba(255, 255, 255, 0.04) inset;
@@ -266,7 +273,16 @@ body[data-active] #app {
   align-items: center;
   gap: 10px;
   padding: 9px 13px 9px;
-  background: var(--tile-bg);
+  /* 背景搬到 ::before 伪元素（见下方）。原因：父元素上同时有
+   * backdrop-filter + will-change: backdrop-filter + 心跳动画时，
+   * background-color 的 CSS 过渡会被合成层重置/快照为瞬时（无渐变），
+   * 而 .todo-title/.todo-check/.todo-due 上的 color 过渡正常（它们
+   * 不在 backdrop-filter 合成层上）。把背景移到 ::before，伪元素
+   * 不带 backdrop-filter / will-change / 心跳，background-color 过渡
+   * 走 paint 通道、不被合成层重置。overflow:hidden 把 ::before 裁到
+   * 卡片圆角内（避免 ::before 圆角与卡片圆角错位的 1px 露出）。 */
+  position: relative;
+  overflow: hidden;
   backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   border: 1px solid var(--tile-border);
@@ -274,16 +290,31 @@ body[data-active] #app {
   box-shadow: var(--tile-shadow);
   /* ⚠️ 不 transition backdrop-filter / box-shadow —— 它们都是合成层重操作，
      在 Rust hover emitter 50ms tick 抖动时会反复插值 → 光标闪烁。
-     视觉上从 idle 到 hover 是离散切，保留 background-color / border-color
-     的过渡已足够"软着陆"。
-     timing function 用 cubic-bezier(0.22, 1, 0.36, 1)（ease-out-quint）：
-     开头快、结尾稳 —— 视觉上"马上出现然后平滑过渡到位"，跟用户期望一致。 */
+     视觉上从 idle 到 hover 是离散切；背景过渡走 ::before 的 background-color
+     （不在这条 transition 里），border-color 保留。 */
   transition:
-    background-color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
     border-color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
     transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
     opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1);
   cursor: grab;
+}
+/* 玻璃背景层（伪元素，详见上方注释）。过渡走 **opacity**（compositor-only）
+ * 而不是 background-color（paint）—— 2026-08-13 perf：paint 过渡每帧重绘
+ * N 层 ::before，todo 一多 hover 就掉帧；opacity 由 GPU 插值，零重绘。
+ * transform: translateZ(0) 强制 ::before 走独立合成层，opacity 才能被
+ * 合成器独立插值（否则它只是父卡片 backdrop-filter 合成层的一部分，
+ * 没法单独变透明）。背景用实色 rgb(var(--tile-bg-rgb)) + opacity 变量
+ * 等价旧的 rgba 半透明（见 #app 变量注释）。 */
+.todo-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: rgb(var(--tile-bg-rgb));
+  opacity: var(--tile-bg-alpha);
+  border-radius: inherit;
+  transform: translateZ(0);
+  transition: opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .todo-card:active { cursor: grabbing; }
 .todo-card.dragging { opacity: 0.5; transform: scale(0.98); }
@@ -376,7 +407,7 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done {
    * 绝对亮度都已很低，差距足够）。border 跟随 pending 归 0。
    * 让已完成任务在浮窗静止时几乎看不见，达到"折叠到背景"的目的。
    * 只动 alpha（背景 + 边框），不动 --tile-blur，跟 v3 设计原则一致。 */
-  --tile-bg: rgba(28, 30, 38, 0.12);
+  --tile-bg-alpha: 0.12;
   --tile-border: rgba(255, 255, 255, 0);
   /* 勾圈颜色覆盖：idle 下不沿用 --c-data-ok（= 0.58 白），用更弱色 0.40
    * 保持"已完成"识别但明显比 pending 卡更"折叠"。
@@ -652,7 +683,10 @@ body[data-active] #app .todo-due.days     { color: var(--c-data-cyan);  backgrou
   align-items: center;
   gap: 8px;
   padding: 8px 13px;
-  background: var(--tile-bg);
+  /* 背景搬到 ::before（详见 .todo-card 注释：父元素有 backdrop-filter
+   * 时 background-color 过渡会被合成层重置，所以走伪元素）。 */
+  position: relative;
+  overflow: hidden;
   backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   border: 1px solid var(--tile-border);
@@ -660,8 +694,18 @@ body[data-active] #app .todo-due.days     { color: var(--c-data-cyan);  backgrou
   box-shadow: var(--tile-shadow);
   /* 不 transition backdrop-filter —— 同 .todo-card，防 hover emitter 抖动闪烁 */
   transition:
-    background-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
     border-color 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.todo-input::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: rgb(var(--tile-bg-rgb));
+  opacity: var(--tile-bg-alpha);
+  border-radius: inherit;
+  transform: translateZ(0);
+  transition: opacity 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .todo-input:focus-within {
   border-color: rgba(10, 132, 255, 0.45);
@@ -733,7 +777,9 @@ body[data-narrow="1"] .todo-input-hint {
   align-items: center;
   justify-content: center;
   padding: 0;
-  background: var(--tile-bg);
+  /* 背景搬到 ::before（详见 .todo-card 注释）。 */
+  position: relative;
+  overflow: hidden;
   backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   border: 1px solid var(--tile-border);
@@ -742,9 +788,19 @@ body[data-narrow="1"] .todo-input-hint {
   color: var(--text-faint);
   cursor: pointer;
   transition:
-    background-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
     border-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
     color 0.15s ease-out;
+}
+.todo-paste-btn::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: rgb(var(--tile-bg-rgb));
+  opacity: var(--tile-bg-alpha);
+  border-radius: inherit;
+  transform: translateZ(0);
+  transition: opacity 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .todo-paste-btn svg {
   width: 15px;
@@ -753,7 +809,13 @@ body[data-narrow="1"] .todo-input-hint {
 .todo-paste-btn:active {
   color: var(--c-data-info);
   border-color: rgba(10, 132, 255, 0.45);
+}
+/* 背景在 ::before 上，按下态高亮改 ::before 的 background。
+ * opacity: 1 锁掉 tile 的 idle 0.30 透明度 —— 否则按下反馈被乘弱
+ * （rgba(10,132,255,0.18) × 0.30 ≈ 5% alpha，几乎看不见）。 */
+.todo-paste-btn:active::before {
   background: rgba(10, 132, 255, 0.18);
+  opacity: 1;
 }
 
 /* ── 图片附件缩略图（v0.2.6，内联单行） ──
@@ -943,7 +1005,7 @@ body:not([data-hover]):not([data-low-power]) .todo-section-done {
  * 已经主动放弃合成预算换取续航，idle ↔ hover 的视觉变化是无意义的开关
  * 抖动，直接锁在全强度上。 */
 body[data-low-power] #app {
-  --tile-bg: rgba(28, 30, 38, 0.82);
+  --tile-bg-alpha: 0.82;
   --tile-border: rgba(255, 255, 255, 0.10);
   --tile-shadow: 0 10px 30px rgba(0, 0, 0, 0.45),
                  0 0 0 0.5px rgba(255, 255, 255, 0.04) inset;

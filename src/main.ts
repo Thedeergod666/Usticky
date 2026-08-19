@@ -747,14 +747,16 @@ function lookupTodo(todoId: string): Todo | null {
 ///
 /// **A2 fix（PERF_AUDIT.md）**：旧实现每行 7 次 row.querySelector
 /// （check / title / thumb / actions / due / copy / del），N=100 时
-/// 每次 render 700 次选择器解析。改：稳定节点（check / title /
-/// actions / copy / del）首次 buildTodoRow 时一次性查好缓存到
-/// rowStableRefs 内部 slot，updateTodoRow 直接取。动态节点（thumb /
-/// due）按需 querySelector —— 它们的存在/缺失随 todo 内容变化，
-/// 缓存会 stale 不划算。
+/// 每次 render 700 次选择器解析。改：稳定节点（check / actions /
+/// copy / del）首次 buildTodoRow 时一次性查好缓存到 rowStableRefs 内部
+/// slot，updateTodoRow 直接取。**`title` 不缓存**：编辑模式
+/// `titleEl.replaceWith(input)` + exitEditMode 新建 `.todo-title`，
+/// 缓存会持有 detach 的旧节点，后续 render 写到不可见旧节点 =
+/// 预览窗编辑后浮窗视觉不同步（用户 2026-08-14 实测）。动态节点
+/// （thumb / due）也按需 querySelector —— 它们的存在/缺失随 todo
+/// 内容变化，缓存会 stale 不划算。title 同理（编辑模式会替换）。
 interface RowStableRefs {
   check: HTMLElement;
-  title: HTMLElement;
   actions: HTMLElement;
   copyBtn: HTMLElement;
   delBtn: HTMLElement;
@@ -766,7 +768,6 @@ function getRowStableRefs(row: HTMLElement): RowStableRefs {
   if (!refs) {
     refs = {
       check: row.querySelector<HTMLElement>(".todo-check")!,
-      title: row.querySelector<HTMLElement>(".todo-title")!,
       actions: row.querySelector<HTMLElement>(".todo-actions")!,
       copyBtn: row.querySelector<HTMLElement>(".todo-copy")!,
       delBtn: row.querySelector<HTMLElement>(".todo-delete")!,
@@ -794,7 +795,7 @@ function updateTodoRow(row: HTMLElement, todo: Todo) {
     check.title = todo.status === "done" ? t("app.action.undo") : t("app.action.complete");
   }
 
-  const titleEl = refs.title;
+  const titleEl = row.querySelector<HTMLElement>(".todo-title");
 
   // 缩略图（check 与 title 之间）：attachment 有则建 / 更新 src，无则摘。
   // v0.2.6 图片附件内联：flex:1 1 0 跟 title 1:1 各占一半宽；无标题时
