@@ -72,9 +72,7 @@ fn read_plugin_image(app: &AppHandle) -> Option<ClipboardImage> {
     // 主路径）OOM。read_image 自身的内部分配护不住（在插件层），但拦掉
     // to_vec + PNG 编码这两步已能挡住绝大多数 GB 级 payload。macOS 原生
     // 路径（1a/1c/file-url）已分别 data.len()/metadata 预检，唯独插件路径漏。
-    let rgba_bytes = (w as u64)
-        .saturating_mul(h as u64)
-        .saturating_mul(4) as usize;
+    let rgba_bytes = (w as u64).saturating_mul(h as u64).saturating_mul(4) as usize;
     if rgba_bytes > MAX_IMAGE_BYTES {
         return None;
     }

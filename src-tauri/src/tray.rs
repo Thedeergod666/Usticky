@@ -325,7 +325,9 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                         let store = if let Some(s) = app2.try_state::<SharedStore>() {
                             s.inner().clone()
                         } else {
-                            tracing::warn!("tray reset_position handler: store not ready, skipping");
+                            tracing::warn!(
+                                "tray reset_position handler: store not ready, skipping"
+                            );
                             return;
                         };
                         if let Err(e) = commands::reset_floating_window_core(&app2, &store).await {

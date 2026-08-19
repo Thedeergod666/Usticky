@@ -159,8 +159,7 @@ pub fn set_window_pin_bottom<R: Runtime>(app: &AppHandle<R>) {
             // 直到下一次任何 level 操作才能自愈。同时再校一次 LAST_INSIDE：
             // 隐藏门控（lib.rs hide_dismiss 触发 WINDOW_VISIBLE=false 后下一
             // tick）会把它置 false，鼠标移出场景下让 LOWER 走通。
-            if !LAST_INSIDE.load(Ordering::SeqCst)
-                && LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst)
+            if !LAST_INSIDE.load(Ordering::SeqCst) && LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst)
             {
                 set_window_level(&app2, LEVEL_BELOW_NORMAL, false);
             }
@@ -821,8 +820,18 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
         // **P3-10 fix**：写本 tick 的 gen 标签。晚到的 stale 闭包即便写到
         // 这里，gen 也是旧的（不等于新 tick 的 my_gen），会被 wait 校验拒绝。
         let payload = match result {
-            Some((inside, over_preview, frame)) => SlotData { inside, dispatch_failed: false, frame: Some(frame), over_preview },
-            None => SlotData { inside: false, dispatch_failed: true, frame: None, over_preview: false },
+            Some((inside, over_preview, frame)) => SlotData {
+                inside,
+                dispatch_failed: false,
+                frame: Some(frame),
+                over_preview,
+            },
+            None => SlotData {
+                inside: false,
+                dispatch_failed: true,
+                frame: None,
+                over_preview: false,
+            },
         };
         {
             let mut g = slot2.slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -838,7 +847,15 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
         {
             let mut g = slot.slot.lock().unwrap_or_else(|e| e.into_inner());
             if g.is_none() {
-                *g = Some((my_gen, SlotData { inside: false, dispatch_failed: true, frame: None, over_preview: false }));
+                *g = Some((
+                    my_gen,
+                    SlotData {
+                        inside: false,
+                        dispatch_failed: true,
+                        frame: None,
+                        over_preview: false,
+                    },
+                ));
             }
         }
         slot.cvar.notify_all();
@@ -852,9 +869,13 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
     let mut guard = slot.slot.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         let matches = matches!(guard.as_ref(), Some((g,_)) if *g == my_gen);
-        if matches { break; }
+        if matches {
+            break;
+        }
         let remaining = deadline.saturating_sub(started.elapsed());
-        if remaining.is_zero() { break; }
+        if remaining.is_zero() {
+            break;
+        }
         let (g, _wait_timeout) = slot
             .cvar
             .wait_timeout(guard, remaining)
@@ -862,7 +883,13 @@ fn is_floating_topmost_at_with_status<R: Runtime>(
         guard = g;
     }
     // 超时仍 None 或 stale（gen 不匹配）→ (false, true, None, false) 兜底
-    let data = guard.as_ref().and_then(|(gen, data)| if *gen == my_gen { Some(data.clone()) } else { None });
+    let data = guard.as_ref().and_then(|(gen, data)| {
+        if *gen == my_gen {
+            Some(data.clone())
+        } else {
+            None
+        }
+    });
     match data {
         Some(d) => (d.inside, d.dispatch_failed, d.frame, d.over_preview),
         None => (false, true, None, false),

@@ -169,7 +169,9 @@ pub async fn update_todo(
         let existing = s.todos().iter().find(|t| t.id == id).cloned();
         // **P2-4 fix**：update 返 Result<Option<Todo>>。None = no-op，跳过
         // persist + emit；Some = 实际改了。
-        let updated = s.update(&id, title, status_enum).map_err(|e| e.to_string())?;
+        let updated = s
+            .update(&id, title, status_enum)
+            .map_err(|e| e.to_string())?;
         (updated, existing)
     };
     match maybe_updated {
@@ -300,10 +302,12 @@ pub async fn purge_attachment(store: State<'_, SharedStore>, file: String) -> Re
     // 引用仍在则跳过删除，让孤儿扫描或下次 delete 收尾。
     {
         let s = store.read().await;
-        let still_referenced = s
-            .todos()
-            .iter()
-            .any(|t| t.attachment.as_ref().map(|a| a.file == file).unwrap_or(false));
+        let still_referenced = s.todos().iter().any(|t| {
+            t.attachment
+                .as_ref()
+                .map(|a| a.file == file)
+                .unwrap_or(false)
+        });
         if still_referenced {
             tracing::warn!(
                 "purge_attachment skipped: {file} 仍被 todo 引用（let purge_orphan_attachments 兜底）"
@@ -907,11 +911,10 @@ pub async fn paste_from_clipboard(
                     _ => String::new(),
                 },
             };
-            let dir = store
-                .read()
-                .await
-                .attachments_dir()
-                .ok_or_else(|| rust_i18n::t!("commands.error.no_attachments_dir").to_string())?;
+            let dir =
+                store.read().await.attachments_dir().ok_or_else(|| {
+                    rust_i18n::t!("commands.error.no_attachments_dir").to_string()
+                })?;
             std::fs::create_dir_all(&dir).map_err(|e| format!("create attachments dir: {e}"))?;
             let file = format!("{}.{}", uuid::Uuid::new_v4(), img.ext);
             let path = dir.join(&file);
@@ -1457,8 +1460,8 @@ pub async fn dump_perf(path: String, data: serde_json::Value) -> Result<(), Stri
     .map_err(|e| format!("dump_perf: invalid USTICKY_PERF_OUT {perf_out:?}: {e}"))?;
 
     let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let canon_parent =
-        std::fs::canonicalize(parent).map_err(|e| format!("dump_perf: invalid path {path:?}: {e}"))?;
+    let canon_parent = std::fs::canonicalize(parent)
+        .map_err(|e| format!("dump_perf: invalid path {path:?}: {e}"))?;
     let file_name = target
         .file_name()
         .ok_or_else(|| "dump_perf: path has no file name".to_string())?;

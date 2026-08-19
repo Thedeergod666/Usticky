@@ -153,7 +153,13 @@ fn parse_shortcut(s: &str) -> Result<Shortcut, String> {
 fn make_quick_add_handler(
     app: &tauri::AppHandle,
     store: &SharedStore,
-) -> impl Fn(&tauri::AppHandle, &tauri_plugin_global_shortcut::Shortcut, tauri_plugin_global_shortcut::ShortcutEvent) + Send + Sync + 'static {
+) -> impl Fn(
+    &tauri::AppHandle,
+    &tauri_plugin_global_shortcut::Shortcut,
+    tauri_plugin_global_shortcut::ShortcutEvent,
+) + Send
+       + Sync
+       + 'static {
     let app_handle = app.clone();
     let store_ref = store.clone();
     move |_app, _shortcut, event| {

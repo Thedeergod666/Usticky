@@ -151,12 +151,18 @@ unsafe fn apply_z_order(hwnd: *mut core::ffi::c_void, z: ZOrder) {
             let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             if ex_style == 0 {
                 let err = unsafe { GetLastError() };
-                tracing::debug!(error = err, "apply_z_order: GetWindowLongPtrW 失败，跳过 style 写入");
+                tracing::debug!(
+                    error = err,
+                    "apply_z_order: GetWindowLongPtrW 失败，跳过 style 写入"
+                );
             } else {
                 let new_style: isize = ex_style | (WS_EX_TOPMOST as isize);
                 if SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style) == 0 {
                     let err = unsafe { GetLastError() };
-                    tracing::debug!(error = err, "apply_z_order: SetWindowLongPtrW(TopMost) 失败");
+                    tracing::debug!(
+                        error = err,
+                        "apply_z_order: SetWindowLongPtrW(TopMost) 失败"
+                    );
                 }
             }
         }
@@ -167,12 +173,18 @@ unsafe fn apply_z_order(hwnd: *mut core::ffi::c_void, z: ZOrder) {
             let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             if ex_style == 0 {
                 let err = unsafe { GetLastError() };
-                tracing::debug!(error = err, "apply_z_order: GetWindowLongPtrW 失败，跳过 style 写入");
+                tracing::debug!(
+                    error = err,
+                    "apply_z_order: GetWindowLongPtrW 失败，跳过 style 写入"
+                );
             } else {
                 let new_style: isize = ex_style & !(WS_EX_TOPMOST as isize);
                 if SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style) == 0 {
                     let err = unsafe { GetLastError() };
-                    tracing::debug!(error = err, "apply_z_order: SetWindowLongPtrW(clear TopMost) 失败");
+                    tracing::debug!(
+                        error = err,
+                        "apply_z_order: SetWindowLongPtrW(clear TopMost) 失败"
+                    );
                 }
             }
         }
@@ -433,7 +445,8 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                     }
                 }
 
-                let Some((raw_inside, over_preview, pt, rect)) = is_cursor_inside_floating(&app) else {
+                let Some((raw_inside, over_preview, pt, rect)) = is_cursor_inside_floating(&app)
+                else {
                     continue;
                 };
 
@@ -574,9 +587,7 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
 /// 外框（同一坐标系），emit hover-pos 时 caller 相减 + 除 scale 转
 /// 视口相对 logical 坐标。over_preview=true 时坐标对预览窗无意义，
 /// 前端只看 flag。
-fn is_cursor_inside_floating<R: Runtime>(
-    app: &AppHandle<R>,
-) -> Option<(bool, bool, POINT, RECT)> {
+fn is_cursor_inside_floating<R: Runtime>(app: &AppHandle<R>) -> Option<(bool, bool, POINT, RECT)> {
     let win = app.get_webview_window("floating")?;
     let hwnd_t = win.hwnd().ok()?;
     if hwnd_t.0.is_null() {
