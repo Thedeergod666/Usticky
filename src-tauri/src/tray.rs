@@ -11,6 +11,7 @@
 //
 // 菜单结构：
 //   Toggle floating window
+//   Reset Position
 //   ---
 //   [Settings ▸]
 //     Top        ✓
@@ -166,6 +167,17 @@ fn build_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         None::<&str>,
     )?;
 
+    // **归位**：跟设置面板 "Reset Position" 按钮复用同一个 command
+    // (`commands::reset_floating_window`)，行为完全一致 —— 把浮窗移到
+    // 主屏正中央 + 持久化新位置/尺寸 + emit window-pos-changed。
+    let reset_i = MenuItem::with_id(
+        app,
+        "reset_position",
+        rust_i18n::t!("tray.reset_position").to_string(),
+        true,
+        None::<&str>,
+    )?;
+
     // ── Settings 子菜单：pin mode 三档 + 打开设置面板 ──
     let cur_pin = current_pin_mode(app);
     let pin_top_i = CheckMenuItem::with_id(
@@ -232,7 +244,16 @@ fn build_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         true,
         None::<&str>,
     )?;
-    Menu::with_items(app, &[&toggle_i, &sep_i, &settings_sub, &quit_i])
+    Menu::with_items(
+        app,
+        &[
+            &toggle_i as &dyn IsMenuItem<R>,
+            &reset_i as &dyn IsMenuItem<R>,
+            &sep_i as &dyn IsMenuItem<R>,
+            &settings_sub as &dyn IsMenuItem<R>,
+            &quit_i as &dyn IsMenuItem<R>,
+        ],
+    )
 }
 
 pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -291,6 +312,24 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = commands::open_settings_window(app2).await {
                             tracing::warn!(error = %e, "打开设置失败");
+                        }
+                    });
+                }
+                "reset_position" => {
+                    // 跟设置面板 "Reset Position" 按钮复用 `reset_floating_window_core`：
+                    // 移到主屏正中央 + 持久化 + emit window-pos-changed。
+                    let app2 = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        // try_state 同 pin mode handler —— 启动早期 / shutdown
+                        // 阶段 store 可能还没 ready / 已 drop，None 时 warn 跳过。
+                        let store = if let Some(s) = app2.try_state::<SharedStore>() {
+                            s.inner().clone()
+                        } else {
+                            tracing::warn!("tray reset_position handler: store not ready, skipping");
+                            return;
+                        };
+                        if let Err(e) = commands::reset_floating_window_core(&app2, &store).await {
+                            tracing::warn!(error = %e, "tray reset_position 失败");
                         }
                     });
                 }

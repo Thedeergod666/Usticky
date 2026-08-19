@@ -19,6 +19,7 @@
   },
   "tray": {
     "toggle": "Toggle floating window",
+    "reset_position": "Reset Position",
     "settings": "Settings",
     "open_settings": "Open Settings Panel...",
     "quick_add_change": "Change Quick Add Shortcut...",

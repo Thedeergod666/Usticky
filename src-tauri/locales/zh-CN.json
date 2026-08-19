@@ -19,6 +19,7 @@
   },
   "tray": {
     "toggle": "切换浮窗显隐",
+    "reset_position": "归位位置",
     "settings": "设置",
     "open_settings": "打开设置面板...",
     "quick_add_change": "修改快速唤出快捷键...",

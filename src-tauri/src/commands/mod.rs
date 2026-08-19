@@ -370,6 +370,16 @@ pub async fn reset_floating_window(
     app: AppHandle,
     store: State<'_, SharedStore>,
 ) -> Result<(), String> {
+    reset_floating_window_core(&app, store.inner()).await
+}
+
+/// 归位（移到主屏正中央）的核心逻辑（command 和 tray menu handler 共用）。
+///
+/// 详见 [`reset_floating_window`] 的字段说明。
+pub async fn reset_floating_window_core(
+    app: &AppHandle,
+    store: &SharedStore,
+) -> Result<(), String> {
     // **fix 2026-07-17**：用 OS 主显示器（菜单栏所在 / Windows 标记为
     // "Main display" 的屏），**不**用 current_monitor。无论用户把浮窗
     // 拖到哪个副屏，点重置都回主屏中央——这是用户的产品预期（"重置"
@@ -436,7 +446,7 @@ pub async fn reset_floating_window(
         }
 
         // **P1-2 fix**：调裸 persist_only helper（无 RwLock 跨 I/O）。
-        persist_only(&app, store.inner()).await;
+        persist_only(app, store).await;
 
         // **P2-19 fix**：emit `usticky://window-pos-changed` 给浮窗 webview
         // （reset 后浮窗的位置已变，前端 cached 的"outer_pos"和 CSS 渲染
