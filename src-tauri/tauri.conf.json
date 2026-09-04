@@ -29,11 +29,12 @@
         "skipTaskbar": true,
         "visible": true,
         "shadow": false,
+        "dragDropEnabled": false,
         "url": "index.html"
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc:; font-src 'self'; frame-ancestors 'none'",
+      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'",
       "assetProtocol": {
         "enable": true,
         "scope": [

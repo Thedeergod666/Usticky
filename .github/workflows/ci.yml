@@ -9,6 +9,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# **P3-23 fix（2026-09-04 全量审查）**：显式 permissions 块最小化。旧
+# 缺省取仓库默认 token 权限（org 级可能 permissive），与 release.yml
+# 21-23 行 `contents: write` 不一致。CI 只做构建，只需 contents: read。
+permissions:
+  contents: read
+
 # action 全部钉到 commit SHA（沿用 Musage 同款钉法，避免上游 major 升级改语义）
 #   actions/checkout        v4.3.1 → 34e114876b0b11c390a56381ad16ebd13914f8d5
 #   actions/setup-node      v4.4.0 → 49933ea5288caeca8642d1e84afbd3f7d6820020

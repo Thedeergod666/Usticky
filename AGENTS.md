@@ -25,7 +25,7 @@
 | 系统通知 | tauri-plugin-notification | v0.2+ 用（提醒临近 deadline），v0.1 不依赖 |
 
 **Cargo 钉死**（避免重复踩坑）：
-- `crate-type = ["staticlib", "rlib"]` —— 删 cdylib 绕 MinGW ld 16-bit ordinal 溢出
+- `crate-type = ["rlib"]` —— 删 staticlib 绕 MinGW ld 16-bit ordinal 溢出（v0.1.5 P3-4 删）
 - `tauri` feature = `["tray-icon", "image-png", "macos-private-api"]`（macOS-private-api 是 entitlements 前置）
 - `[profile.release]` `panic = "abort"` + `lto = true` + `opt-level = "s"`，**不**开 `strip = true`（与 rust-i18n 冲突）
 
@@ -76,7 +76,7 @@
   "alwaysOnTop": false,    // 默认 false，让用户选 pin_top / pin_bottom / normal
   "skipTaskbar": true, "shadow": false,
   "resizable": true,        // 即便"内容自适应"也要可拖
-  "minWidth": 180, "minHeight": 160,
+  "minWidth": 240, "minHeight": 160,
   "maxWidth": 420, "maxHeight": 2400
 }
 ```
@@ -430,7 +430,7 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 - **产物未签名**：没配 APPLE_* / WINDOWS_CERTIFICATE secret。macOS 用户右键打开或 `xattr -cr`；Windows SmartScreen 选"仍要运行"。以后要签名时把 Musage release.yml 的 env 块抄回来。
 - **有意砍掉**：Windows MSI（Musage 实测 WiX 镜像 CI 上常 timeout）、Linux RPM（AppImage+deb 覆盖面已够）。
 - **版本号三处同步**：`pnpm sync-version`（package.json → tauri.conf.json + Cargo.toml）。发版流程：改 package.json version → sync → 更新 CHANGELOG → commit → `git tag vX.Y.Z && git push origin vX.Y.Z` → 等 draft release → 人工 review 后 publish。
-- Windows 目标用 **MSVC**（Musage CI 同款）。Cargo.toml 的 `crate-type = ["staticlib", "rlib"]` 是给 MinGW 兜底的，对 MSVC 无副作用，别删。
+- Windows 目标用 **MSVC**（Musage CI 同款）。Cargo.toml 的 `crate-type = ["rlib"]`（v0.1.5 P3-4 删 staticlib 后）。
 - 不上传 `latest.json`（不走 tauri-plugin-updater；要加 updater 时记得把 network entitlement 加回 entitlements.plist）。
 
 ## v0.2 候选

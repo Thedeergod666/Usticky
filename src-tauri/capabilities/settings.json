@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "settings",
+  "description": "settings window 独占：opener.default 用于打开 GitHub 链接 (About → Repo)",
+  "windows": [
+    "settings"
+  ],
+  "permissions": [
+    "opener:default"
+  ]
+}
