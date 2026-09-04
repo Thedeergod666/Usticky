@@ -1378,11 +1378,22 @@ pub async fn open_preview_window(
 /// `force = false`（默认）：窗口**聚焦中**（用户在预览里编辑）时跳过 ——
 /// 浮窗 hover(false) / grace close 不该打断编辑；编辑态窗口由 preview.ts
 /// 自己的 blur/Esc 关闭。`force = true`：浮窗 hide 等兜底路径强制关。
+///
+/// **P0-4 fix（2026-09-04 全量审查）**：旧实现 focused 早期 return 路径
+/// 既不 close、也不 emit preview-closed / clear pending —— 浮窗 grace close
+/// 状态机靠 preview-closed 才解卡片强调态 + 玻璃 hover，早期 return 会让
+/// "用户编辑时浮窗收方阵已清 previewTodoId 但 hover 强调/玻璃永远卡住"。
+/// 修：focused 时也 emit preview-closed 复位（编辑态 webview 自己的 blur/Esc
+/// 链路完全独立，不受影响）。
 #[tauri::command]
 pub async fn close_preview_window(app: AppHandle, force: Option<bool>) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("preview") {
         let force = force.unwrap_or(false);
         if !force && w.is_focused().unwrap_or(false) {
+            // 仍 emit preview-closed + clear pending，让浮窗 grace timer
+            // 状态机正确复位（强调态 / 玻璃态依赖此事件）。
+            let _ = app.emit("usticky://preview-closed", ());
+            clear_pending_preview_todo();
             return Ok(());
         }
         // w.close() 偶发返 Err（窗口正被移动 / 合成层重排 / 已在关闭中等竞态）。
