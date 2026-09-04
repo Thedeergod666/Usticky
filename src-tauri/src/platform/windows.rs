@@ -124,6 +124,16 @@ enum ZOrder {
 /// `SetWindowLongW` **必须 OR 不能替换** —— 直接 `0x0008` 会
 /// wipe 掉 `WS_EX_LAYERED` / `WS_EX_NOREDIRECTIONBITMAP` 等所有 bit。
 unsafe fn apply_z_order(hwnd: *mut core::ffi::c_void, z: ZOrder) {
+    // **P0-2 fix（2026-09-04 全量审查）**：stale HWND 守卫。emitter 线程每
+    // tick 现取 hwnd 之前曾缓存为 spawn-time 单次值（line 399 `hwnd_cache`），
+    // WebviewWindow 销毁/重建后旧 hwnd 通过 handle-reuse 落到无关窗口，
+    // SetWindowLongPtrW 写入错误进程的 ex-style —— Win32 经典 UB。
+    // 防御：每次进函数先 IsWindow 探测；无效则早退，避免后续三调用全误写。
+    if unsafe { IsWindow(HWND(hwnd)) } == false {
+        tracing::debug!(?z, "apply_z_order: hwnd 无效，跳过");
+        return;
+    }
+
     // **P1-7 fix**：与所有调用方串行 —— 见 APPLY_Z_ORDER_LOCK 注释。
     // 持有锁期间跑完整三调用序列（读 style → 改 style → SetWindowPos），
     // 防止 hover emitter 后台线程和 pin-mode 派发的 main-thread 互踩
@@ -379,31 +389,21 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
     let builder = thread::Builder::new()
         .name("usticky-hover-emitter".into())
         .spawn(move || {
-            // **P2-1 fix**：缓存 hwnd + scale_factor，避免后台线程每 tick
-            // 调 `app.get_webview_window / win.hwnd / win.scale_factor`。
-            // Tauri 的 WebviewWindow 方法没有跨线程安全保证；Win32 API 虽
-            // 然大部分 thread-safe，但 Tauri 封装层有内部状态（HWND handle
-            // 表），后台线程频繁取可能有竞争。这里启动时一次性在 spawn
-            // 闭包内拉（线程刚启动时主线程也在 setup 流程内，但 get_webview_window
-            // 走的是 Tauri 的内部 handle 表，主线程初始化完成后取是安全的）。
+            // **P2-1 fix**：缓存 WebviewWindow 句柄（win_opt）保留供 scale_cache
+            // 刷新 + 隐藏态跳过用，但 **hwnd 不再缓存**（P0-2 fix）。
+            // **P0-2 fix（2026-09-04 全量审查）**：旧实现 spawn 时一次性
+            // 取 hwnd 存为 `hwnd_cache`，但 WebviewWindow 销毁/重建后 hwnd
+            // 通过 Win32 handle-reuse 落到无关窗口 → apply_z_order 内部
+            // SetWindowLongPtrW 写入错误进程 ex-style（UB）。每 tick 从
+            // win_opt.hwnd().ok() 现取，避免 stale。
             //
-            // 如果拉不到（窗口未上屏等极端情况），fallback 默认值 + 跳过
-            // hover-pos / z-order emit——避免误发坐标让前端 elementFromPoint
-            // 命中错位。
-            // **P1-8 fix**：保留 win_opt（WebviewWindow 句柄）供 hover emitter
-            // 主循环刷新 scale_cache 用。`hwnd_cache` 仍走 spawn 时一次性取
-            // （hwnd 在线程生命周期内不变，省去每次调 win.hwnd() 的开销）。
             // scale 不能缓存为 spawn-time 值 —— 用户改 DPI / 拖显示器后 stale
             // 会让 hover-pos 转视口坐标错位。
             let win_opt = app.get_webview_window("floating");
-            let hwnd_cache = match &win_opt {
-                Some(win) => win.hwnd().ok().map(|h| h.0).unwrap_or(std::ptr::null_mut()),
-                None => std::ptr::null_mut(),
-            };
-            if hwnd_cache.is_null() {
-                tracing::warn!("hover emitter: 无法获取浮窗 hwnd，hover raise / glass 效果将失效");
+            if win_opt.is_none() {
+                tracing::warn!("hover emitter: 无法获取浮窗 WebviewWindow，hover raise / glass 效果将失效");
                 // 仍继续跑 hover 状态机——`is_cursor_inside_floating` 内部
-                // 自己也会查 hwnd，缓存 null 不影响 inside 判定。
+                // 自己也会查 hwnd。
             }
             let mut last_inside = false;
             let mut last_emitted = false;
@@ -509,58 +509,53 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                 // 鼠标在卡 A→卡 B 之间的切换。未聚焦时 WKWebView 不派
                 // mouseenter，title-expand 必须靠这条路径。
                 //
-                // **P2-1 fix**：用 spawn 时缓存的 hwnd，不调 Tauri。
+                // **P0-2 fix**：hwnd 每 tick 从 win_opt 现取（避免 stale）。
                 // **P1-8 fix**：scale 用 Mutex<Option> 缓存，第一 tick / 每 60 tick
                 // 刷新一次。坐标 = 视口相对（cursor - window rect 左上角）/ scale。
-                if inside && !hwnd_cache.is_null() {
-                    let logical_x = (pt.x - rect.left) as f64 / scale;
-                    let logical_y = (pt.y - rect.top) as f64 / scale;
-                    let pos = HoverPos {
-                        x: logical_x,
-                        y: logical_y,
-                        over_preview,
-                    };
-                    // P3：静止去重 —— 坐标不变就跳过，消掉 20Hz IPC + elementFromPoint
-                    if last_emitted_pos != Some(pos) {
-                        last_emitted_pos = Some(pos);
-                        let _ = app.emit("usticky://floating-hover-pos", pos);
-                    }
-                }
-
-                // (3) PinBottom 模式：切 z-order
-                //
-                // **P2-1 fix**：用缓存 hwnd。Win 上 scale_factor 在用户
-                // 拖显示器 / 改 DPI 时会变（scale_cache 可能 stale），但
-                // z-order 操作不依赖 scale，缓存 stale 不影响。
-                if LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst) && !hwnd_cache.is_null() {
-                    if inside {
-                        // **P2-6 fix**：re-assert TopMost 节流到 500ms / 1 次。
-                        //
-                        // 旧实现每 50ms 都 SetWindowLongPtrW + SetWindowPos，
-                        // 每秒 ~20 次 z-order 操作，触发主线程 WM_WINDOWPOSCHANGING
-                        // 等消息 + WKWebView 重排。新用户报告窗口有可感知抖动。
-                        //
-                        // 500ms 间隔足够防 Win OS 把窗口 demote（OS z-order 调度
-                        // 周期通常 ≥ 1s），但 z-order 调用频次降到 2 Hz，与
-                        // macOS NSWindow 不需要 re-assert 的"被动"语义更接近。
-                        // **P2-5 fix（2026-08-13 全量审查）**：edge-trigger
-                        // （last_inside=false → inside=true）跳过节流判定。
-                        // 旧实现把 `tick_count.is_multiple_of(10)` 无条件放在
-                        // inside 分支里，fresh-entry 帧若不在 10 倍 tick 上
-                        // 就推迟到下个 10 倍 tick（最长 450ms）。PinBottom 默认
-                        // 模式下鼠标快速划过浮窗（< 500ms）→ 浮窗永远不置顶
-                        // —— 与代码自己的注释承诺不符，也跟 macOS 端立即置顶
-                        // 行为不一致。
-                        let edge_entry = !last_inside;
-                        if edge_entry || tick_count.is_multiple_of(10) {
-                            unsafe {
-                                apply_z_order(hwnd_cache, ZOrder::TopMost);
-                            }
+                if inside {
+                    if let Some(hwnd_raw) = win_opt.as_ref().and_then(|w| w.hwnd().ok().map(|h| h.0)) {
+                        let logical_x = (pt.x - rect.left) as f64 / scale;
+                        let logical_y = (pt.y - rect.top) as f64 / scale;
+                        let pos = HoverPos {
+                            x: logical_x,
+                            y: logical_y,
+                            over_preview,
+                        };
+                        // P3：静止去重 —— 坐标不变就跳过，消掉 20Hz IPC + elementFromPoint
+                        if last_emitted_pos != Some(pos) {
+                            last_emitted_pos = Some(pos);
+                            let _ = app.emit("usticky://floating-hover-pos", pos);
                         }
-                    } else if last_inside {
-                        // 刚离开: edge-trigger drop 到 BOTTOM
-                        unsafe {
-                            apply_z_order(hwnd_cache, ZOrder::Bottom);
+                        // (3) PinBottom 模式：切 z-order
+                        //
+                        // **P0-2 fix**：hwnd 现取（无 stale 风险，apply_z_order 内部
+                        // 另有 IsWindow 守卫双保险）。scale_factor 漂
+                        // 不影响 z-order 操作。
+                        if LEVEL_SWITCHING_ACTIVE.load(Ordering::SeqCst) {
+                            if inside {
+                                // **P2-6 fix**：re-assert TopMost 节流到 500ms / 1 次。
+                                //
+                                // 旧实现每 50ms 都 SetWindowLongPtrW + SetWindowPos，
+                                // 每秒 ~20 次 z-order 操作，触发主线程 WM_WINDOWPOSCHANGING
+                                // 等消息 + WKWebView 重排。新用户报告窗口有可感知抖动。
+                                //
+                                // 500ms 间隔足够防 Win OS 把窗口 demote（OS z-order 调度
+                                // 周期通常 ≥ 1s），但 z-order 调用频次降到 2 Hz，与
+                                // macOS NSWindow 不需要 re-assert 的"被动"语义更接近。
+                                // **P2-5 fix（2026-08-13 全量审查）**：edge-trigger
+                                // （last_inside=false → inside=true）跳过节流判定。
+                                let edge_entry = !last_inside;
+                                if edge_entry || tick_count.is_multiple_of(10) {
+                                    unsafe {
+                                        apply_z_order(hwnd_raw, ZOrder::TopMost);
+                                    }
+                                }
+                            } else if last_inside {
+                                // 刚离开: edge-trigger drop 到 BOTTOM
+                                unsafe {
+                                    apply_z_order(hwnd_raw, ZOrder::Bottom);
+                                }
+                            }
                         }
                     }
                 }
