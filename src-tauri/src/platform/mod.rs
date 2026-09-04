@@ -52,7 +52,7 @@ mod plat {
     pub fn start_hover_emitter<R: Runtime>(_app: AppHandle<R>) {}
     // Quick-add 临时置顶 + 切回原应用：Linux no-op（无稳定切回原 app 路径）
     pub fn save_previous_app_for_quick_add() {}
-    pub fn activate_previous_app_after_quick_add() {}
+    pub fn activate_previous_app_after_quick_add<R: Runtime>(_app: &AppHandle<R>) {}
     pub fn raise_for_quick_add<R: Runtime>(_app: &AppHandle<R>) {}
     pub fn restore_level_after_quick_add<R: Runtime>(_app: &AppHandle<R>, _mode: PinMode) {}
 }

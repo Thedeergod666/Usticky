@@ -16,7 +16,7 @@
 //   - tray 动态进度条（Usticky tray 是"任务总数 badge"，v0.1 stub）
 //   - PinBottom hover emitter 在 Musage 是 v0.2 才加的，Usticky v0.1 直接搬
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tauri::{Emitter, Listener, Manager};
@@ -53,6 +53,29 @@ pub type SharedStore = Arc<tokio::sync::RwLock<Store>>;
 ///     + activate prev app + set false）
 ///   - show_floating_window 命令 / tray toggle show → set false（清除残留状态）
 static QUICK_ADD_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// **P-rapid-press fix（2026-08-24）**：quick_show 单调计数器。每次
+/// `quick_show_floating_window` 成功把 `QUICK_ADD_ACTIVE` 翻 true 时增 1。
+///
+/// 解决的问题：`Focused(false)` handler spawn 的 blur_dismiss 任务**可能延后
+/// 几十 ms 才跑**（toki 调度 + blocking_read 卡顿），期间用户可能又按了
+/// 几次快捷键（quick_show → toggle_dismiss 交替），任务的 `clear_quick_add_state`
+/// 拿到 `was_active=true`（来自最新一次 quick_show）→ 误派发 LOWER。
+///
+/// 主线程 dispatch 队列形如 `[RAISE(按N), LOWER(stale任务)]` → 最终落到
+/// BELOW_NORMAL，浮窗被其它 app 完全盖住，用户视觉等同"闪退"。
+///
+/// `clear_quick_add_state` 在 swap 之后再看一眼 epoch：若 epoch 变了说明
+/// 中间至少夹了一次新 show，整个 restore 跳过（不派 LOWER 也不调
+/// `set_window_pin_bottom` 翻 `LEVEL_SWITCHING_ACTIVE`，避免把 hover emitter
+/// 的开关再打乱）。
+///
+/// 注：epoch 检查和后续 `restore_level_after_quick_add` 调用之间还有极小竞态
+/// 窗口（其他线程可能再触发一次 quick_show）。要让 main thread 真正原子地
+/// "check-then-set level"，得把检查挪进 `set_window_level` 的 dispatch 闭包里
+/// —— 那需要给 set_window_level 加新参数，影响面更大。当前简单修复覆盖 99%
+/// 场景（用户连续按 N 次只看到 N-1 次 stale restore），剩余小窗口实际很难撞上。
+static SHOW_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// **P2-8 fix**：浮窗 Moved/Resized 事件的 trailing-edge debounce 通道。
 ///
@@ -247,10 +270,21 @@ fn register_quick_add_shortcut(
 
 /// 内部 helper：清 QUICK_ADD_ACTIVE 状态 + 还原 level（不隐藏、不 activate prev app）。
 /// 仅在 was_active=true 时做实际工作。
+///
+/// **P-rapid-press fix**：在 swap 后 capture `SHOW_EPOCH`，blocking_read 后
+/// 再 check 一次。若 epoch 变了 → 中间夹了新的 quick_show → 我们的 dismiss
+/// 是 stale 的 → 整个 restore 放弃（详见 `SHOW_EPOCH` 注释）。
 fn clear_quick_add_state(app: &tauri::AppHandle, store: &SharedStore) {
     let was_active = QUICK_ADD_ACTIVE.swap(false, Ordering::SeqCst);
     if was_active {
+        let epoch = SHOW_EPOCH.load(Ordering::SeqCst);
         let mode = store.blocking_read().pin_mode();
+        if SHOW_EPOCH.load(Ordering::SeqCst) != epoch {
+            // 中间夹了一次新的 quick_show，我们的 dismiss 已经被它覆盖。
+            // 新 show 已经把 level 升到 FLOATING 并派了 RAISE，我们不能再派
+            // LOWER 把它的 RAISE 顶掉（main thread 是 FIFO dispatch）。
+            return;
+        }
         platform::restore_level_after_quick_add(app, mode);
     }
 }
@@ -273,14 +307,38 @@ pub fn quick_show_floating_window(app: &tauri::AppHandle, _store: &SharedStore) 
     let Some(w) = app.get_webview_window("floating") else {
         return;
     };
+    // **P-rapid-press fix**：成功拿回浮窗控制权后才 bump epoch。
+    // 放在 swap 之后是为了让 stale 的 blur_dismiss 任务能看到 epoch 变化；
+    // 放在 show/focus 之前是为了让任何派发的 RAISE 都在 epoch 增 1 之后。
+    QUICK_ADD_ACTIVE.store(true, Ordering::SeqCst);
+    SHOW_EPOCH.fetch_add(1, Ordering::SeqCst);
     // save prev app 只在快捷键路径有意图（tray 主动唤起不需要切回原 app，
     // activate_previous_app_after_quick_add 是 no-op 也不会报错 —— 但为了语义清晰，
     // 这里仍然 save：tray hide 走 hide_dismiss 会 activate prev app，跟快捷键一致）
     platform::save_previous_app_for_quick_add();
     platform::raise_for_quick_add(app);
-    QUICK_ADD_ACTIVE.store(true, Ordering::SeqCst);
     let _ = w.show();
-    let _ = w.set_focus();
+    // **P-WKWebView-init-race fix（2026-08-25）**：浮窗启动后第一次按快捷键时
+    // WKWebView 还在 init / 第一次 layout pass，连按 show + focus 可能让 NSWindow
+    // 进入 invalid visibility state，WKWebView 已知会在这个时机 NSException → 进程 abort
+    // （macOS 上 panic="abort" 直接终止）。修：第一次 focus 派发到下一个 main-thread
+    // cycle，让 WKWebView 有机会把 show 处理完再 focus。后续 focus 走 sync，
+    // UX 上用户无感（10~20ms 差异肉眼不可见）。
+    //
+    // 跨进程第一次 focus 后 `FIRST_FOCUS_DONE` 翻 true，本会话内不再 defer。
+    // 如果将来想做更精细的"等 on_page_load 完再 focus"，参考 [lib.rs setup 段]
+    // 的 `on_page_load` hook 注释。
+    if FIRST_FOCUS_DONE.swap(true, Ordering::SeqCst) {
+        let _ = w.set_focus();
+    } else {
+        let app_for_focus = app.clone();
+        let label_for_focus = w.label().to_string();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(w) = app_for_focus.get_webview_window(&label_for_focus) {
+                let _ = w.set_focus();
+            }
+        });
+    }
     // **P4 perf fix**：通知 hover emitter 窗口已显示 → 恢复 tick。必须在 show()
     // 之后调用，因为 emitter 下次 tick 会读 WINDOW_VISIBLE。
     #[cfg(target_os = "macos")]
@@ -291,6 +349,10 @@ pub fn quick_show_floating_window(app: &tauri::AppHandle, _store: &SharedStore) 
     let _ = app.emit("usticky://quick-add", ());
 }
 
+/// 浮窗启动后是否已完成过第一次 focus。用于 [quick_show_floating_window] 在第一次
+/// 按快捷键时 defer focus 避免 WKWebView init race（详见该函数注释）。
+static FIRST_FOCUS_DONE: AtomicBool = AtomicBool::new(false);
+
 /// toggle dismiss（快捷键 2nd press 调）：不隐藏窗口，仅还原 level + 切回原 app。
 ///
 /// 顺序：restore level → activate prev app。
@@ -298,7 +360,7 @@ pub fn quick_show_floating_window(app: &tauri::AppHandle, _store: &SharedStore) 
 /// 但此时 QUICK_ADD_ACTIVE 已经是 false，blur_dismiss 是 no-op，不会重复处理。
 pub fn toggle_dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore) {
     clear_quick_add_state(app, store);
-    platform::activate_previous_app_after_quick_add();
+    platform::activate_previous_app_after_quick_add(app);
 }
 
 /// blur dismiss（窗口失焦事件调）：仅还原 level + 清状态。
@@ -352,7 +414,7 @@ pub fn hide_dismiss_floating_window(app: &tauri::AppHandle, store: &SharedStore)
     if was_active {
         let mode = store.blocking_read().pin_mode();
         platform::restore_level_after_quick_add(app, mode);
-        platform::activate_previous_app_after_quick_add();
+        platform::activate_previous_app_after_quick_add(app);
     }
 }
 

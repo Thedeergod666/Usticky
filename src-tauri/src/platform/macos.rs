@@ -244,13 +244,23 @@ pub fn save_previous_app_for_quick_add() {
 /// macOS 14+ 推荐 `activate()`，但 objc2-app-kit 0.3.2 只暴露了 deprecated 的
 /// `activateWithOptions(_:)`。实测在 macOS 26 上仍工作，先用着 —— 后续升级
 /// objc2-app-kit 后再切 `activate()`。
-pub fn activate_previous_app_after_quick_add() {
+///
+/// **P-macOS-thread fix（2026-08-25）**：原实现从 global-shortcut callback 线程
+/// 直接调 `activateWithOptions`。macOS 14+ 走 `_NXAssertMainThread` 路径校验
+/// 线程，从非主线程调偶发触发 NSAssert → 进程 abort（panic="abort" profile 下尤其
+/// 致命，连按 Cmd+Shift+Space 多次直接撞这条）。修：mutex 读 + `Retained::clone()`
+/// 仍在调用线程做（refcount 原子操作，不触 ObjC runtime），但 `activateWithOptions`
+/// 包进 `app.run_on_main_thread` 派发到主线程。
+pub fn activate_previous_app_after_quick_add<R: Runtime>(app: &AppHandle<R>) {
     let mutex = SAVED_PREV_APP.get_or_init(|| Mutex::new(None));
     let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(app) = guard.as_ref() else { return };
+    let Some(saved_app) = guard.as_ref().cloned() else { return };
+    drop(guard);
     // ActivateAllWindows：把目标 app 的所有窗口都拉到前面（vs 只拉 key window）
     let options = NSApplicationActivationOptions::ActivateAllWindows;
-    let _ = app.activateWithOptions(options);
+    let _ = app.run_on_main_thread(move || {
+        let _ = saved_app.activateWithOptions(options);
+    });
     // 不清空 SAVED_PREV_APP —— 下次 quick-add 时 save_previous_app_for_quick_add
     // 会覆盖（如果新 frontmost 不是我们自己）。这样即使 dismiss 后没立刻 save
     // 也保留上次值，行为更稳。

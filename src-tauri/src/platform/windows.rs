@@ -296,7 +296,7 @@ pub fn save_previous_app_for_quick_add() {
     *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(foreground as usize);
 }
 
-pub fn activate_previous_app_after_quick_add() {
+pub fn activate_previous_app_after_quick_add<R: Runtime>(app: &AppHandle<R>) {
     let lock = SAVED_PREV_HWND.get_or_init(|| std::sync::Mutex::new(None));
     let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let Some(hwnd) = *guard else { return };
@@ -304,23 +304,33 @@ pub fn activate_previous_app_after_quick_add() {
         return;
     }
     let hwnd_w = hwnd as WIN_HWND;
-    // SAFETY: AllowSetForegroundWindow + SetForegroundWindow + IsWindow 都是
-    // thread-safe Win32 API。
-    unsafe {
-        // **P3-15 fix（2026-08-13 全量审查）**：HWND 复用校验。原 app 在
-        // quick-add 会话期间被关掉（Alt+F4 / 崩溃 / 退出），句柄被 OS
-        // 复用给完全无关的窗口 → SetForegroundWindow 静默把焦点甩给
-        // 那个窗口。IsWindow 0 即"句柄已失效"，提前 return。
-        if IsWindow(hwnd_w) == 0 {
-            tracing::trace!("activate_previous_app: saved hwnd 已失效（被关闭或复用），跳过");
-            return;
+    // **P-macOS-thread consistency fix（2026-08-25）**：Win32 这俩 API 文档上 thread-safe
+    // 但实际行为依赖"调用线程是不是 foreground process"（不是主线程），且和别的线程
+    // 的 z-order 操作存在 race —— 派发到 main thread 后 main thread 上跑的 z-order
+    // 序列跟 SetForegroundWindow 是同一个 owner，避免两个线程互踩。
+    //
+    // HWND 复用校验（IsWindow）保留在派发闭包里做：闭包跑在 main thread，调用
+    // IsWindow 时 main thread 状态稳定，不会被另一条 path 的 set_window_level
+    // 干扰。SetForegroundWindow 也在 main thread 调，跟其他 Win32 窗口操作走同一线程。
+    let _ = app.run_on_main_thread(move || {
+        // SAFETY: AllowSetForegroundWindow + SetForegroundWindow + IsWindow 都是
+        // thread-safe Win32 API。
+        unsafe {
+            // **P3-15 fix（2026-08-13 全量审查）**：HWND 复用校验。原 app 在
+            // quick-add 会话期间被关掉（Alt+F4 / 崩溃 / 退出），句柄被 OS
+            // 复用给完全无关的窗口 → SetForegroundWindow 静默把焦点甩给
+            // 那个窗口。IsWindow 0 即"句柄已失效"，提前 return。
+            if IsWindow(hwnd_w) == 0 {
+                tracing::trace!("activate_previous_app: saved hwnd 已失效（被关闭或复用），跳过");
+                return;
+            }
+            // 放权让任何进程都能接 foreground —— 不调的话 SetForegroundWindow
+            // 大概率被 OS 拒绝（除非 Usticky 此刻刚好是前台进程，那 dismiss 路径
+            // 上调用方就是前台，可以直接调；保守起见还是放权）
+            AllowSetForegroundWindow(ASFW_ANY);
+            let _ = SetForegroundWindow(hwnd_w);
         }
-        // 放权让任何进程都能接 foreground —— 不调的话 SetForegroundWindow
-        // 大概率被 OS 拒绝（除非 Usticky 此刻刚好是前台进程，那 dismiss 路径
-        // 上调用方就是前台，可以直接调；保守起见还是放权）
-        AllowSetForegroundWindow(ASFW_ANY);
-        let _ = SetForegroundWindow(hwnd_w);
-    }
+    });
 }
 
 /// 唤出浮窗时调：disable hover 切 z-order + 设 TopMost。
