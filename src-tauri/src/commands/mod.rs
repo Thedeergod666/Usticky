@@ -405,8 +405,12 @@ pub async fn reset_floating_window_core(
                 .and_then(|m| m.into_iter().next())
         })
         .ok_or_else(|| rust_i18n::t!("commands.error.no_primary_monitor").to_string())?;
-    let mon_size = monitor.size();
-    let mon_pos = monitor.position();
+    // **P0-5 fix（2026-09-04 全量审查）**：用 work_area 而非 size。
+    // size 含 macOS 菜单栏 / Dock、Win 任务栏；work_area 是 visible frame，
+    // 重置后浮窗顶部不会被菜单栏遮掉 22px。对齐 preview_position v0.2.4 fix。
+    let work_area = monitor.work_area();
+    let mon_size = work_area.size;
+    let mon_pos = work_area.position;
     if let Some(w) = app.get_webview_window("floating") {
         // **P2-12 fix**：用持久化的 (w, h)（来自上次 Resized 事件 + 跨重启）
         // 而不是当前 outer_size。后者会拿"现在显示的尺寸"——若用户曾在浮窗
@@ -423,21 +427,33 @@ pub async fn reset_floating_window_core(
                 }
             }
         };
-        let x = mon_pos.x + ((mon_size.width as i32 - win_w as i32) / 2);
-        let y = mon_pos.y + ((mon_size.height as i32 - win_h as i32) / 2);
+        let mut x = mon_pos.x + ((mon_size.width as i32 - win_w as i32) / 2);
+        let mut y = mon_pos.y + ((mon_size.height as i32 - win_h as i32) / 2);
+        // **P0-5 fix**：clamp 至少 50×50 px 在主屏内，防副屏拔屏后
+        // (x, y) 漂到屏外看不见。
+        const MIN_VISIBLE_PX: i32 = 50;
+        x = x.max(mon_pos.x + MIN_VISIBLE_PX).min(mon_pos.x + mon_size.width as i32 - MIN_VISIBLE_PX);
+        y = y.max(mon_pos.y + MIN_VISIBLE_PX).min(mon_pos.y + mon_size.height as i32 - MIN_VISIBLE_PX);
         tracing::debug!(
-            "reset_floating_window: 目标显示器 pos=({}, {}) size={}x{} → 窗口新位置 ({}, {}) size={}x{}",
+            "reset_floating_window: 目标显示器 work_area pos=({}, {}) size={}x{} → 窗口新位置 ({}, {}) size={}x{}",
             mon_pos.x, mon_pos.y, mon_size.width, mon_size.height, x, y, win_w, win_h
         );
 
-        // **P2-16 fix**：浮窗 hide 时**不**调 set_position。macOS 上
-        // set_position 会把 hidden window 提到 front → 用户"明明没主动开
-        // 却被浮窗挡住"。改成只持久化新 (x, y)，下次 show() 时由 setup 流程
-        // 启动时或下次 Resized 时自然应用。
+        // **P0-5 fix**：visible 分支直接 set_position；**hidden 分支**
+        // show + 立即 hide 让 set_position 真生效（macOS 上对 hidden 窗
+        // set_position 才会被 commit，且不会"浮起来"——show 一帧后立即
+        // hide 用户感知不到）。
         let is_visible = w.is_visible().unwrap_or(false);
         if is_visible {
             w.set_position(tauri::PhysicalPosition::new(x, y))
                 .map_err(|e| e.to_string())?;
+        } else {
+            // show + 立即 hide 模式：让 macOS / Win commit set_position。
+            let _ = w.show();
+            if let Err(e) = w.set_position(tauri::PhysicalPosition::new(x, y)) {
+                tracing::debug!(error = %e, "reset_floating_window: hidden 分支 set_position 失败");
+            }
+            let _ = w.hide();
         }
 
         {
