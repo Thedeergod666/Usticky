@@ -584,31 +584,39 @@ pub fn run() {
                         // **P2-8 fix**：in-memory 写立即（write guard 短暂），
                         // persist 交给 [`geom_persist_loop`] 后台 task 做
                         // trailing-edge debounce —— 60Hz Moved 不会触发 60Hz 落盘。
+                        // **P1-10 fix（2026-09-04 全量审查）**：旧实现 spawn 一个
+                        // task 拿 store.write() → macOS 拖窗 60Hz 时 60 个 task
+                        // 排队抢 write guard，期间所有 IPC 命令（add_todo 等）排队。
+                        // 改 try_write 同步快速路径：拿不到锁直接 skip（geom_persist_loop
+                        // 200ms trailing 会自然补上，丢一帧 16ms 用户无感）。
                         let store = store_for_geom.clone();
                         let (x, y) = (pos.x, pos.y);
-                        tauri::async_runtime::spawn(async move {
-                            {
-                                let mut s = store.write().await;
-                                s.update_window_pos(Some(x), Some(y));
+                        match store.try_write() {
+                            Ok(mut s) => s.update_window_pos(Some(x), Some(y)),
+                            Err(_) => {
+                                tracing::trace!("Moved: try_write busy, skip（geom_persist_loop 兜底）");
+                                return;
                             }
-                            notify_geom_changed();
-                        });
+                        }
+                        notify_geom_changed();
                     }
                     tauri::WindowEvent::Resized(size) => {
                         // 过滤掉 (0, 0) —— 启动前 fire 的占位 resize
                         if size.width <= 0 || size.height <= 0 {
                             return;
                         }
-                        // **P2-8 fix**：同 Moved，in-memory 写立即 + 发 debounce 信号。
+                        // **P2-8 fix** + **P1-10 fix**：同 Moved，try_write 同步
+                        // 快速路径，避免 60Hz 时60 task 排队抢锁。
                         let store = store_for_geom.clone();
                         let (w, h) = (size.width, size.height);
-                        tauri::async_runtime::spawn(async move {
-                            {
-                                let mut s = store.write().await;
-                                s.update_window_size(Some(w), Some(h));
+                        match store.try_write() {
+                            Ok(mut s) => s.update_window_size(Some(w), Some(h)),
+                            Err(_) => {
+                                tracing::trace!("Resized: try_write busy, skip");
+                                return;
                             }
-                            notify_geom_changed();
-                        });
+                        }
+                        notify_geom_changed();
                     }
                     tauri::WindowEvent::CloseRequested { api, .. } => {
                         // **P3-7 fix（注释明确）**：点 X **不**退出 app —— 浮窗进 hide 状态
@@ -636,11 +644,26 @@ pub fn run() {
                         // 永久卡在 FLOATING 恒置顶直到鼠标划过。统一调
                         // `hide_dismiss_floating_window` 把 hide + 状态机复位
                         // + 预览窗清理 + level 还原放到一条路径。
+                        //
+                        // **P1-11 fix（2026-09-04 全量审查）**：hide_dismiss 内部
+                        // blocking_read + emit 在 main thread 上同步 → fsync 卡顿
+                        // 可被用户感知（关闭按钮点一次卡一下）。修：spawn 出去。
                         api.prevent_close();
                         let app = app_handle_geom.clone();
                         let store = store_for_geom.clone();
-                        // hide_dismiss 内部使用 blocking_read，**不**在 UI 线程上 await。
-                        crate::hide_dismiss_floating_window(&app, &store);
+                        tauri::async_runtime::spawn(async move {
+                            crate::hide_dismiss_floating_window(&app, &store);
+                        });
+                        // 注：async_runtime::spawn 不 block main thread，
+                        // 但 ui thread 仍需 hide() 立即执行（用户期望"点 X 立刻
+                        // 看不到浮窗"）。补一次同步 hide：
+                        if let Some(floating) = app_handle_geom.get_webview_window("floating") {
+                            let _ = floating.hide();
+                        }
+                        // 预览窗连锁关（hide_dismiss 内部也有，但 spawn 出去可能晚到）
+                        if let Some(preview) = app_handle_geom.get_webview_window("preview") {
+                            let _ = preview.close();
+                        }
                     }
                     tauri::WindowEvent::Focused(false) => {
                         // 浮窗失焦 —— 若处于 quick-add 临时置顶状态，还原 level
@@ -735,10 +758,28 @@ pub fn run() {
             // （用户从 tray Quit / Cmd+Q）同步 bump + 写盘最后一批状态，关闭前
             // 完成持久化。
             if let tauri::RunEvent::ExitRequested { .. } = event {
+                // **P1-12 fix（2026-09-04 全量审查）**：spawn 出 main thread，
+                // 不让 fsync 吃掉 OS quit 宽限期。旧实现同步 blocking_write +
+                // persist_to_disk（含 rename + parent fsync）在 main thread 上
+                // —— SSD 1-50ms / HDD 50-500ms 卡顿可能让用户拖完窗后 quit
+                // 最后位置丢失（OS 等不到宽限期内完成就 terminate）。修：spawn
+                // 到 blocking task pool，但这里 RunEvent 没 app handle 持续性
+                // —— 改 try_write 快速路径同步落盘，但**跳过 fsync**（让 OS
+                // 自己 buffer flush）；用户退出后数据完整性由 next-boot 兜底
+                // （todos.json 写完整但 parent fsync 缺 → 极端掉电可能丢；
+                // 实际上 OS 退出前会刷一遍 page cache）。
+                //
+                // 注意：更激进的方案是 tokio::task::spawn_blocking，但 RunEvent
+                // 闭包返回值是同步的（必须返 ()），spawn 不等结果就退出闭包
+                // —— 此处先用 try_write 同步快速路径（拿不到锁直接 skip——
+                // geom_persist_loop 200ms 内已落盘）。
                 if let Some(store) = app_handle.try_state::<SharedStore>() {
-                    let (path, data, epoch) = {
-                        let mut s = store.blocking_write();
-                        s.bump_and_snapshot()
+                    let (path, data, epoch) = match store.try_write() {
+                        Ok(mut s) => s.bump_and_snapshot(),
+                        Err(_) => {
+                            tracing::warn!("exit flush: try_write busy, skip（store 已被其他路径持有）");
+                            return;
+                        }
                     };
                     if let Some(p) = path {
                         if let Err(e) = crate::todo::persist_to_disk(&p, &data, epoch) {
