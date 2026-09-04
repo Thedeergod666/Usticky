@@ -446,6 +446,15 @@ pub fn start_hover_emitter<R: Runtime>(app: AppHandle<R>) {
                         // 一次无意义 TopMost re-assert，残留 TopMost 上屏
                         // 视觉"无故闪在最上层"。完全重置确保显示后从干净
                         // 状态开始新一帧 hover 评估。
+                        //
+                        // **P1-13 fix（2026-09-04 全量审查）**：hide 前一帧
+                        // 若 last_emitted=true（hovering 中），直接 continue
+                        // 不 emit false → 前端 CSS body[data-hover] 卡住
+                        // 一帧（玻璃态残留），show 后才被下一 tick 自然覆写。
+                        // 修：hide 时若 last_emitted=true 主动 emit false。
+                        if last_emitted {
+                            let _ = app.emit("usticky://floating-hover", false);
+                        }
                         last_inside = false;
                         last_emitted = false;
                         last_emitted_pos = None;
