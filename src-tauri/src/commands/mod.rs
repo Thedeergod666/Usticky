@@ -302,8 +302,16 @@ pub async fn purge_attachment(store: State<'_, SharedStore>, file: String) -> Re
     // "删 A → 撤销 A → 再删 A" 第二次删除触发 clearUndoEntry purge fA，
     // 而 fA 已被第一次 restore 恢复回 store（live 引用）→ 撤销后再裂图。
     // 引用仍在则跳过删除，让孤儿扫描或下次 delete 收尾。
+    //
+    // **P0-7 fix（2026-09-04 全量审查）**：把"引用检查 + 拿 dir + remove_file"
+    // 全部塞进**同一个 write lock 临界区**。旧实现两次 read lock 之间存在
+    // 竞态窗口：第一次通过引用检查释放 lock 后，restore_todo 在第二次 lock
+    // 前插入新引用 → remove_file 仍按 stale 判定执行 → 刚被 restore 的 todo
+    // 图片永久丢失。修复：write() 而非 read() 锁（为了一致性 + 防并发
+    // restore 跨边沿）。
+    #[allow(unused_mut)] // mut is required for the write lock guard even if we only read
     {
-        let s = store.read().await;
+        let mut s = store.write().await;
         let still_referenced = s.todos().iter().any(|t| {
             t.attachment
                 .as_ref()
@@ -316,14 +324,14 @@ pub async fn purge_attachment(store: State<'_, SharedStore>, file: String) -> Re
             );
             return Ok(());
         }
-    }
-    let dir = store.read().await.attachments_dir();
-    if let Some(dir) = dir {
-        let path = dir.join(&file);
-        if let Err(e) = std::fs::remove_file(&path) {
-            // NotFound 不算错（已被启动孤儿扫描清掉 / 用户手动清过）
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("purge attachment {:?} failed: {}", path, e);
+        let dir = s.attachments_dir();
+        if let Some(dir) = dir {
+            let path = dir.join(&file);
+            if let Err(e) = std::fs::remove_file(&path) {
+                // NotFound 不算错（已被启动孤儿扫描清掉 / 用户手动清过）
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("purge attachment {:?} failed: {}", path, e);
+                }
             }
         }
     }
