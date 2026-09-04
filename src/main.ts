@@ -1500,8 +1500,24 @@ async function undoDelete(): Promise<void> {
     await invoke("restore_todo", { todo: entry.todo });
     showMiniFlash(t("app.undo.flash", { title: entry.todo.title }));
   } catch (e) {
+    // **P1-6 fix（2026-09-04 全量审查）**：失败时不能让附件变孤儿文件。
+    // 旧实现 undoEntry 已 null + invoke 失败 → 永远不调 purge_attachment，
+    // 用户长运行期间附件累积。修：恢复 undoEntry = entry（timer 已 null
+    // 不会再 fire），并排一个新 8s timer 到时调 purge_attachment 兜底清掉。
+    // 用户可在此期间重试 / 重启后孤儿扫描兜底。
     console.error("[usticky] restore_todo failed", e);
     showMiniFlash(t("app.error.save_failed"));
+    if (entry.todo.attachment) {
+      const file = entry.todo.attachment.file;
+      // 重置栈：失败后用户可再点 undo 按钮 / 超时 purge
+      // 注意：栈在 entry=null 时已清（hideMiniFlash），restore_todo 失败
+      // 不能再走"撤销"路径 —— 改为单条 8s 后强制 purge 兜底。
+      setTimeout(() => {
+        void invoke("purge_attachment", { file }).catch((err) =>
+          console.error("[usticky] purge_attachment fallback failed", err),
+        );
+      }, DELETE_UNDO_MS);
+    }
   }
 }
 
@@ -1584,6 +1600,25 @@ function cleanupSortables() {
 function enterEditMode(card: HTMLElement, todo: Todo) {
   // 已有 input 在编辑（防御性 —— 多次快速点击）
   if (card.querySelector("input.todo-edit-input")) return;
+
+  // **P1-4 fix（2026-09-04 全量审查）**：跨 section 编辑切换 → 前一张
+  // 卡片的 input 永久残留 + Sortable 永久 disabled。旧实现只查新 card 的
+  // input 是否存在（防御性）但不查"有没有别的卡片正编辑中"——若用户在
+  // pending A 编辑中直接点 done B，A 的 input 嵌在 A 节点上、isEditing=true、
+  // A section Sortable 已 disabled=true 但 B enterEditMode 只 disable B section。
+  // exitEditMode 时 restoreSortableForCard 只恢复 B → A 永久卡住直到用户
+  // 再进 A 编辑再退。修：进入新编辑前先扫所有 .todo-edit-input 找旧编辑态
+  // 调 commitAndExit 保存内容走 update_todo 路径，失败则按 input 当前值保留。
+  const allEditingInputs = app.querySelectorAll<HTMLInputElement>("input.todo-edit-input");
+  if (allEditingInputs.length > 0) {
+    for (const oldInput of Array.from(allEditingInputs)) {
+      const oldCard = oldInput.closest<HTMLElement>(".todo-card");
+      if (oldCard && oldCard !== card) {
+        // commit 当前 input 内容，next string 让 exitEditMode 走 save 路径
+        exitEditMode(oldCard, oldInput.value);
+      }
+    }
+  }
 
   const titleEl = card.querySelector<HTMLElement>(".todo-title");
   if (!titleEl) return;
@@ -2856,14 +2891,32 @@ function ensureInputBar() {
         input.value = v;
       }
     } else if (e.key === "Escape") {
-      // **P2-11 fix**：区分 Esc 来源。
-      //   - quick-add 模式：Esc 直接收浮窗（用户预期"刚唤起又能收起"）
-      //   - 其它场景：仅 blur input，保留窗口显示
+      // **P1-5 fix（2026-09-04 全量审查）**：quick-add 模式 Esc 先清输入
+      // 再决定是否 hide。旧实现不管 input 有无内容直接 hide → 用户
+      // 键入 'hello' 后按 Esc 想放弃输入 → hide_floating_window → DOM 销毁
+      // → 'hello' 永久丢失。
       if (isQuickAddActive) {
+        if (input.value.trim()) {
+          // input 有内容 → 仅清空，不 hide（给用户机会继续输入或点 +）
+          input.value = "";
+} else {
+        // input 为空 → 真 hide 浮窗
         isQuickAddActive = false;
+        // **P1-7 fix（2026-09-04 全量审查）**：hide 前清预览状态机。
+        // 旧实现 hide_floating_window 后端 200ms 延迟 emit preview-closed
+        // （lib.rs:400-405），期间浮窗已 hide、hover emitter 已停 tick，
+        // 但 previewTodoId/previewPinnedId/previewMouseInside 仍悬空。
+        // 200ms 内用户再次通过 tray 显示浮窗 + 立即 hover 别卡 → 状态机
+        // 短暂混乱（previewTodoId 仍是旧值，hover 别卡时不切预览）。
+        cancelPreviewDwell();
+        cancelPreviewClose();
+        previewTodoId = null;
+        previewPinnedId = null;
+        previewMouseInside = false;
         invoke("hide_floating_window").catch((e) =>
           console.error("[usticky] hide_floating_window failed", e),
         );
+      }
       } else {
         input.blur();
       }
