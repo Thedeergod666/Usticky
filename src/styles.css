@@ -1033,6 +1033,14 @@ body[data-low-power] #app {
   --c-bg-ok:    rgba(48, 209, 88, 0.16);
   --c-bg-alert: rgba(255, 69, 58, 0.16);
 }
+/* **P3-12 fix（2026-09-04 全量审查）**：低电量模式 done section 单独
+ * 弱化。低电量下 --text-bright 是高对比白，done 卡仍用 line-through 划线
+ * + 同色文字 = 视觉信息密度偏高与"省电折叠"哲学不符。done 卡单独把
+ * 文字降到 0.32 透明度。*/
+body[data-low-power] .todo-card.done .todo-title {
+  color: rgba(255, 255, 255, 0.32);
+  text-decoration: line-through;
+}
 body[data-low-power] *,
 body[data-low-power] *::before,
 body[data-low-power] *::after {

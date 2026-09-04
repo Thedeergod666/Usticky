@@ -526,11 +526,17 @@ function flashHint(hint: HTMLElement | null, msg: string) {
 
 /// 复制标题全文：navigator.clipboard 优先，execCommand 兜底（非聚焦
 /// webview / 权限受限时）。同 main.ts copyTodoText 双路径。
+///
+/// **P3-4 fix（2026-09-04 全量审查）**：双路径都失败时不能仍闪"已复制"
+/// 假成功反馈。修：catch e2 走 copy_failed flash，clipboard 第一次失败
+/// 但 execCommand 成功仍闪 copy.flash（execCommand 内部不抛 = 视为成功）。
 async function copyTitle(hint: HTMLElement | null) {
   const text = currentTodo?.title ?? "";
   if (!text) return;
+  let ok = false;
   try {
     await navigator.clipboard.writeText(text);
+    ok = true;
   } catch (e) {
     console.debug("[preview] navigator.clipboard 失败，走 execCommand 兜底", e);
     const ta = document.createElement("textarea");
@@ -540,12 +546,17 @@ async function copyTitle(hint: HTMLElement | null) {
     ta.select();
     try {
       document.execCommand("copy");
+      ok = true;
     } catch (e2) {
       console.error("[preview] execCommand copy 也失败", e2);
     }
     ta.remove();
   }
-  flashHint(hint, t("app.copy.flash"));
+  if (ok) {
+    flashHint(hint, t("app.copy.flash"));
+  } else {
+    flashHint(hint, t("app.error.copy_failed"));
+  }
 }
 
 /// 删除当前 todo：后端 emit todos-changed -> 当前 id 没了 -> closeSelf

@@ -1085,7 +1085,16 @@ function schedulePreviewClose(immediate: boolean = false) {
 /// 测一次，后续 hover 复用。卡片被 GC（WeakMap 自动）后缓存自然清理。
 /// 缩略图宽仅在 render() 重建 / resize 时变化 —— 这两条路径下卡片是
 /// 全新节点，WeakMap 也是新条目，无需手动 invalidate。
+///
+/// **P3-1 fix（2026-09-04 全量审查）**：用户手动 resize 浮窗后缓存不
+/// 失效，hover 时用旧窗口下的缩略图宽。修：代际计数器。onResized 事件
+/// 时 bump 代际，setCardHover 读到 stale 代际则 cache miss 重新测。
 const thumbWidthCache = new WeakMap<HTMLElement, number>();
+const thumbWidthGeneration = new WeakMap<HTMLElement, number>();
+let currentThumbGeneration = 0;
+function bumpThumbGeneration(): void {
+    currentThumbGeneration += 1;
+}
 function setCardHover(card: HTMLElement, on: boolean) {
   // 幂等：已在目标态就跳过（over_preview 每 50ms tick 重复调，避免反复
   // 读 offsetWidth 触发布局）。
@@ -1093,11 +1102,18 @@ function setCardHover(card: HTMLElement, on: boolean) {
   const thumb = card.querySelector<HTMLElement>(".todo-thumb");
   if (on) {
     if (thumb) {
-      // B2：缓存 thumb 宽，避免反复 hover 边沿触发 layout flush
-      let w = thumbWidthCache.get(card);
+      // B2：缓存 thumb 宽，避免反复 hover 边沿触发 layout flush。
+      // **P3-1 fix**：代际校验。resize 时 bump currentThumbGeneration，
+      // stale 代际的 cache 视为 miss 重新测。
+      let w: number | undefined;
+      const cachedGen = thumbWidthGeneration.get(card);
+      if (cachedGen === currentThumbGeneration) {
+        w = thumbWidthCache.get(card);
+      }
       if (w === undefined) {
-        w = thumb.offsetWidth;  // 首次 hover 强制一次 layout 读
+        w = thumb.offsetWidth;  // 首次 hover 或 resize 后强制一次 layout 读
         thumbWidthCache.set(card, w);
+        thumbWidthGeneration.set(card, currentThumbGeneration);
       }
       if (w > 0) {
       // 仅在有非空标题时冻结图片宽度：标题以省略号收缩给 actions 让位，
@@ -1920,6 +1936,9 @@ async function init() {
     .onResized(() => {
       syncNarrowMode();
       invalidateScrollable();
+      // **P3-1 fix**：resize 时 bump 代际，让 thumbWidthCache miss 重新测
+      // thumb 宽（旧窗口下的缓存值与新窗口不符）。
+      bumpThumbGeneration();
     })
     .then((fn) => (unlistenResized = fn))
     .catch((e) => console.error("[usticky] onResized failed", e));
@@ -2782,6 +2801,12 @@ async function init() {
     unlistenFocusChanged?.();
     unlistenResized?.();
     cleanupSortables();
+    // **P3-2 fix（2026-09-04 全量审查）**：清 deleteConfirmTimers Map。
+    // 旧实现关窗时 Map 残留，理论微小泄漏。
+    for (const t of deleteConfirmTimers.values()) clearTimeout(t);
+    deleteConfirmTimers.clear();
+    // **P3-3 fix**：hide_floating_window 之前清 undoEntry timer（若仍挂着）。
+    clearUndoEntry(true);
     // 摘掉 hover listener（setHoverAttr 路径，命名引用）
     document.body.removeEventListener("mouseenter", onBodyMouseEnter);
     document.body.removeEventListener("mouseleave", onBodyMouseLeave);
