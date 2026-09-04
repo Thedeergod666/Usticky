@@ -119,12 +119,24 @@ fn parse_status(s: &str) -> Result<TodoStatus, String> {
 /// 114514 的来历：彩蛋。把 280 → 114514,纪念经典的「1919810」同款
 /// 数字梗。原本上限来自早期推特 280 字符,视口窄 + 标题超长会强制换行
 /// 破坏 hover-expand 手势;改大后基本可视为「不限制」,纯当彩蛋来玩。
+///
+/// **P1-15 fix（2026-09-04 全量审查）**：t! 占位符 {max} 必须传 vars，
+/// 否则前端拿到字面 "Title too long (max {max} characters)"。
+/// **P1-16 fix**：NUL 字节必拒（多行 / 控制字符暂保留 —— 富文本复制
+/// 场景常见 tab / 换行通过 trim 后保留，换行存盘浏览器渲染为 U+FFFD，
+/// 用户可见但不算数据损坏）。
 fn validate_title(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim().to_string();
     if trimmed.is_empty() {
         return Err(rust_i18n::t!("commands.error.empty_title").into());
     }
+    if trimmed.contains('\0') {
+        return Err(rust_i18n::t!("commands.error.empty_title").into());
+    }
     if trimmed.chars().count() > 114514 {
+        // **P1-15 fix**：文案已硬编码 "max 114514 characters"（rust_i18n 3
+        // 不支持 vars 占位符，与上游 tera/fluent 风格不同 —— 见
+        // locales/{en,zh-CN}.json too_long 字段）。
         return Err(rust_i18n::t!("commands.error.too_long").into());
     }
     Ok(trimmed)
@@ -293,6 +305,24 @@ pub async fn restore_todo(
         let _ = app.emit("usticky://persist-failed", e.clone());
         // 回滚 in-memory：删掉刚 restore 进去的 todo
         store.write().await.delete(&restored_id);
+        // **P1-17 fix（2026-09-04 全量审查）**：rollback 后再调一次
+        // persist_to_disk 把内存态同步到磁盘。旧实现只删内存不落盘，
+        // 若磁盘上 persist 失败时已是新版本（小概率：tmp 写盘成功 + rename
+        // 失败重试后 OK），下次启动从磁盘加载仍看到"已恢复"——用户以为
+        // 撤销了，重启又看到。修：rollback 后再落盘一次强制同步。
+        {
+            let (path, data, epoch) = {
+                let mut s = store.write().await;
+                s.bump_and_snapshot()
+            };
+            if let Some(p) = path {
+                if let Err(e2) = crate::todo::persist_to_disk(&p, &data, epoch) {
+                    tracing::error!("restore_todo rollback persist also failed: {}", e2);
+                    // 二次失败只能听天由命 —— 用户下次启动可能看到 stale
+                    // 状态；记 trace 留给后续诊断。
+                }
+            }
+        }
         // 不 emit todos-changed：内存已回到"未恢复"，前端拿 Err 自己处理 flash
         return Err(format!("restore failed: persist error: {e}"));
     }
@@ -798,6 +828,15 @@ pub async fn set_quick_add_shortcut(
     store: State<'_, SharedStore>,
     accelerator: String,
 ) -> Result<(), String> {
+    // **P1-18 fix（2026-09-04 全量审查）**：accelerator 与 previous 相同
+    // 短路早返。旧实现 user 开设置面板 + 不改键 + 点 OK 仍走完整 parse +
+    // unregister_all + on_shortcut 路径；on_shortcut 偶发失败 + best-effort
+    // 装回 previous 偶发失败 = 快捷键永久丢失（退化 P1-4 fix 保护）。
+    let previous_now: String = store.read().await.quick_add_shortcut();
+    if previous_now == accelerator {
+        return Ok(());
+    }
+
     // 1. parse + **P1-5 fix**：modifier 必需。裸键（"F12"、"Space"）会被 OS
     //    直接吞掉或抢走其它 app 的焦点输入 —— 强制要求 CONTROL/ALT/META/SUPER
     //    至少一个。后端再校验一遍，防止前端 UI 没拦截（中间人篡改 IPC、未来
@@ -812,7 +851,7 @@ pub async fn set_quick_add_shortcut(
         return Err(rust_i18n::t!("commands.error.shortcut_no_modifier").to_string());
     }
 
-    // 2. **P1-4 fix**：snapshot 旧 accelerator —— persist 失败时回滚 in-memory
+// 2. **P1-4 fix**：snapshot 旧 accelerator —— persist 失败时回滚 in-memory
     //    + 不重新注册 OS 级快捷键，让用户保留旧可用快捷键。
     let previous = store.read().await.quick_add_shortcut();
     {
@@ -1470,21 +1509,36 @@ pub async fn close_preview_window(app: AppHandle, force: Option<bool>) -> Result
         // preview-closed 才释放 -> 卡死强调态 + 预览窗残留孤儿（用户实测"鼠标
         // 离开后预览迟迟不消失 + todo 虽置底仍强调态"）。修：close 失败也 emit
         // preview-closed 复位浮窗，并 hide 兜底藏掉残留窗（reuse 路径会重新 show）。
-        if let Err(e) = w.close() {
-            tracing::debug!(error = %e, "preview w.close failed, hide 兜底 + 仍 emit preview-closed");
+        let close_ok = w.close().is_ok();
+        if !close_ok {
+            tracing::debug!("preview w.close 失败，hide 兜底 + 仍 emit preview-closed");
             let _ = w.hide();
         }
         // **P3-4 fix（2026-08-13 全量审查）**：Rust 直关预览前 emit
         // preview-flush + 200ms 延迟，让 preview.ts 把 <700ms 防抖窗口内
         // 的 update_todo invoke 走完（beforeunload 不一定派发的兜底）。
+        // **P1-19 fix（2026-09-04 全量审查）**：成功路径**不**走 spawn 兜底
+        // —— webview beforeunload 已可靠 emit preview-closed 一次，spawn
+        // 再 emit 一次会让浮窗 listener 收两次，状态机二次 reset。spawn 仅
+        // 失败路径需要（webview 没收到 close 信号，状态机需 Rust 兜底）。
         let _ = app.emit("usticky://preview-flush", ());
-        let app2 = app.clone();
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let _ = app2.emit("usticky://preview-closed", ());
-            let _ = app2.emit("usticky://backdrop-refresh", ());
+        if !close_ok {
+            let app2 = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ = app2.emit("usticky://preview-closed", ());
+                let _ = app2.emit("usticky://backdrop-refresh", ());
+                clear_pending_preview_todo();
+            });
+        } else {
+            // 成功路径立即 emit（不等 beforeunload），确保浮窗 grace 状态机
+            // 立即复位（beforeunload 异步可能晚到，期间用户操作 hover 卡导致
+            // previewTodoId 短暂卡住）。preview.ts beforeunload 会再 emit
+            // 一次，但浮窗 listener 幂等无副作用。
+            let _ = app.emit("usticky://preview-closed", ());
+            let _ = app.emit("usticky://backdrop-refresh", ());
             clear_pending_preview_todo();
-        });
+        }
         return Ok(());
     }
     Ok(())

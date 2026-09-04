@@ -2,7 +2,7 @@
   "commands": {
     "error": {
       "empty_title": "Title cannot be empty",
-      "too_long": "Title too long (max {max} characters)",
+      "too_long": "Title too long (max 114514 characters)",
       "not_found": "Todo not found",
       "no_primary_monitor": "No primary monitor detected",
       "no_attachments_dir": "Attachments directory unavailable",
