@@ -301,7 +301,21 @@ function hideMiniFlash(): void {
     miniFlashTimer = null;
   }
   const el = app.querySelector<HTMLElement>(".mini-flash");
-  if (el) el.classList.remove("visible");
+  if (el) {
+    el.classList.remove("visible");
+    // **P1-1 fix（2026-09-04 全量审查）**：has-action 残留清除。
+    // 旧实现只 remove("visible") 但保留 has-action + 按钮子节点，
+    // 后果链：① 删除一次 → has-action 残留 → 后续 showMiniFlash 因
+    //   `contains("has-action")` 早退 → 所有 mini-flash 反馈永久静默
+    // ② styles.css .mini-flash.has-action { pointer-events: auto } 覆盖
+    //   基础类的 none，残留的 flash 条 opacity 0（不可见）但 fixed 定位
+    //   z-index 9999 可点击 → 底部中央出现幽灵点击拦截层（吃 todo 卡/输入区点击）
+    el.classList.remove("has-action");
+    // 清掉 action flash 注入的 span/button 子节点，否则下次 showMiniFlash
+    // append 一段新文案会和旧按钮并排显示。
+    while (el.firstChild) el.removeChild(el.firstChild);
+    el.textContent = "";
+  }
 }
 
 function showMiniFlash(msg: string): void {
