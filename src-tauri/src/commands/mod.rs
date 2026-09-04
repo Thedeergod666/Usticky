@@ -148,7 +148,7 @@ pub async fn update_todo(
     id: String,
     title: Option<String>,
     status: Option<String>,
-) -> Result<Todo, String> {
+) -> Result<Option<Todo>, String> {
     // **P2-7 fix**：校验 title。前端可能传 None（只改 status）或 Some(string)。
     // None 透传不校验；Some 必须走 validate_title，否则透传空串/超长串到 store。
     let title = match title {
@@ -177,12 +177,14 @@ pub async fn update_todo(
     match maybe_updated {
         (Some(updated), _) => {
             persist_and_emit(&app, &store).await;
-            Ok(updated)
+            Ok(Some(updated))
         }
-        (None, Some(cur)) => {
-            // No-op：返当前状态，**不**触发 persist / emit。
-            Ok(cur)
-        }
+        // **P0-6 fix（2026-09-04 全量审查）**：no-op 返 None 而非 Some(cur)。
+        // 旧实现返 Some(cur) 让前端 toggleDone 快速双击时拿到 cur 渲染，
+        // 但 store updated_at 已被第一次真改 bump，cur 与 store 一致；
+        // 真正歧义在于"前端以为改动生效了"——其实只是 no-op。
+        // 改 Ok(None) 让前端区分"改动生效"与"无变化"。
+        (None, Some(_cur)) => Ok(None),
         (None, None) => Err(rust_i18n::t!("commands.error.not_found").to_string()),
     }
 }
