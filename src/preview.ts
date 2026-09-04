@@ -195,6 +195,12 @@ function ensureSkeleton() {
   panel.appendChild(footer);
   appEl.appendChild(panel);
   textarea.addEventListener("input", () => {
+    // **P1-2 fix（2026-09-04 全量审查）**：IME 组合期间跳过防抖保存。
+    // WebKit 在候选未上屏时就派发 input，textarea.value 是临时串（如
+    // 'nihao'）。zh-CN 用户在候选框停留 >700ms 选词 → saveTitle('nihao')
+    // → update_todo 把拼音临时串写进 todos.json；与 Esc handler 叠加
+    // 构成确定性标题永久损坏路径（P1-3）。与 resize 路径对齐守 imeComposing。
+    if (imeComposing) return;
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       saveTimer = null;
@@ -209,6 +215,14 @@ function ensureSkeleton() {
   textarea.addEventListener("compositionend", () => {
     imeComposing = false;
     scheduleFit();
+    // **P1-2 fix**：compositionend 时统一补一次保存（候选上屏后
+    // textarea.value 已是真实字符，但 input 事件已被 imeComposing 守卫
+    // 短路 → 防抖 timer 没排 → 永远不存）。补排一次 ensure 落盘。
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      void saveTitle(textarea.value, hintEl);
+    }, SAVE_DEBOUNCE_MS);
   });
   // WKWebView 已知行为：从外部拖文本进 textarea **不**派发 input，
   // 只在 blur 时补 change。两个都挂上兜底。drop 时 value 还没更新，
@@ -742,6 +756,12 @@ async function init() {
   // 不需要 Esc = 取消编辑的二级语义。固定窗同样走 Esc 关窗。
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
+      // **P1-3 fix（2026-09-04 全量审查）**：IME 组合中不拦截。
+      // WebKit 在组合期间派发 keydown（e.isComposing: true），用户按 Esc
+      // 想取消拼音 → 旧实现 preventDefault() 阻断 IME 取消默认行为，
+      // 接着 closeSelf() → flushPendingSave() 把组合临时串落盘 → 标题
+      // 被写成拼音垃圾。与 P1-2 守卫叠加构成确定性数据损坏路径。
+      if (e.isComposing || e.keyCode === 229) return;
       e.preventDefault();
       closeSelf();
     }
