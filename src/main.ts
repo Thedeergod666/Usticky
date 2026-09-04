@@ -1307,22 +1307,40 @@ async function getTodos(): Promise<TodoSnapshot | null> {
   }
 }
 
+// **P1-8 fix（2026-09-04 全量审查）**：vanishing 用 transition 两阶段。
+// 先把当前 offsetHeight 写入 inline CSS var 让 transition 从该高度平滑过渡，
+// 140ms 后挂 .vanishing-2 触发"线 → 0"第二阶段。比旧 keyframe 0% 硬编码
+// 200px 与多行 todo（banner 100px+）相符，且不被全局 animation:none 禁用。
+const VANISH_PHASE1_MS = 140;
+function startVanishing(row: HTMLElement): void {
+  const h = row.offsetHeight;
+  row.style.setProperty("--card-vanish-h", `${h}px`);
+  row.classList.add("vanishing");
+  setTimeout(() => {
+    if (row.isConnected) row.classList.add("vanishing-2");
+  }, VANISH_PHASE1_MS);
+}
+function stopVanishing(row: HTMLElement): void {
+  row.classList.remove("vanishing", "vanishing-2");
+  row.style.removeProperty("--card-vanish-h");
+}
+
 async function toggleDone(todo: Todo) {
   // 乐观更新 DOM：先加 .vanishing 动画（变成一条线 → 继续缩窄到 0），
-  // 动画结束后再调 IPC。500ms 匹配 CSS @keyframes vanish-to-line 总时长。
+  // 动画结束后再调 IPC。两阶段各 140ms + IPC 缓冲 = 280ms 总耗时。
   const row = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(todo.id)}"]`);
   if (todo.status === "pending") {
     // 标完成：pending 行 vanishing → done section 出现新行
     if (row) {
-      row.classList.add("vanishing");
+      startVanishing(row);
       setTimeout(async () => {
         try {
           await invoke("update_todo", { id: todo.id, status: "done" });
         } catch (e) {
           console.error("[usticky] update_todo failed", e);
-          row.classList.remove("vanishing");
+          if (row.isConnected) stopVanishing(row);
         }
-      }, 500);
+      }, VANISH_PHASE1_MS + 60);
     } else {
       await invoke("update_todo", { id: todo.id, status: "done" });
     }
@@ -1330,16 +1348,16 @@ async function toggleDone(todo: Todo) {
     // 撤销完成：done 行 vanishing（变成一条线 → 继续缩窄）→ pending section 出现新行
     // 即"done 移到 pending 行，原有 done 行变成一条线并继续缩窄高度"
     if (row) {
-      row.classList.add("vanishing");
+      startVanishing(row);
       setTimeout(async () => {
         try {
           await invoke("update_todo", { id: todo.id, status: "pending" });
           showMiniFlash(t("app.undo.flash", { title: todo.title }));
         } catch (e) {
           console.error("[usticky] undo failed", e);
-          row.classList.remove("vanishing");
+          if (row.isConnected) stopVanishing(row);
         }
-      }, 500);
+      }, VANISH_PHASE1_MS + 60);
     } else {
       try {
         await invoke("update_todo", { id: todo.id, status: "pending" });
@@ -1524,7 +1542,7 @@ async function undoDelete(): Promise<void> {
 async function deleteTodo(todo: Todo) {
   const row = app.querySelector<HTMLElement>(`.todo-card[data-todo-id="${cssEscape(todo.id)}"]`);
   if (row) {
-    row.classList.add("vanishing");
+    startVanishing(row);
     setTimeout(async () => {
       try {
         await invoke("delete_todo", { id: todo.id });
@@ -1532,9 +1550,9 @@ async function deleteTodo(todo: Todo) {
         // 预览窗删除（不走本函数）也有撤销入口。
       } catch (e) {
         console.error("[usticky] delete_todo failed", e);
-        row.classList.remove("vanishing");
+        if (row.isConnected) stopVanishing(row);
       }
-    }, 500);
+    }, VANISH_PHASE1_MS + 60);
   } else {
     await invoke("delete_todo", { id: todo.id });
   }

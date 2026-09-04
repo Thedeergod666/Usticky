@@ -440,44 +440,52 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
 
 /* idle 状态下 done 卡**额外**淡化（line 230 注释）—— 由 .todo-card.done
  * + body:not([data-hover]) 的 CSS variable 重写实现（见下方 ~234 行）。 */
-/* vanishing 两阶段动画：先变成一条线，再继续缩窄到 0
- * 0%   → 50%  高度从原值缩到 2px，padding 清零，文字被 overflow:hidden
- *             裁掉，只剩 background + border 作为一条横线（opacity 半透）
- * 50%  → 100% 高度从 2px 继续缩到 0，border 消失，opacity 降到 0
+/* vanishing：两阶段动画，先变成一条线，再继续缩窄到 0。
+ *
+ * **P1-8 fix（2026-09-04 全量审查）**：低电量模式全局规则
+ * `body[data-low-power] * { animation: none !important }` 把 vanish-to-line
+ * 关键帧整段禁用 → 完成/删除卡片瞬间塌陷无视觉过渡，用户体感突变。
+ *
+ * 改用 CSS transition 而非 keyframe animation：
+ * - inline `--card-vanish-h` 由 JS 写入当前 offsetHeight，让 transition 从
+ *   真实高度平滑过渡（避免旧 keyframe 0% 硬编码 200px 与多行 todo 不符）
+ * - transition 不被 animation:none 全局禁用
+ * - 280ms 单次过渡（比 500ms 两段动画略快，符合"消失"直觉）
+ * - 旧 keyframe 保留但 deprecated 注释，CSS 备用
  *
  * 用于 "标记完成" / "撤销完成" / "删除" 三种场景 —— 行从原位置消失时
- * 都走这个动画。500ms 总时长（两阶段各 250ms）。 */
-@keyframes vanish-to-line {
-  0% {
-    opacity: 1;
-    max-height: 200px;
-    padding: 9px 13px 9px;
-    margin: 0;
-    border-width: 1px;
-  }
-  50% {
-    /* 第一阶段：变成一条线 —— 高度 2px，padding 清零，
-     * 文字被 overflow:hidden 裁掉，边框 + 背景作为一条横线。 */
-    opacity: 0.55;
-    max-height: 2px;
-    padding: 0 13px;
-    margin: 0;
-    border-width: 1px;
-  }
-  100% {
-    /* 第二阶段：继续缩窄 —— 高度 0 + border 消失 + 完全透明 */
-    opacity: 0;
-    max-height: 0;
-    padding: 0;
-    margin: 0;
-    border-width: 0;
-  }
-}
+ * 都走这个动画。 */
 .todo-card.vanishing {
-  animation: vanish-to-line 0.5s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  /* inline `--card-vanish-h` 由 JS 在挂 .vanishing 前写入；
+   * fallback 200px 保持旧 keyframe 视觉下限。 */
+  max-height: var(--card-vanish-h, 200px);
+  opacity: 1;
+  padding: 9px 13px 9px;
+  margin: 0;
+  border-width: 1px;
   overflow: hidden;
-  /* 动画期间禁止点击 —— 否则重复点 ✓/× 触发多次 IPC */
   pointer-events: none;
+  transition:
+    max-height 140ms cubic-bezier(0.22, 1, 0.36, 1),
+    padding 140ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 140ms cubic-bezier(0.22, 1, 0.36, 1),
+    border-width 140ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+/* 第二阶段：再触发一次 .vanishing-2 把 max-height → 0、opacity → 0。
+ * JS 在 140ms 后挂这个 class 形成"两阶段"语义。*/
+.todo-card.vanishing.vanishing-2 {
+  max-height: 0;
+  opacity: 0;
+  padding: 0;
+  border-width: 0;
+}
+
+/* @deprecated：保留作为参考，新实现走 .vanishing + .vanishing-2 transition。
+ * 旧 keyframe 被低电量模式全局 animation:none 禁用，详见 P1-8。 */
+@keyframes vanish-to-line {
+  0% { opacity: 1; max-height: 200px; padding: 9px 13px 9px; }
+  50% { opacity: 0.55; max-height: 2px; padding: 0 13px; }
+  100% { opacity: 0; max-height: 0; padding: 0; }
 }
 
 /* 完成 checkbox */
