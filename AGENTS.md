@@ -34,7 +34,7 @@
 - `@types/node` ^20.0.0
 - `typescript` ^5.6.0
 - `vite` ^5.4.0
-- `rustc` ≥ 1.77（edition = "2021"）
+- `rustc` ≥ 1.84（edition = "2021"；u64::is_multiple_of 在 1.84.0 stable，2025-01-09）
 
 ## 复用的 Musage 经验（"代码级"复用）
 

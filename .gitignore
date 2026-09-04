@@ -17,3 +17,6 @@ src-tauri/gen/
 # Env
 .env
 .env.local
+
+# zcode session plans
+.zcode/
