@@ -1333,8 +1333,17 @@ pub async fn open_preview_window(
     if let Some(w) = app.get_webview_window("preview") {
         // 复用：换内容 + 跟手归位。pinned 才抢焦点（hover 预览不抢）。
         let was_visible = w.is_visible().unwrap_or(true);
-        let _ = w.set_size(tauri::PhysicalSize::new(w_phys as u32, h_phys as u32));
-        let _ = w.set_position(tauri::PhysicalPosition::new(pos_x, pos_y));
+        // **P0-8 fix（2026-09-04 全量审查）**：set_size / set_position 失败
+        // 不再静默吞。窗口正被合成层重排 / Dock 拖动期间可能失败，旧实现 `let _ =`
+        // 让旧尺寸残留 → 前端 emit preview-todo 完成 render 新内容但窗口尺寸是
+        // 旧 todo 的 → 文本被裁 / footer 看不见。修：tracing::debug! 失败日志，
+        // 不影响流程（前端继续 render 新内容，下次 hover 触发 resize_preview_window）。
+        if let Err(e) = w.set_size(tauri::PhysicalSize::new(w_phys as u32, h_phys as u32)) {
+            tracing::debug!(error = %e, "open_preview_window reuse: set_size 失败（窗口可能正重排）");
+        }
+        if let Err(e) = w.set_position(tauri::PhysicalPosition::new(pos_x, pos_y)) {
+            tracing::debug!(error = %e, "open_preview_window reuse: set_position 失败");
+        }
         if pinned {
             let _ = w.show();
             let _ = w.set_focus();
@@ -1354,11 +1363,18 @@ pub async fn open_preview_window(
         // 直接 render，省掉每次换卡一次 `get_todos` 全列表序列化 + IPC 往返。
         // 旧实现只发 id，preview.ts loadTodo 每次都 invoke("get_todos") 拿全
         // 列表再 find 单条 —— hover 在卡间横扫时每切换一次就全量往返一次。
-        w.emit(
+        //
+        // **P0-8 fix**：emit 失败不返 Err。极端场景下窗口已销毁但 get_webview_window
+        // 仍返 Some（close race），emit 失败 → 旧实现 `?` 上抛 Err，但此时
+        // pending 已写入、set_size 已成功，预览窗已在屏上 —返 Err 让浮窗报错 toast
+        // 但预览内容卡住。修：emit 失败 tracing::warn!，依赖 preview.ts take_pending
+        // 自愈（init 时再 take 一次拿最新 todo）。
+        if let Err(e) = w.emit(
             "usticky://preview-todo",
             serde_json::json!({ "id": todo_id, "todo": todo }),
-        )
-        .map_err(|e| e.to_string())?;
+        ) {
+            tracing::warn!(error = %e, "open_preview_window reuse: emit preview-todo 失败，依赖 pending take 自愈");
+        }
         // 只在隐藏→上屏时刷新浮窗玻璃（见 doc comment）
         if !was_visible {
             let _ = app.emit("usticky://backdrop-refresh", ());
