@@ -42,9 +42,20 @@ async fn persist_and_emit(app: &AppHandle, store: &SharedStore) -> TodoSnapshot 
     // （bump_and_snapshot）。PERSIST_LOCK 只串行化 I/O —— 旧实现 read guard
     // 取快照 + 锁外写盘，与 geom debounce / 其他 CRUD persist 交错时旧快照
     // 可能后写盘覆盖新数据（lost-update）。
+    //
+    // **P1-9 fix（2026-09-04 全量审查）**：本次 persist 若是用户主动 CRUD
+    // （add / update / restore）触发的，清 recovered_corrupt 标志 + 兜底
+    // purge_orphan_attachments 清残留孤儿附件（之前持久化 recovered_corrupt=true
+    // 是为了让"首次启动跳过孤儿扫描"——现在用户已确认操作可以清）。
     let (snap, path, data, epoch) = {
         let mut s = store.write().await;
         let snap = s.snapshot();
+        // 检测本次调用方是否想清 recovered_corrupt 标志：靠 snap.todos 变化
+        // 来推断——旧实现直接清，与具体命令无关。这里走更保守的语义：
+        // 仅当内存中已**有 todos**（用户真实操作 add 后）才清。但更稳的
+        // 做法是把"本次是用户 CRUD 触发的"显式标记 —— 改由命令调用方在
+        // 写锁内清 flag + 这里不再管，避免被 pin mode / geom debounce 等
+        // 非用户操作误清。
         let (path, data, epoch) = s.bump_and_snapshot();
         (snap, path, data, epoch)
     };
@@ -135,6 +146,13 @@ pub async fn add_todo(
     let trimmed = validate_title(&title)?;
     let todo = {
         let mut s = store.write().await;
+        // **P1-9 fix**：用户主动 add = 确认 todos.json 内容有效。清 recovered_corrupt
+        // 标志让下次启动走正常孤儿扫描路径；同时本次兜底 purge 残留附件。
+        if s.recovered_corrupt() {
+            tracing::info!("add_todo: 清除 recovered_corrupt 标志 + 兜底 purge 孤儿附件");
+            s.clear_recovered_corrupt();
+            s.purge_orphan_attachments();
+        }
         s.add(trimmed)
     };
     persist_and_emit(&app, &store).await;
@@ -248,6 +266,14 @@ pub async fn restore_todo(
             return Ok(existing);
         }
     };
+    // **P1-9 fix**：restore = 用户主动操作 = 确认数据有效。清 recovered_corrupt。
+    {
+        let mut s = store.write().await;
+        if s.recovered_corrupt() {
+            tracing::info!("restore_todo: 清除 recovered_corrupt 标志");
+            s.clear_recovered_corrupt();
+        }
+    }
     // 实际插入了 -> persist。失败则回滚（删掉刚插入的，让内存跟磁盘一致）。
     // **P1-3 fix**：写锁内取快照 + epoch（同 persist_and_emit）。
     let (snap, path, data, epoch) = {

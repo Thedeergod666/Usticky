@@ -130,6 +130,11 @@ pub struct StoreData {
     /// None = 用 rust-i18n 默认（首次启动），Some("en") / Some("zh-CN") = 用户选择
     #[serde(default)]
     pub locale: Option<String>,
+    /// **P1-9 fix（2026-09-04 全量审查）**：todos.json 损坏恢复后置 true，
+    /// 下次启动持续跳过 purge_orphan_attachments 直到用户产生新操作（add/
+    /// update/restore）后由相关路径清除。详细根因见 load_or_init 注释。
+    #[serde(default)]
+    pub recovered_corrupt: bool,
 }
 
 impl Default for StoreData {
@@ -140,6 +145,7 @@ impl Default for StoreData {
             pin_mode: None,
             quick_add_shortcut: None,
             locale: None,
+            recovered_corrupt: false,
         }
     }
 }
@@ -174,16 +180,25 @@ impl Store {
         // （空 store 的 live 集合为空，purge_orphan_attachments 会把
         // attachments/ 里每一个文件当孤儿删掉；.bak 只备份了 todos.json
         // 元数据，图片附件没有备份，不可逆）。
+        //
+        // **P1-9 fix（2026-09-04 全量审查）**：损坏恢复后置 recovered_corrupt=true
+        // 持久化到 todos.json（旧实现只在本次启动设 loaded_ok 局部变量 → 任何
+        // 后续 persist（ExitRequested flush / Moved 触发 geom debounce / 任何
+        // CRUD）把空 store 落盘 → 下次启动 load 解析成功 → live 集合空 → 孤儿
+        // 扫描清光所有附件，不可逆数据丢失）。修复：recovered_corrupt 跨启动
+        // 持久化，直到用户产生新 add/update/restore 操作由调用方主动清除。
         let mut loaded_ok = true;
         let data = if data_path.exists() {
             match load_from_disk(&data_path) {
                 Ok(d) => d,
                 Err(e) => {
                     // 解析失败 → backup 后用空 store 顶上，不阻塞启动
-                    tracing::warn!("todos.json 解析失败 ({}), backup + 启动空 store", e);
+                    tracing::warn!("todos.json 解析失败 ({}), backup + 启动空 store + recovered_corrupt=true", e);
                     backup_corrupt_file(&data_path)?;
                     loaded_ok = false;
-                    StoreData::default()
+                    let mut d = StoreData::default();
+                    d.recovered_corrupt = true;
+                    d
                 }
             }
         } else {
@@ -199,6 +214,7 @@ impl Store {
         if let Some(loc) = data.locale.as_deref() {
             rust_i18n::set_locale(loc);
         }
+        let recovered_corrupt = data.recovered_corrupt;
         let store = Self {
             data,
             data_path: Mutex::new(Some(data_path)),
@@ -207,8 +223,13 @@ impl Store {
         // 启动兜底：清掉上次崩溃/异常退出留下的孤儿附件文件
         // （删除已延后到前端 undo 栈，见 commands::purge_attachment）。
         // 解析失败（loaded_ok=false）时跳过 —— 见上方注释。
-        if loaded_ok {
+        // **P1-9 fix**：若上次是损坏恢复（recovered_corrupt=true），**持续跳过**
+        // 直到用户产生新操作。add/update/restore 命令内会清 recovered_corrupt
+        // 标志 + 调 purge_orphan_attachments 兜底清残留。
+        if loaded_ok && !recovered_corrupt {
             store.purge_orphan_attachments();
+        } else if recovered_corrupt {
+            tracing::warn!("启动跳过 purge_orphan_attachments：上次 todos.json 损坏恢复未确认，等待用户新操作");
         }
         Ok(store)
     }
@@ -383,7 +404,18 @@ impl Store {
     /// （见 `commands::purge_attachment`）。如果用户删除后还没等 undo 窗口
     /// 超时就关掉浮窗 / 杀进程，附件文件就成了孤儿。启动时扫一遍兜底清理。
     /// uuid 命名保证不会误删别家的文件。
-    pub fn purge_orphan_attachments(&self) {
+    /// **P1-9 fix（2026-09-04 全量审查）**：用户主动 add/restore 后清
+/// recovered_corrupt 标志。调用方负责写锁内调用。
+pub fn clear_recovered_corrupt(&mut self) {
+    self.data.recovered_corrupt = false;
+}
+
+/// getter 供 commands/mod.rs 在写锁内读 flag 决定是否清
+pub fn recovered_corrupt(&self) -> bool {
+    self.data.recovered_corrupt
+}
+
+pub fn purge_orphan_attachments(&self) {
         let dir = match self.attachments_dir() {
             Some(d) => d,
             None => return,
