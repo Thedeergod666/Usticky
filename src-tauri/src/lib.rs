@@ -328,6 +328,10 @@ pub fn quick_show_floating_window(app: &tauri::AppHandle, _store: &SharedStore) 
     // 跨进程第一次 focus 后 `FIRST_FOCUS_DONE` 翻 true，本会话内不再 defer。
     // 如果将来想做更精细的"等 on_page_load 完再 focus"，参考 [lib.rs setup 段]
     // 的 `on_page_load` hook 注释。
+    //
+    // **P3-18 fix（2026-09-04 全量审查）**：`swap` 返回**旧值**（false=从未
+    // focus 过 → defer；true=已 focus 过 → sync）。这是 AtomicBool 经典踩坑点，
+    // 注释显式写明防后人改飞。
     if FIRST_FOCUS_DONE.swap(true, Ordering::SeqCst) {
         let _ = w.set_focus();
     } else {

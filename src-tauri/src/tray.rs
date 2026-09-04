@@ -382,9 +382,11 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                     (MouseButton::Right, MouseButtonState::Down) => {
                         mark_menu_open();
                     }
-                    (MouseButton::Right, MouseButtonState::Up) => {
-                        mark_menu_open();
-                    }
+                    // **P3-17 fix（2026-09-04 全量审查）**：Right Up 不再
+                    // 调 mark_menu_open（与 Down 重复，且重置 SET_AT 实际
+                    // 是浪费）。Down 已把 timer 重置成"刚才"，Up 时已 elapsed
+                    // ≈ 50ms，timer 还有 4950ms 剩余。
+                    (MouseButton::Right, MouseButtonState::Up) => {}
                     (MouseButton::Left, _) => {
                         MENU_OPEN_FLAG.store(false, Ordering::SeqCst);
                     }

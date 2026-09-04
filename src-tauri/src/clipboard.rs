@@ -67,11 +67,14 @@ pub fn read(app: &AppHandle) -> ClipboardContent {
 fn read_plugin_image(app: &AppHandle) -> Option<ClipboardImage> {
     let img = app.clipboard().read_image().ok()?;
     let (w, h) = (img.width(), img.height());
-    // **P3-3 fix**：read_image() 内部已分配 RGBA buffer，这里**至少**在
-    // to_vec() 二次拷贝 + PNG 编码前预检体积，防超大剪贴板图（Win/Linux
-    // 主路径）OOM。read_image 自身的内部分配护不住（在插件层），但拦掉
-    // to_vec + PNG 编码这两步已能挡住绝大多数 GB 级 payload。macOS 原生
-    // 路径（1a/1c/file-url）已分别 data.len()/metadata 预检，唯独插件路径漏。
+    // **P3-3 fix（2026-08-13 全量审查）**：read_image() 内部已分配 RGBA
+    // buffer，这里**至少**在 to_vec() 二次拷贝 + PNG 编码前预检体积，防超大
+    // 剪贴板图（Win/Linux 主路径）OOM。
+    //
+    // **P3-16 已知限制（2026-09-04 全量审查）**：read_image 自身的内部分配
+    // 护不住（在插件层）—— 30000×30000 等 GB 级像素在 read_image 已 OOM。
+    // 本层拦 to_vec + PNG 编码可挡住绝大多数情况；根治需要给插件提 patch
+    // （先探尺寸再解码）。记录在此防后人误以为已根治。
     let rgba_bytes = (w as u64).saturating_mul(h as u64).saturating_mul(4) as usize;
     if rgba_bytes > MAX_IMAGE_BYTES {
         return None;

@@ -211,8 +211,20 @@ impl Store {
         // 恢复持久化的 locale —— 让 rust-i18n 跟 store 同步，
         // get_app_locale / t! 都拿正确值。否则首次启动用户切了语言，
         // 重启后 rust-i18n 默认 locale 会跟 store 里不一致。
+        //
+        // **P3-15 fix（2026-09-04 全量审查）**：白名单校验。set_app_locale
+        // 命令有 ["en", "zh-CN"] 白名单（commands/mod.rs:645），但启动恢复
+        // 直接吃盘上任意字符串 → 手改 JSON / 半损坏数据落 "zh_CN" 等坏值
+        // → 后续所有 t!() 返 dotted key 原文，且每次启动被回写。修：启动
+        // 也走白名单，非法值回退默认 + 在内存里修正（下次 persist 自动落对值）。
+        const ALLOWED_LOCALES: &[&str] = &["en", "zh-CN"];
         if let Some(loc) = data.locale.as_deref() {
-            rust_i18n::set_locale(loc);
+            if ALLOWED_LOCALES.contains(&loc) {
+                rust_i18n::set_locale(loc);
+            } else {
+                tracing::warn!("load_or_init: 非法 locale {:?} 落回默认 en", loc);
+                rust_i18n::set_locale("en");
+            }
         }
         let recovered_corrupt = data.recovered_corrupt;
         let store = Self {
@@ -836,10 +848,23 @@ pub fn persist_to_disk(path: &Path, data: &StoreData, epoch: u64) -> Result<()> 
         // **未做**：不在 reorder 路径 debounce（add / delete / restore 仍
         // 立即持久化，crash 不能丢）。仅压缩序列化这步。
         let json = serde_json::to_vec(data).context("serialize")?;
-        f.write_all(&json).context("write tmp")?;
-        f.sync_all().context("fsync tmp")?;
+        // **P3-14 fix（2026-09-04 全量审查）**：write_all / sync_all 失败时
+        // best-effort 删 tmp，避免'最后一次失败后再无 persist'场景下永久残留
+        // 25MB 内的垃圾文件。
+        if let Err(e) = f.write_all(&json) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e).context("write tmp")?;
+        }
+        if let Err(e) = f.sync_all() {
+            let _ = fs::remove_file(&tmp);
+            return Err(e).context("fsync tmp")?;
+        }
     }
-    fs::rename(&tmp, path).context("atomic rename")?;
+    // rename 失败也清 tmp（rename 是 atomic 失败的话 tmp 仍存在）。
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).context("atomic rename")?;
+    }
 
     // **P2-2 fix**：parent dir fsync，保证 dir entry 持久化。Windows 上 dir
     // handle 的 sync_all 是 no-op，跳过。
@@ -856,11 +881,48 @@ pub fn persist_to_disk(path: &Path, data: &StoreData, epoch: u64) -> Result<()> 
     Ok(())
 }
 
+/// **P3-13 + P3-15 fix（2026-09-04 全量审查）**：
+/// - 保留最近 5 份 .bak.<ts>，更老的清理（避免无界累积）
+/// - rename 失败（如数据目录变只读）降级返回 Ok(()) 不阻塞启动；
+///   旧实现 `.context("backup corrupt file")?` 会让 lib.rs:505 的
+///   `.expect("failed to init todo store")` panic（永久无法启动）。
 fn backup_corrupt_file(path: &Path) -> Result<()> {
     // 毫秒级时间戳：秒级会在同秒两次失败时互相覆盖（第一个损坏现场丢失）。
     let ts = chrono::Utc::now().timestamp_millis();
     let backup = path.with_extension(format!("json.bak.{}", ts));
-    fs::rename(path, backup).context("backup corrupt file")?;
+    if let Err(e) = fs::rename(path, &backup) {
+        // 降级：rename 失败不阻塞启动（lib.rs caller 仍会用空 store 顶上）
+        tracing::warn!("backup_corrupt_file: rename to {:?} failed ({}), 跳过备份", backup, e);
+        return Ok(());
+    }
+    // 清理旧 .bak.<ts>：保留最近 5 份
+    if let Some(parent) = path.parent() {
+        let prefix = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("todos.json");
+        let mut baks: Vec<(i64, PathBuf)> = Vec::new();
+        if let Ok(entries) = fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                // 形如 todos.json.bak.<ts>
+                if let Some(ts_str) = name_str
+                    .strip_prefix(&format!("{}.bak.", prefix))
+                {
+                    if let Ok(ts) = ts_str.parse::<i64>() {
+                        baks.push((ts, entry.path()));
+                    }
+                }
+            }
+        }
+        baks.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));  // 新→旧
+        for (_, old) in baks.into_iter().skip(5) {
+            if let Err(e) = fs::remove_file(&old) {
+                tracing::debug!("cleanup old bak {:?} failed: {}", old, e);
+            }
+        }
+    }
     Ok(())
 }
 
