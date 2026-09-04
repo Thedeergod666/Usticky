@@ -416,6 +416,41 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ✅ **附带：预览窗 hover 穿缝行为改进**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts)）：预览开着时鼠标穿 card↔preview 之间的缝隙（短暂"两窗都不在"），原实现会立即摘 `.card-hover` + 落 idle 玻璃 -> 卡片像失焦闪一下。改：预览开着（`previewTodoId !== null && previewPinnedId === null`，即非 pinned 的 hover 面板）时，`floating-hover(false)` / hover-pos 不摘卡片强调、不落 idle；`over_preview` 命中时把 `rustHoveredCardId` 对齐到 `previewTodoId` 保持 `.card-hover`。释放时机统一收到 `preview-closed`：预览真关 + 鼠标仍不在浮窗（`lastHoverPayload === false`）才落 idle + 摘 `.card-hover`；鼠标在浮窗上则不动（让 hover-pos 正常驱动，避免摘了又挂抖动）。顺带删了 `previewWasOver` / `justLeftPreview` 边沿机制（被 preview-closed 释放路径取代，不再需要）。 `close_preview_window` 兜底直接 emit `usticky://preview-closed`：w.close() 在 Tauri 2 / WKWebView 下可能不触发 webview beforeunload -> preview.ts 的 beforeunload 监听不来 -> 浮窗收不到 preview-closed -> 穿缝期间保留的强调 / 玻璃卡死释放不了（只有切走 app 触发 onFocusChanged 才摘）。preview.ts beforeunload 仍会再 emit 一次，listener 幂等无副作用。
 ✅ 构建验证：`cargo check --all-targets` 零警告 ✓、`cargo test --lib` 20/20 ✓、`pnpm build`（tsc + vite）✓。
 
+### v0.2.7（2026-09-04，8 域全量代码审查修复）
+
+8 个并行审查 agent 对 8 个模块域做深度 bug 扫描（前端渲染/交互/预览/设置、后端存储/命令/平台/配置），共发现 ~95 条（按分级 P0=8/P1=22/P2=30/P3=26 报告）。本次修复 **P0（7）+ P1（8）+ P3（18）= 33 条 commit**，P2（30 条边界条件）列入 v0.3 候选。
+
+**阶段 0**：commit 现有未提交 diff（quick-add level switching refactor，4 个文件 wip 提交）
+
+**P0 修复（7 个 commit，必发）**：
+- ✅ **`build`：rust-version 1.77 → 1.84**（u64::is_multiple_of API 需要）
+- ✅ **`fix(windows)`：hover emitter hwnd 每 tick 现取 + apply_z_order IsWindow 守卫**（防 Win32 handle-reuse UB）
+- ✅ **`fix(commands)`：close_preview_window focused 早期 return 也 emit preview-closed + clear pending**（grace close 状态机复位）
+- ✅ **`fix(commands)`：reset_floating_window 用 work_area + hidden show/hide + 50px clamp**（多显示器拔屏位置漂移修复）
+- ✅ **`fix(commands)`：update_todo no-op 返 Ok(None) 而非 Ok(Some(cur))**（语义歧义 + 双击 toggleDone 状态错乱）
+- ✅ **`fix(commands)`：purge_attachment 引用检查 + remove_file 进同一 write lock 临界区**（防 delete → restore → 再 delete race 永久丢附件）
+- ✅ **`fix(commands)`：open_preview_window reuse 路径 set_size/position 失败 tracing + emit 失败不返 Err**（依赖 take_pending_preview_todo 自愈）
+
+**P1 修复（8 个 commit，高频功能性）**：
+- ✅ **`fix(frontend)`：mini-flash has-action 残留 + 幽灵点击拦截层**
+- ✅ **`fix(preview)`：IME 组合期间防抖保存跳过 + Esc isComposing 守卫**（zh-CN 标题永久损坏路径）
+- ✅ **`fix(frontend)`：跨 section 编辑残留 + quick-add Esc 丢输入 + undoDelete 失败兜底 + hide 前清预览状态机**
+- ✅ **`fix(styles)`：vanish-to-line 用 transition 两阶段替代 keyframe**（脱离全局 animation:none 禁用）
+- ✅ **`fix(todo)`：损坏 JSON 链 recovered_corrupt 持久化 + 用户操作后清除**（防孤儿扫描清光附件）
+- ✅ **`fix(lib)`：Moved/Resized try_write 快速路径 + CloseRequested spawn hide_dismiss + ExitRequested try_write**
+- ✅ **`fix(windows/tray)`：Win hide 时 emit floating-hover false + tray 左键已走 show_normal**
+- ✅ **`fix(commands)`：t! 占位符 + validate NUL + restore rollback 持久化 + shortcut 短路 + close 200ms 拆分**
+
+**P3 修复（3 个 commit，防御性改进）**：
+- ✅ **`fix(frontend)`：P3 防御性改进 — thumbWidthCache 代际校验 / deleteConfirmTimers 清 / copy 双路径失败 flash / preview 对比度 / low-power done 折叠**
+- ✅ **`fix(todo/lib/tray/clipboard)`：P3 存储/线程防御 — backup 保留 5 份 + rename 降级 / persist 失败清 tmp / locale 白名单 / clipboard 注释 / tray Right Up 冗余 / FIRST_FOCUS_DONE swap 注释**
+- ✅ **`chore(config)`：CSP + capabilities + CI + AGENTS.md 同步**（connect-src http://ipc.localhost + 三个纵深防御 / opener 拆 settings.json / ci permissions / docs staticlib + minWidth 240 / dragDropEnabled false）
+
+**P2（30 条边界条件）** 列入 v0.3 候选，包括：
+- thumbWidthCache 实现与注释矛盾 / 滚动 / 拖拽残留边沿 / `:empty` 在空白字符 title 下失效 / pulse 动画无 reduced-motion / 浅色背景对比度 / due 标签 DST 边界 / 多次删附件 / 预览窗 confirm 跨 todo 残留 / input Cmd+V 粘图片残留空白 / perfDump 版本硬编码等
+
+**构建验证**：`cargo check --all-targets` 零警告 ✓、`cargo test --lib` 21/21 ✓（多一个 reorder_rejects_mixed_status_subset 回归测试）、`pnpm build`（tsc + vite）✓。
+
 ### 仍未做
 
 ⏳ **Cmd+Z 撤销栈**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 已占位 keydown listener，TODO 未实现，v0.2 候选）
