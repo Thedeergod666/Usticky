@@ -33,25 +33,72 @@
  * 不是 CSS hover 状态机问题（--tile-blur 10px 写死，从未切），
  * 是 WebKit 合成器把 CABackdropLayer 的 sample cache 丢了。
  *
- * 修复方案 3 层叠加（任一层漏掉都重现）：
- *   L1: will-change: backdrop-filter —— 让 WebKit 给元素独立 GPU layer，
+ * 修复方案 3 层叠加（任一层漏掉都重现），v0.2.10 起全部只作用于**单一
+ * 玻璃面板**（#app::after）而不是每张卡：
+ *   L1: will-change: backdrop-filter —— 让 WebKit 给面板独立 GPU layer，
  *       不进空闲节流判定
- *   L2: 心跳动画 @keyframes backdrop-heartbeat —— 极微小 blur 变化
- *       (10px ↔ 9.95px) 强制每帧 invalidation，绕过 sample 失效
+ *   L2: 心跳动画 @keyframes usticky-backdrop-heartbeat —— transform/opacity
+ *       亚像素微动，强制每帧合成，绕过 sample 失效
  *   L3: 监听 usticky://backdrop-refresh 事件（PinBottom 模式 level 切换
- *       后 emit），前端 force reflow 立刻重采
+ *       后 emit），前端给 #app 挂 .force-reflow 立刻重采
  *
  * 共同生效：3 层冗余 — 任一层失效另外两层兜底。
+ *
+ * **v0.2.10 单一玻璃面板重构（O(N)→O(1)）**：
+ * 旧架构每张卡独立 backdrop-filter 层 + 心跳保活 —— 采样成本、合成底噪
+ * 全部随卡数线性增长，且卡片一动（vanish 塌缩 / SortableJS 重排 / 滚动）
+ * 每个移动中的层都要逐帧重采样（v0.2.8 被迫在 .vanishing 期间手动关
+ * backdrop 打补丁）。新架构：整窗**一块**玻璃，卡片退化成玻璃上的半透明
+ * 填充（border / shadow / radius 保留，瓦片感靠描边）：
+ *   - backdrop 采样层 N → 1；心跳 / will-change / force-reflow 全部 ×1
+ *   - 面板 position:fixed + inset:0（底边让出 95px 呼吸带）—— 不随 #app
+ *     滚动、不参与布局（autoResize 的 scrollHeight 无反馈环）、几何静止
+ *     → 卡片任何移动都不再触发 backdrop 重采样
+ *   - 双伪元素分工（沿用 2026-08-13 教训）：#app::after 只做玻璃
+ *     （backdrop-filter + L1 + L2），#app::before 只做 tint（实色 rgb()
+ *     × opacity 过渡）—— opacity 过渡是 compositor-only 零重绘；且 tint
+ *     必须与玻璃分层，opacity 若挂在玻璃层上会把 blur 结果一起变透明，
+ *     桌面清晰透出 = 假玻璃
+ *   - 视觉变化：卡与卡之间的缝隙、#app padding 区域从"透桌面"变成玻璃
+ *     —— 整块面板观感（iOS 26 原生 widget 即整块玻璃）
  */
 
-/* L1: will-change —— 每个玻璃元素独立 GPU layer */
-.todo-card,
-.todo-input,
-.todo-paste-btn {
+/* 单一玻璃面板 —— 玻璃层（#app::after，含 L1 will-change + L2 心跳） */
+#app::after {
+  content: "";
+  position: fixed;
+  /* 底边让出 95px：#app padding-bottom 100px 是"滚到底不被 dock 切"的
+   * 呼吸带 —— 常态（不滚动）下窗口比最后一行高 100px，玻璃若铺满会把
+   * 呼吸带变成一条空玻璃尾巴。95px = 100px − 5px 底边距，与顶/左/右
+   * 的 5px padding 对齐。窗口被 clamp 进滚动态时底部 95px 无玻璃（已知
+   * 限制，仅超屏长列表触达）。 */
+  inset: 0 0 95px 0;
+  z-index: -2;
+  border-radius: 16px;
+  backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
+  -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   will-change: backdrop-filter;
+  animation: usticky-backdrop-heartbeat 4s linear infinite;
+}
+/* 单一玻璃面板 —— tint 层（#app::before）：idle 0.30 ↔ hover 0.82 的
+ * 深浅过渡在这里走 opacity（transform: translateZ(0) 强制独立合成层，
+ * opacity 才能被合成器单独插值）。border / box-shadow 消费同一组 tile
+ * 变量 —— 故意不 transition（离散切，同旧 .todo-card 规则）。 */
+#app::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 95px 0;
+  z-index: -1;
+  border-radius: 16px;
+  border: 1px solid var(--tile-border);
+  box-shadow: var(--tile-shadow);
+  background: rgb(var(--tile-bg-rgb));
+  opacity: var(--tile-bg-alpha);
+  transform: translateZ(0);
+  transition: opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-/* L2: 心跳动画 —— 0.001 度 rotate + 0.001 opacity 循环。
+/* L2: 心跳动画（已应用在上方 #app::after）—— 0.001 度 rotate + 0.001 opacity 循环。
  *
  * 为什么不用 backdrop-filter 自身的微动（10px ↔ 9.95px）：
  *   backdrop-filter 的 blur() 函数在 @keyframes 内的"中间值"由浏览器自己
@@ -78,56 +125,29 @@
   0%, 100% { transform: rotate(0deg);     opacity: 1; }
   50%      { transform: rotate(0.001deg); opacity: 0.999; }
 }
-.todo-card,
-.todo-input,
-.todo-paste-btn {
-  animation: usticky-backdrop-heartbeat 4s linear infinite;
-}
 
-/* **v0.2.8 交互态暂停心跳**（拖拽/删除动画"瞬移感"的根因修复）：
- *
- * CSS 级联里正在运行的 animation 对它声明的属性（transform / opacity）
- * 的优先级**高于一切普通声明，包括 inline style**，且动画期间这些属性的
- * computed value 被锁死 → 同属性上的 transition 永不启动、inline 覆盖无效。
- * 后果（修复前全部"视觉死亡"，用户看到的是瞬移 = 卡顿感的主根因）：
- *   - SortableJS animate() 给**兄弟卡**写 inline transform（150ms 重排滑动）
- *     —— 被心跳 keyframes 的 transform 掩蔽，松手后所有卡瞬移到位
- *   - .dragging / .sortable-chosen 的 opacity 淡化 —— 被掩蔽
- *   - .vanishing 的 opacity 淡出 —— 被掩蔽（只剩高度塌缩）
- *
- * 解法：交互态（拖拽中 #app[data-drag-active] 由 main.ts onStart/onEnd 挂、
- * vanishing / dragging / sortable-chosen）暂停心跳。安全性：
- *   - 暂停/恢复只是 0.001deg / 0.001 alpha 的亚像素 snap，肉眼不可见
- *   - 拖拽 / 塌缩本身在持续改几何，layer 不会进 WKWebView ~2s 空闲节流
- *     窗口，玻璃防丢失（L2 的目的）不受影响 */
-.todo-card.vanishing,
-.todo-card.dragging,
-.todo-card.sortable-chosen,
-#app[data-drag-active] .todo-card {
-  animation: none;
-}
+/* **v0.2.8 交互态暂停心跳 → v0.2.10 随单一玻璃面板退役**：心跳现在只在
+ * #app::after 一层上，卡片不再携带任何 animation —— SortableJS 的 inline
+ * transform 重排、.dragging / .sortable-chosen 的 opacity 淡化、.vanishing
+ * 的淡出天然生效，不再被 keyframes 掩蔽。
+ * （v0.2.8 经验 ⑦ 仍成立：animation 对其声明属性的优先级高于 inline
+ * style —— 只是现在唯一的心跳层上没有任何库会写 inline transform，
+ * 无需暂停机制。main.ts 的 data-drag-active 挂/摘已一并移除。） */
 
-/* L3: level 切换后 force reflow —— 由 main.ts 在收到
- * usticky://backdrop-refresh 事件时给 .todo-card/.todo-input 加这个类，
- * 触发 reflow → 立刻重新合成 backdrop sample，击穿 2s sample 失效窗口。
+/* L3: level 切换后 force reflow —— main.ts 收到 usticky://backdrop-refresh
+ * 时给 #app 挂 .force-reflow（100ms 后移除），触发面板 backdrop layer
+ * 立即重采样，击穿 2s sample 失效窗口。
  *
- * 关键点：
- *   - 用 .force-reflow class 强制重采样（不是简单加 transition）
- *   - 0.1s 后由 JS 移除 —— 短暂 flicker 但立刻恢复，肉眼几乎不可见
- *   - 不影响 hover 状态机（不触发 body[data-hover] 切换）
- *   - **用 backdrop-filter 微动（blur +1px）而不是 filter** —— 旧实现
- *     `filter: drop-shadow(0 0 0 transparent)` 会给元素叠一个 filter pass、
- *     **重栅格化元素自身背景**，在 PinBottom hover 切 level 时与 220ms
- *     的 background-color 过渡重叠，把过渡 cancel 掉 → 用户看到"背景透明
- *     突然变深"的跳变（Musage 默认 PinTop 不切 level、不发 backdrop-refresh，
- *     所以没这个问题）。backdrop-filter 微动只强制 backdrop layer 重采样，
- *     不动元素自身背景 → 过渡照常走。
- *   - +1px blur 差肉眼不可见（10px→11px），但足以让 WebKit 判定
- *     backdrop-filter 变了 → 重采样。
- */
-.todo-card.force-reflow,
-.todo-input.force-reflow,
-.todo-paste-btn.force-reflow {
+ * v0.2.10：玻璃层唯一（#app::after），改挂 #app 本体即可 —— v0.2.8 的
+ * "只刷视口内可见卡"过滤随之退役（就一个元素）。
+ *
+ * 沿用 **backdrop-filter 微动（blur +1px）而不是 filter** —— 旧实现
+ * `filter: drop-shadow(0 0 0 transparent)` 会给元素叠一个 filter pass、
+ * 重栅格化元素自身背景，在 PinBottom hover 切 level 时与 220ms 的过渡
+ * 重叠，把过渡 cancel 掉（"背景突然变深"跳变）。backdrop-filter 微动只
+ * 强制 backdrop layer 重采样，不动 tint 层的 opacity 过渡。
+ * +1px blur 差肉眼不可见（10px→11px）。 */
+#app.force-reflow::after {
   backdrop-filter: blur(calc(var(--tile-blur) + 1px)) saturate(var(--tile-saturate));
   -webkit-backdrop-filter: blur(calc(var(--tile-blur) + 1px)) saturate(var(--tile-saturate));
 }
@@ -181,8 +201,9 @@ html, body {
    *
    * **2026-07-20 fix**：idle 背景进一步压到 Musage 档位 —— bg alpha
    * 0.55 → 0.30、border 0.06 → 0、shadow → 0（对齐 Musage idle：
-   * 0.30 alpha / border 0 / shadow 0），idle 几乎只剩文字浮在桌面上，
-   * hover 才显出玻璃瓦片（idle→hover 差 0.52 alpha，与 Musage 一致；
+   * 0.30 alpha / border 0 / shadow 0），idle 只剩淡玻璃面板（0.30）托着
+   * 文字 —— v0.2.10 起缝隙与卡同深浅，整块一致；hover 才显出瓦片描边
+   * （idle→hover 差 0.52 alpha，与 Musage 一致；
    * hover 值也已跟 Musage 逐项对齐）。rgb 保持 28,30,38 不动，纯
    * alpha 渐变。
    * blur 10px（2026-08-10 perf：28→10→26→10 三轮试调最终留 10px；Musage 是
@@ -190,12 +211,12 @@ html, body {
    * 闲置观感与 Musage 接近但略轻。L1+L2 玻璃防丢失靠 will-change + 心跳 +
    * force-reflow，跟 blur 半径无关，10px 在安全区内（见文件头 L1-L3）。
    * 历史：2026-07-08 曾 0.62 → 0.55。 */
-  /* 玻璃背景拆两个变量（2026-08-13 perf）：--tile-bg-rgb（固定色）+
-   * --tile-bg-alpha（透明度）。::before 用 rgb(var(--tile-bg-rgb)) 实色 +
+  /* 玻璃背景拆两个变量（2026-08-13 perf；v0.2.10 起由面板 tint 层
+   * #app::before 消费，卡片不再自带 tint）：--tile-bg-rgb（固定色）+
+   * --tile-bg-alpha（透明度）。tint 层用 rgb(var(--tile-bg-rgb)) 实色 +
    * opacity: var(--tile-bg-alpha) 走 **opacity 过渡**（compositor-only，
-   * GPU 插值零重绘）—— 替代 background-color 过渡（paint，每帧重绘 N 层
-   * ::before，todo 一多 hover 过渡就掉帧卡顿）。视觉等价：
-   * rgb(28,30,38) × opacity 0.30 ≡ rgba(28,30,38,0.30)。 */
+   * GPU 插值零重绘）。视觉等价：rgb(28,30,38) × opacity 0.30 ≡
+   * rgba(28,30,38,0.30)。 */
   --tile-bg-rgb: 28, 30, 38;
   --tile-bg-alpha: 0.30;
   --tile-blur: 10px;
@@ -299,50 +320,31 @@ body[data-active] #app {
   align-items: center;
   gap: 10px;
   padding: 9px 13px 9px;
-  /* 背景搬到 ::before 伪元素（见下方）。原因：父元素上同时有
-   * backdrop-filter + will-change: backdrop-filter + 心跳动画时，
-   * background-color 的 CSS 过渡会被合成层重置/快照为瞬时（无渐变），
-   * 而 .todo-title/.todo-check/.todo-due 上的 color 过渡正常（它们
-   * 不在 backdrop-filter 合成层上）。把背景移到 ::before，伪元素
-   * 不带 backdrop-filter / will-change / 心跳，background-color 过渡
-   * 走 paint 通道、不被合成层重置。overflow:hidden 把 ::before 裁到
-   * 卡片圆角内（避免 ::before 圆角与卡片圆角错位的 1px 露出）。 */
+  /* v0.2.10 单一玻璃面板：卡片不再自带 backdrop-filter / tint ::before ——
+   * 玻璃在 #app::after、深浅在 #app::before，卡片只是玻璃上的内容层，
+   * 保留 border / radius / shadow 做瓦片描边（hover 时 border 0.10 +
+   * shadow 显出瓦片感）。overflow:hidden 保留 —— 防御长标题/编辑态
+   * 内容溢出圆角。 */
   position: relative;
   overflow: hidden;
-  backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
-  -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   border: 1px solid var(--tile-border);
   border-radius: 14px;
   box-shadow: var(--tile-shadow);
   /* ⚠️ 不 transition backdrop-filter / box-shadow —— 它们都是合成层重操作，
      在 Rust hover emitter 50ms tick 抖动时会反复插值 → 光标闪烁。
-     视觉上从 idle 到 hover 是离散切；背景过渡走 ::before 的 opacity。
+     视觉上从 idle 到 hover 是离散切；背景过渡走面板 tint 层（#app::before）
+     的 opacity。
      **v0.2.8 perf**：border-color 也移出 transition —— hover 边沿 0→0.10
      alpha 的逐帧 border 重绘 ×N 卡是 paint 风暴的一部分，而 0.10 的离散
-     切换肉眼不可辨。transform/opacity 留给拖拽态（心跳暂停时才生效）。 */
+     切换肉眼不可辨。transform/opacity 留给拖拽态（v0.2.10 起卡片无心跳，
+     直接生效）。 */
   transition:
     transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
     opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1);
   cursor: grab;
 }
-/* 玻璃背景层（伪元素，详见上方注释）。过渡走 **opacity**（compositor-only）
- * 而不是 background-color（paint）—— 2026-08-13 perf：paint 过渡每帧重绘
- * N 层 ::before，todo 一多 hover 就掉帧；opacity 由 GPU 插值，零重绘。
- * transform: translateZ(0) 强制 ::before 走独立合成层，opacity 才能被
- * 合成器独立插值（否则它只是父卡片 backdrop-filter 合成层的一部分，
- * 没法单独变透明）。背景用实色 rgb(var(--tile-bg-rgb)) + opacity 变量
- * 等价旧的 rgba 半透明（见 #app 变量注释）。 */
-.todo-card::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  background: rgb(var(--tile-bg-rgb));
-  opacity: var(--tile-bg-alpha);
-  border-radius: inherit;
-  transform: translateZ(0);
-  transition: opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1);
-}
+/* （v0.2.10 删）卡片 tint ::before —— 玻璃与深浅整体上移到 #app::after /
+ * #app::before 单层面板，卡片透明，瓦片感靠 border + shadow。 */
 .todo-card:active { cursor: grabbing; }
 .todo-card.dragging { opacity: 0.5; transform: scale(0.98); }
 .todo-card.sortable-chosen {
@@ -492,11 +494,8 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
   border-width: 1px;
   overflow: hidden;
   pointer-events: none;
-  /* **v0.2.8 perf**：塌缩期间退出玻璃采样 —— 140ms 里后续卡逐帧上移、
-   * 每个移动中的 backdrop-filter layer 都要重采样，正在消失的这张没
-   * 必要再占一份采样预算（它本来就在消失，视觉无感）。 */
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
+  /* （v0.2.10 删）塌缩期间 backdrop-filter: none 补丁 —— 卡片已无独立
+   * backdrop 采样层，面板几何静止，塌缩不再触碰任何玻璃采样。 */
   /* **v0.2.8 perf**：transition 收窄到 max-height + opacity —— padding /
    * border-width 逐帧变化只会扩大每帧 invalidation 面积，离散切到 0 与
    * 塌缩同步发生，肉眼无感。opacity 淡出依赖上面的 animation:none
@@ -595,7 +594,8 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
  *
  * 视觉策略：透明背景 + 1px 弱边框 + focus 时蓝色描边，沿用 .todo-input
  * 的 focus-within 视觉语义，让用户一眼看出"现在处于编辑态"。不写
- * box-shadow（避免跟 .todo-card 已有的 backdrop-filter 合成预算打架）。
+ * box-shadow（v0.2.10 前是避免跟卡片 backdrop-filter 合成预算打架；现在
+ * 卡片已无玻璃层，纯保持视觉轻量）。
  *
  * 跟 .todo-title 的 font 完全一致 —— 字体跳变会让用户体感"被切走"，编辑
  * 文字字号 / 字重 / letter-spacing 必须 1:1 对齐。
@@ -741,29 +741,16 @@ body[data-active] #app .todo-due.days     { color: var(--c-data-cyan);  backgrou
   align-items: center;
   gap: 8px;
   padding: 8px 13px;
-  /* 背景搬到 ::before（详见 .todo-card 注释：父元素有 backdrop-filter
-   * 时 background-color 过渡会被合成层重置，所以走伪元素）。 */
+  /* v0.2.10 单一玻璃面板：瓦片不再自带 backdrop-filter / tint ::before
+   * （玻璃/深浅都在 #app 双伪元素上），保留 border / radius / shadow。 */
   position: relative;
   overflow: hidden;
-  backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
-  -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   border: 1px solid var(--tile-border);
   border-radius: 14px;
   box-shadow: var(--tile-shadow);
   /* 不 transition backdrop-filter —— 同 .todo-card，防 hover emitter 抖动闪烁。
    * **v0.2.8 perf**：border-color 移出（同 .todo-card，离散切换肉眼不可辨）。 */
   transition: none;
-}
-.todo-input::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  background: rgb(var(--tile-bg-rgb));
-  opacity: var(--tile-bg-alpha);
-  border-radius: inherit;
-  transform: translateZ(0);
-  transition: opacity 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .todo-input:focus-within {
   border-color: rgba(10, 132, 255, 0.45);
@@ -835,11 +822,9 @@ body[data-narrow="1"] .todo-input-hint {
   align-items: center;
   justify-content: center;
   padding: 0;
-  /* 背景搬到 ::before（详见 .todo-card 注释）。 */
+  /* v0.2.10 单一玻璃面板：不再自带 backdrop-filter（玻璃在 #app::after）。 */
   position: relative;
   overflow: hidden;
-  backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
-  -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   border: 1px solid var(--tile-border);
   border-radius: 14px;
   box-shadow: var(--tile-shadow);
@@ -849,16 +834,18 @@ body[data-narrow="1"] .todo-input-hint {
    * color 留给 :active 的即时反馈 */
   transition: color 0.15s ease-out;
 }
+/* v0.2.10：tint ::before 退役（玻璃/深浅上移到面板），伪元素改为纯
+ * 按下高亮层 —— 默认 opacity:0，:active 才显蓝色。 */
 .todo-paste-btn::before {
   content: "";
   position: absolute;
   inset: 0;
   z-index: -1;
-  background: rgb(var(--tile-bg-rgb));
-  opacity: var(--tile-bg-alpha);
+  background: rgba(10, 132, 255, 0.18);
+  opacity: 0;
   border-radius: inherit;
   transform: translateZ(0);
-  transition: opacity 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+  transition: opacity 0.15s ease-out;
 }
 .todo-paste-btn svg {
   width: 15px;
@@ -868,11 +855,7 @@ body[data-narrow="1"] .todo-input-hint {
   color: var(--c-data-info);
   border-color: rgba(10, 132, 255, 0.45);
 }
-/* 背景在 ::before 上，按下态高亮改 ::before 的 background。
- * opacity: 1 锁掉 tile 的 idle 0.30 透明度 —— 否则按下反馈被乘弱
- * （rgba(10,132,255,0.18) × 0.30 ≈ 5% alpha，几乎看不见）。 */
 .todo-paste-btn:active::before {
-  background: rgba(10, 132, 255, 0.18);
   opacity: 1;
 }
 
@@ -927,11 +910,10 @@ body[data-narrow="1"] .todo-input-hint {
  * idle 下整个 done section 渐变到 opacity: 0（见下方规则），
  * hover 回到 1。复用全局 cubic-bezier(0.22, 1, 0.36, 1) iOS spring，
  * 跟 .todo-card / .section-header 的色彩过渡节奏一致。
- * **v0.2.8 perf**：配对 visibility —— opacity:0 只是不画，子卡仍带
- * backdrop-filter + will-change + 无限心跳（心跳让 layer 永远"活着"，
- * WebKit 不按空闲回收）→ idle（99% 的状态）下 N 张不可见 done 卡持续
- * 占用 blur 合成预算，挤压 hover 过渡的 GPU 余量。visibility:hidden
- * 让 WebKit 跳过其绘制/合成/命中测试；布局占位不变（0 跳位设计保留，
+ * **v0.2.8 perf**：配对 visibility —— opacity:0 只是不画。v0.2.10 单面板
+ * 后卡片虽已无独立 backdrop 采样层，不可见 done 卡仍会参与 paint/合成；
+ * visibility:hidden 让 WebKit 跳过其绘制/合成/命中测试；布局占位不变
+ * （0 跳位设计保留，
  * scrollHeight 语义不受影响）。时序：淡出完（0.22s）才 hidden，hover
  * 回来立即 visible（base 规则 delay 0），肉眼与纯 opacity 方案无差别。 */
 .todo-section-done {

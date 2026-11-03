@@ -472,16 +472,13 @@ const sortableOpts: Sortable.Options = {
   filter: NON_DRAGGABLE_SELECTORS,
   preventOnFilter: true,
   onStart: () => {
+    // v0.2.10：心跳只在 #app::after 单层上，卡片无 animation —— SortableJS
+    // 的 inline transform 重排不再被 keyframes 掩蔽，data-drag-active
+    // 暂停机制退役（见 styles.css 心跳段注释）。
     isDragging = true;
-    // v0.2.8 卡顿修复：拖拽期间给 #app 挂 data-drag-active —— CSS 据此暂停
-    // 所有卡的心跳动画（animation 会掩蔽 inline transform，见 styles.css
-    // 心跳暂停段注释），SortableJS 的重排滑动动画（animate() 写 inline
-    // transform）和兄弟卡位移才真正"动起来"，不再瞬移。
-    app.dataset.dragActive = "1";
   },
   onEnd: (evt) => {
     isDragging = false;
-    delete app.dataset.dragActive;
     void handleDragEnd(evt);
   },
 };
@@ -1695,7 +1692,6 @@ function cleanupSortables() {
   // onEnd 已经处理，但跨 webview 某些边界 / 异常路径可能遗漏），重置，
   // 不让后续 render 永久被挡。
   isDragging = false;
-  delete app.dataset.dragActive;
   // P2-6：拖拽期间被吞的 render 一次补掉。
   flushPendingRender();
 }
@@ -2410,43 +2406,25 @@ async function init() {
     .catch((e) => console.error("[usticky] listen floating-hover-pos failed", e));
 
   // ── Backdrop refresh (L3 修复) ──
-  // Rust 端在 set_window_level（level 切换）后 emit `usticky://backdrop-reflow`，
-  // 前端给所有 .todo-card / .todo-input 加 .force-reflow class
-  // (filter: drop-shadow 微动 → paint invalidation → backdrop layer 重采样)，
-  // 击穿 macOS WKWebView ~2s 的 sample 失效窗口。
+  // Rust 端在 set_window_level（level 切换）后 emit `usticky://backdrop-refresh`，
+  // 前端给 #app 挂 .force-reflow（styles.css 把 #app::after 的 blur +1px
+  // → backdrop layer 立即重采样），击穿 macOS WKWebView ~2s 的 sample
+  // 失效窗口。100ms 后移除（视觉几乎不可见）。
   //
-  // 击穿机制：
-  //   - level 切换 → WKWebView 旧 backdrop sample 失效
-  //   - 通常 ~2s 后 WebKit 才重新计算 sample（用户看到"2 秒丢失"）
-  //   - 我们在切换后立刻强制 paint invalidation，WebKit 必须立即重采样
-  //   - .force-reflow class 持续 100ms 后移除（视觉几乎不可见）
+  // v0.2.10 单一玻璃面板：玻璃层唯一（#app::after），不再遍历卡片 ——
+  // v0.2.8 的"只刷视口内可见卡"过滤随之退役（就一个元素）。
   //
-  // 注意：前端这个修复跟 Rust 的 hover emitter dispatch 抖动修复（4 层 那个）
+  // 注意：前端这个修复跟 Rust 的 hover emitter dispatch 抖动修复（4 层那个）
   // 是**正交的**——前者解决 sample 失效（物理层），后者解决 hover 状态机
   // 误触发 CSS 切换（逻辑层）。两者一起叠，玻璃质感稳定。
   let backdropRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let unlistenBackdropRefresh: UnlistenFn | null = null;
   listen("usticky://backdrop-refresh", () => {
     if (backdropRefreshTimer !== null) clearTimeout(backdropRefreshTimer);
-    // v0.2.8：只刷 **视口内可见** 的卡。force-reflow 对每个命中元素是 2 次
-    // backdrop 重采样（+1px / 归位），长列表滚出视口的卡刷了也看不见 ——
-    // 一次 rect 批量读（单次 layout flush，边沿触发非高频路径）过滤，
-    // N 卡列表的重采样开销压到可见集（~屏内 25-50 张）。
-    const appRect = app.getBoundingClientRect();
-    const targets = [...app.querySelectorAll<HTMLElement>(
-      ".todo-card, .todo-input, .todo-paste-btn",
-    )].filter((el) => {
-      if (el.classList.contains("todo-card")) {
-        const r = el.getBoundingClientRect();
-        return r.bottom >= appRect.top && r.top <= appRect.bottom;
-      }
-      return true; // 输入瓦片 / 粘贴键常驻顶部，恒刷
-    });
-    targets.forEach((el) => el.classList.add("force-reflow"));
+    app.classList.add("force-reflow");
     backdropRefreshTimer = setTimeout(() => {
       backdropRefreshTimer = null;
-      app.querySelectorAll<HTMLElement>(".todo-card.force-reflow, .todo-input.force-reflow, .todo-paste-btn.force-reflow")
-        .forEach((el) => el.classList.remove("force-reflow"));
+      app.classList.remove("force-reflow");
     }, 100);
   })
     .then((fn) => (unlistenBackdropRefresh = fn))
