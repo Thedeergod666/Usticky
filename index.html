@@ -11,6 +11,15 @@
   </head>
   <body>
     <div id="app"></div>
+    <!--
+      v0.2.10：窗口级 backdrop 心跳哨兵（.glass-keepalive）。
+      1px 隐形元素，全窗口**唯一**带心跳动画的元素 —— 取代旧版"每卡一个"
+      的心跳（N 个动画层 → 每帧 N 次 backdrop 重采样 = GPU 风暴 = 卡顿主因）。
+      挂在 body 下、position: fixed → 相对浮窗视口，不受 #app 滚动 / 内容
+      增删影响，生命周期与浮窗 webview 一致。
+      机制详见 src/styles.css 文件头的 L1/L2/L3 段注释。
+    -->
+    <div class="glass-keepalive" aria-hidden="true"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

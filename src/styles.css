@@ -35,23 +35,53 @@
  *
  * 修复方案 3 层叠加（任一层漏掉都重现）：
  *   L1: will-change: backdrop-filter —— 让 WebKit 给元素独立 GPU layer，
- *       不进空闲节流判定
- *   L2: 心跳动画 @keyframes backdrop-heartbeat —— 极微小 blur 变化
- *       (10px ↔ 9.95px) 强制每帧 invalidation，绕过 sample 失效
+ *       不进**层级**空闲节流判定
+ *   L2: 心跳动画 —— 持续微动让合成器永不休闲，backdrop 采样 backing
+ *       store 不被丢弃
  *   L3: 监听 usticky://backdrop-refresh 事件（PinBottom 模式 level 切换
  *       后 emit），前端 force reflow 立刻重采
  *
  * 共同生效：3 层冗余 — 任一层失效另外两层兜底。
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ *  **v0.2.10 心跳从「每卡一个」降为「窗口一个」**
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * 旧实现每张卡各挂一份心跳（transform + opacity 0.001° 亚像素微动），
+ * 两个代价：
+ *
+ *   1) **GPU 风暴**：N 个持续动画的合成层 → 每帧 N 次 backdrop 重采样。
+ *      卡一多就掉帧 —— 这是用户实测"总是有卡顿感"的主因。
+ *
+ *   2) **掩蔽交互动画**（AGENTS.md v0.2.8 经验 ⑦）：CSS 级联里正在运行
+ *      的 animation 对它声明属性的优先级**高于一切普通声明，包括 inline
+ *      style**，且动画期间该属性的 computed value 被锁死 → 同属性上的
+ *      transition 永不启动、inline 覆盖无效。后果：SortableJS 归位时写
+ *      inline transform（150ms 重排滑动）被心跳 keyframes 的 transform
+ *      掩蔽 → 松手后所有卡**瞬移**到位。v0.2.8 靠"交互态暂停心跳"
+ *      打了补丁，但那只覆盖拖拽中的瞬间，松手后的归位滑动仍被掩蔽。
+ *
+ * 新实现：
+ *   L2 心跳改为**窗口级哨兵**（.glass-keepalive，1px 隐形元素）：
+ *     - 节流是**窗口空闲判定**（见上），一个持续动画的哨兵就能让合成器
+ *       永不休闲 → 全部瓦片的 backdrop 采样一起被保住（1 个动画代替 N 个）
+ *     - 动画**不在 .todo-card 上** → 卡片不再有被锁死的属性 → SortableJS
+ *       的 inline transform 归位滑动恢复正常（这才是"丝滑"的来源）
+ *     - 代价从 O(N) 降到 O(1)：GPU 每帧只重采样 1 个 1px 层
+ *
+ * 玻璃瓦片仍是**逐卡** backdrop-filter（.todo-card 上），不是整窗一块 ——
+ * 只有逐瓦片才能切出卡间的透明缝隙（单块连续玻璃切不出缝），这是
+ * v0.2.10 之前"圆角胶囊 + 透明间隙"观感的来源。
  */
 
-/* L1: will-change —— 每个玻璃元素独立 GPU layer */
+/* L1: will-change —— 每个玻璃瓦片独立 GPU layer */
 .todo-card,
 .todo-input,
 .todo-paste-btn {
   will-change: backdrop-filter;
 }
 
-/* L2: 心跳动画 —— 0.001 度 rotate + 0.001 opacity 循环。
+/* L2: **窗口级**心跳哨兵 —— 0.001 度 rotate + 0.001 opacity 循环。
  *
  * 为什么不用 backdrop-filter 自身的微动（10px ↔ 9.95px）：
  *   backdrop-filter 的 blur() 函数在 @keyframes 内的"中间值"由浏览器自己
@@ -73,38 +103,55 @@
  *   ease 有停顿 → WKWebView 在停顿期可能判定静止 → 重新进入节流窗口。
  *   4s 是经验值：比 ~2s throttling 窗口长 2 倍，必有一帧错过任何判定窗口；
  *   比 1s 长 4 倍，CPU/GPU 合成压力降 4 倍。
+ *
+ * **v0.2.10 关键改动：哨兵只有 1 个，且不在 .todo-card 上。**
+ *   - 旧版每卡一个 → 每帧 N 次 backdrop 重采样（GPU 风暴 = 卡顿主因）
+ *   - 旧版挂在卡片上 → 锁死卡片 transform → 掩蔽 SortableJS 归位滑动
+ *     （"松手后瞬移" = 卡顿感的另一半）
+ *   - 新版 1 个 1px 哨兵 → 每帧 1 次重采样，且不锁死任何交互属性
+ *
+ * 哨兵为什么能保住**其它**卡片的采样：
+ *   WKWebView 的 backdrop 采样节流是**窗口级**判定（窗口整体空闲 → 丢弃
+ *   backdrop 采样 backing store），不是每元素独立。窗口里只要有一个元素
+ *   持续动，合成器就不进入空闲节流 → 全部瓦片的采样一起被保住。
+ *   这也解释了 v0.2.8 为什么"每卡都挂"是浪费：N 倍成本换同一个效果。
+ *
+ * 哨兵本体：1px × 1px、opacity 0.001、pointer-events:none、z-index 最小 ——
+ * 肉眼完全不可见，也不参与任何命中测试。DOM 节点挂在 <body> 下（见
+ * index.html），position: fixed 相对浮窗视口 → 与浮窗同生命周期，
+ * 且不受 #app 滚动 / 内容增删影响。
  */
 @keyframes usticky-backdrop-heartbeat {
-  0%, 100% { transform: rotate(0deg);     opacity: 1; }
-  50%      { transform: rotate(0.001deg); opacity: 0.999; }
+  0%, 100% { transform: rotate(0deg);     opacity: 0.001; }
+  50%      { transform: rotate(0.001deg); opacity: 0.002; }
 }
-.todo-card,
-.todo-input,
-.todo-paste-btn {
+/* 哨兵：1px 隐形元素，全窗口唯一带心跳动画的元素。
+ *
+ * position: fixed → 相对视口（= 浮窗 webview 视口），不受 #app 滚动 /
+ * 内容重渲染影响。DOM 节点在 index.html <body> 下（不是 #app 内）—— #app 的
+ * flex / overflow 布局与它无关，render() 的 DOM 增删也动不到它。
+ *
+ * **它自己带 backdrop-filter**：让哨兵是一个真正的 backdrop-filter 元素
+ * 且持续被 invalidation —— 走的正是旧版"每卡心跳"完全相同的机制，只是
+ * 数量从 N 降到 1。1px² 的 blur + saturate 成本可忽略，采样结果被
+ * opacity 0.001 压到肉眼不可见。
+ *
+ * ⚠️ 这里**刻意不写 var(--tile-blur)**：瓦片变量定义在 #app 规则上，哨兵
+ * 是 #app 的兄弟节点 → 继承不到 → var() 无效会让 backdrop-filter 计算成
+ * none（等于没加）。数值本身无所谓（1px² + 0.001 alpha），写死即可。 */
+.glass-keepalive {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0.001;
+  pointer-events: none;
+  z-index: -1;
+  will-change: transform;
+  backdrop-filter: blur(10px) saturate(180%);
+  -webkit-backdrop-filter: blur(10px) saturate(180%);
   animation: usticky-backdrop-heartbeat 4s linear infinite;
-}
-
-/* **v0.2.8 交互态暂停心跳**（拖拽/删除动画"瞬移感"的根因修复）：
- *
- * CSS 级联里正在运行的 animation 对它声明的属性（transform / opacity）
- * 的优先级**高于一切普通声明，包括 inline style**，且动画期间这些属性的
- * computed value 被锁死 → 同属性上的 transition 永不启动、inline 覆盖无效。
- * 后果（修复前全部"视觉死亡"，用户看到的是瞬移 = 卡顿感的主根因）：
- *   - SortableJS animate() 给**兄弟卡**写 inline transform（150ms 重排滑动）
- *     —— 被心跳 keyframes 的 transform 掩蔽，松手后所有卡瞬移到位
- *   - .dragging / .sortable-chosen 的 opacity 淡化 —— 被掩蔽
- *   - .vanishing 的 opacity 淡出 —— 被掩蔽（只剩高度塌缩）
- *
- * 解法：交互态（拖拽中 #app[data-drag-active] 由 main.ts onStart/onEnd 挂、
- * vanishing / dragging / sortable-chosen）暂停心跳。安全性：
- *   - 暂停/恢复只是 0.001deg / 0.001 alpha 的亚像素 snap，肉眼不可见
- *   - 拖拽 / 塌缩本身在持续改几何，layer 不会进 WKWebView ~2s 空闲节流
- *     窗口，玻璃防丢失（L2 的目的）不受影响 */
-.todo-card.vanishing,
-.todo-card.dragging,
-.todo-card.sortable-chosen,
-#app[data-drag-active] .todo-card {
-  animation: none;
 }
 
 /* L3: level 切换后 force reflow —— 由 main.ts 在收到
@@ -319,7 +366,11 @@ body[data-active] #app {
      视觉上从 idle 到 hover 是离散切；背景过渡走 ::before 的 opacity。
      **v0.2.8 perf**：border-color 也移出 transition —— hover 边沿 0→0.10
      alpha 的逐帧 border 重绘 ×N 卡是 paint 风暴的一部分，而 0.10 的离散
-     切换肉眼不可辨。transform/opacity 留给拖拽态（心跳暂停时才生效）。 */
+     切换肉眼不可辨。
+     **v0.2.10**：transform/opacity 过渡现在**常态生效** —— 卡片上已不再挂
+     任何 animation（心跳搬到窗口级哨兵），不存在"运行中的 animation 锁死
+     computed value"的问题：SortableJS 的 inline transform 归位滑动、拖拽
+     半透明、vanish 淡出都能正常走过渡。 */
   transition:
     transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
     opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1);
@@ -499,8 +550,10 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
   -webkit-backdrop-filter: none;
   /* **v0.2.8 perf**：transition 收窄到 max-height + opacity —— padding /
    * border-width 逐帧变化只会扩大每帧 invalidation 面积，离散切到 0 与
-   * 塌缩同步发生，肉眼无感。opacity 淡出依赖上面的 animation:none
-   * （心跳掩蔽修复）才真正生效。 */
+   * 塌缩同步发生，肉眼无感。
+   * **v0.2.10**：opacity 淡出**原生生效**，不再需要"交互态暂停心跳"的
+   * animation:none 补丁 —— 卡片上已无任何 animation，不会锁死 opacity 的
+   * computed value。 */
   transition:
     max-height 140ms cubic-bezier(0.22, 1, 0.36, 1),
     opacity 140ms cubic-bezier(0.22, 1, 0.36, 1);

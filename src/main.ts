@@ -473,15 +473,14 @@ const sortableOpts: Sortable.Options = {
   preventOnFilter: true,
   onStart: () => {
     isDragging = true;
-    // v0.2.8 卡顿修复：拖拽期间给 #app 挂 data-drag-active —— CSS 据此暂停
-    // 所有卡的心跳动画（animation 会掩蔽 inline transform，见 styles.css
-    // 心跳暂停段注释），SortableJS 的重排滑动动画（animate() 写 inline
-    // transform）和兄弟卡位移才真正"动起来"，不再瞬移。
-    app.dataset.dragActive = "1";
+    // v0.2.10：**不再需要** data-drag-active 暂停心跳 —— 心跳已从"每卡一个"
+    // 改为"窗口一个"哨兵（.glass-keepalive），卡片上不再挂任何 animation，
+    // 也就不会锁死 transform 的 computed value → SortableJS 的 inline
+    // transform 归位滑动（animate() 写 inline transform）天然生效，
+    // 不再有"松手后所有卡瞬移"的瞬移感。
   },
   onEnd: (evt) => {
     isDragging = false;
-    delete app.dataset.dragActive;
     void handleDragEnd(evt);
   },
 };
@@ -1695,7 +1694,6 @@ function cleanupSortables() {
   // onEnd 已经处理，但跨 webview 某些边界 / 异常路径可能遗漏），重置，
   // 不让后续 render 永久被挡。
   isDragging = false;
-  delete app.dataset.dragActive;
   // P2-6：拖拽期间被吞的 render 一次补掉。
   flushPendingRender();
 }
