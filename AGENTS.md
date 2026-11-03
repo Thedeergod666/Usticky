@@ -1,6 +1,6 @@
 # Usticky 项目说明
 
-> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.2.9（换行丢失根修：编辑态 textarea 化 + 多行粘贴走全文路径）/ 2026-10-27**。
+> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.2.10（玻璃心跳从「每卡一个」降为「窗口一个」哨兵）/ 2026-11-03 —— ⚠️ 在分支 `perf/window-keepalive-glass`，未合入 main，待用户视觉验收**。合入前请读 v0.2.10 段的验收清单。上一版已合入 main 的快照：**v0.2.9（换行丢失根修：编辑态 textarea 化 + 多行粘贴走全文路径）/ 2026-10-27**。
 
 ## 这是什么
 
@@ -504,10 +504,58 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 
 **构建验证**：`pnpm build`（tsc + vite）✓（本轮无 Rust 改动）。
 
+### v0.2.10（2026-11-03，玻璃心跳从「每卡一个」降为「窗口一个」哨兵）⚠️ **未合入 main，在分支 `perf/window-keepalive-glass`（commit 5330edf）**
+
+> **状态**：分支已推 origin，代码完整、`pnpm build` 通过，但**用户尚未做视觉验收**（本环境无法截图）。下一个 agent 的第一件事是跑 `pnpm tauri dev` 按下面的验收清单验证。
+> 被否决的旧方案留在 `perf/single-glass-panel`（commit b334114，已推 origin）—— **不要合它**，理由见下。
+
+**触发**：用户反馈"总是有卡顿感"，并提过"有个新 todo 的想法"（**至今未说明**）。诊断后先试了"整窗单面板"（`perf/single-glass-panel`），用户实测：**动效确实丝滑多了，没有卡顿感**，但暴露三个视觉回归 —— ①未 hover 时底部一大片背景模糊留白 ②hover 后玻璃覆盖不足（底边 95px 无玻璃 + 固定面板不跟随滚动内容）③**卡间透明缝隙消失**（原来"圆角胶囊 + 透明间隙"的观感没了）。用户明确问"能改回来吗"。
+
+**根因澄清（关键，别被"单面板"这个表象带跑）**：卡顿感其实是**两个独立原因**，整窗单面板只是把两个都顺手绕过去了：
+
+1. **GPU 风暴（O(N)）**：旧实现每张卡各挂一份心跳动画（`transform`/`opacity` 0.001° 亚像素微动）。N 个持续动画的合成层 → **每帧 N 次 backdrop 重采样**。卡一多就掉帧。= v0.2.8 经验 ⑨。
+2. **掩蔽交互动画（这是"瞬移感"的真凶）**：v0.2.8 经验 ⑦ —— **运行中的 CSS `animation` 对它声明属性的优先级高于一切普通声明，包括 inline style，且动画期间该属性的 computed value 被锁死**。心跳 keyframes 声明了 `transform` → SortableJS 归位时写的 **inline `transform`**（150ms 重排滑动）被完全掩蔽 → **松手后所有卡瞬移到位**。v0.2.8 用"交互态暂停心跳"打了补丁，但那只覆盖拖拽**进行中**，松手后的**归位滑动**仍被掩蔽。
+
+⚠️ **推论：用户感受到的"丝滑"主要来自原因 2，不是来自"采样层数从 N 变 1"。** 所以正解不是"砍成一块玻璃"，而是"**砍掉卡片上的动画**"。
+
+**最终架构（v0.2.10）**：**逐卡玻璃 + 窗口级心跳哨兵**
+
+| 层 | 位置 | 机制 | v0.2.10 变化 |
+|---|---|---|---|
+| L1 | `styles.css` `.todo-card/.todo-input/.todo-paste-btn` | `will-change: backdrop-filter` → 独立 GPU layer，不进层级空闲节流 | **不变**（逐卡保留）|
+| L2 | `styles.css` `.glass-keepalive` + `index.html` | **窗口级** 1px 哨兵，持续微动 → 合成器永不空闲 → 全部瓦片的 backdrop 采样一起被保住 | **改**：从"每卡一个"降为"窗口一个" |
+| L3 | `macos.rs` `set_window_level` → `usticky://backdrop-refresh` | level 切换后 force reflow 立即重采 | **不变**（仍只刷视口内可见卡）|
+
+- **心跳不再挂在卡片上** → 卡片上**零 `animation`** → 没有任何属性被锁死 → SortableJS 的 inline transform 归位滑动、`.dragging`/`.sortable-chosen` 的 opacity 淡化、`.vanishing` 的淡出**全部原生生效**。v0.2.8 那套"交互态暂停心跳"补丁连同 `main.ts` 的 `data-drag-active`（3 处）**整套退役**。
+- **成本 O(N) → O(1)**：每帧只重采样 1 个 1px² 层，而不是 N 个卡片层。
+- **哨兵节点**：`<body>` 下 `<div class="glass-keepalive">`（`index.html`），`position: fixed` → 相对浮窗视口，不受 `#app` 滚动 / `render()` 的 DOM 增删影响。**刻意不用 `var(--tile-blur)`** —— 瓦片变量定义在 `#app` 规则上，哨兵是 `#app` 的兄弟节点继承不到，`var()` 无效会让 `backdrop-filter` 计算成 `none`（等于没加）。哨兵自己带 `backdrop-filter: blur(10px) saturate(180%)`，让它是**真正的 backdrop-filter 元素且持续被 invalidation** —— 走的正是旧版"每卡心跳"完全相同的机制，只是数量 1 个。
+
+**为什么保留逐卡玻璃（否决整窗单面板）**：单块连续玻璃在物理上**切不出卡间的透明缝隙** —— 模糊必须逐瓦片才能挖出缝，这是"圆角胶囊 + 透明间隙"观感的唯一来源。同理，单面板会盖住 done 段的保留区（`visibility:hidden` 但仍占布局高度）→ 就是用户看到的"大面积模糊留白"。
+
+**改动文件**：`index.html`（+9 哨兵节点）、`src/styles.css`（心跳搬家 + 删"交互态暂停心跳"整段 + 3 处 stale 注释）、`src/main.ts`（删 `data-drag-active` ×3）。
+
+**验收清单（下一个 agent / 用户跑）**：
+1. `pnpm tauri dev` → 未 hover：卡片是**独立胶囊**，**卡间是透明缝**（能看清桌面），**底部 done 保留区不铺玻璃**（不该有大片模糊）。
+2. hover：done 段显形，每张卡各自带玻璃，**卡间仍留缝**，滚动到底**每张卡都还有玻璃**（不该有未玻璃的底边带）。
+3. **静置 10s 玻璃不消失**（L2 哨兵是否真能保住其它卡片的采样 —— 这是本方案唯一未经验证的关键假设：节流是**窗口级**判定，若实际是元素级，玻璃仍会在 ~2s 后掉，需回退方案见下）。
+4. 拖拽排序：松手后卡片是**滑动**归位，不是瞬移（验证原因 2 已修）。
+5. 标记完成：卡片淡出 + 塌缩，**有淡出**不是直接消失（v0.2.8 被掩蔽的老问题）。
+6. 低电量模式：玻璃整体关闭（`body[data-low-power] *` 的 `animation:none` + `backdrop-filter:none` 覆盖哨兵，此时无玻璃可保，无副作用）。
+
+**若第 3 条失败（玻璃 2s 后掉）**：说明节流是元素级而非窗口级。备选（按代价排序）—— ①把哨兵从 1px 放大成**覆盖整个窗口的隐形 backdrop-filter 面板**（`opacity:0.001`，仍 O(1) 层但 blur 面积大）；②恢复逐卡心跳，但**只动画 `opacity` 不动画 `transform`**（避开经验 ⑦ 的掩蔽，代价是 opacity 过渡也被锁 → 需另想办法）；③回到 `perf/single-glass-panel` 并接受视觉回归。
+
+**后续候选**（未做）：原生 `windowEffects`（macOS `NSVisualEffectView` / Win11 Acrylic）可把整套 CSS 玻璃 workaround 删掉，但**同样是整窗矩形模糊 → 同样切不出卡间缝**，与"逐卡玻璃"目标冲突，需先决定是否放弃缝隙观感；`prefers-reduced-motion` 支持（v0.2.7 P2 遗留）。
+
+**经验沉淀**：⑪ **"降采样成本"和"降动画数量"是两件事，别用前者换后者** —— 单面板方案省下了采样层数，代价是丢了逐瓦片才有的视觉特性；而卡顿感的另一半（animation 掩蔽 inline style）跟采样层数毫无关系。⑫ **CSS animation 掩蔽 inline style 的连带效应**：任何"保活"用的常驻动画，如果声明了 transform/opacity，就会连带禁掉该元素上一切依赖 inline style 的第三方动画（SortableJS 的 animate() 就是典型）。保活动画应该挂在一个**专用的、不参与任何交互**的哨兵元素上。⑬ **backdrop-filter 的节流是窗口级还是元素级，决定了保活方案能不能"只做一个"** —— 本项目的判断是窗口级（依据：玻璃是**整窗同时**丢失的、backing store 是窗口级资源），但**尚未实测验证**。
+
+**构建验证**：`pnpm build`（tsc + vite）✓（本轮无 Rust 改动）。
+
 ### 仍未做
 
 ⏳ **Cmd+Z 撤销栈**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 已占位 keydown listener，TODO 未实现，v0.2 候选）
 ⏳ **tray 图标任务数 badge**（v0.1 是静态图标 `tray-base.png`，v0.2 候选）
+⏳ **用户提过的"新 todo 想法"**（2026-11-03 起说了两次，**始终未说明内容**）—— 下次和用户对话时**先问清楚**再动手，别自行猜测实现
+⏳ **v0.2.10 玻璃方案视觉验收**（分支 `perf/window-keepalive-glass`）—— 见 v0.2.10 段验收清单 6 条；未验收前不合 main
 
 ## 发版（v0.2.0 起，2026-07-21）
 
