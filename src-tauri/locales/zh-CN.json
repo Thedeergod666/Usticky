@@ -8,9 +8,6 @@
       "no_attachments_dir": "附件目录不可用",
       "unsupported_locale": "不支持的语言",
       "shortcut_no_modifier": "快捷键必须包含至少一个修饰键（Ctrl / Alt / Shift / Cmd）"
-    },
-    "paste": {
-      "image_title": "📎 图片"
     }
   },
   "window": {

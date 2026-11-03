@@ -46,7 +46,8 @@
 
 /* L1: will-change —— 每个玻璃元素独立 GPU layer */
 .todo-card,
-.todo-input {
+.todo-input,
+.todo-paste-btn {
   will-change: backdrop-filter;
 }
 
@@ -81,6 +82,29 @@
 .todo-input,
 .todo-paste-btn {
   animation: usticky-backdrop-heartbeat 4s linear infinite;
+}
+
+/* **v0.2.8 交互态暂停心跳**（拖拽/删除动画"瞬移感"的根因修复）：
+ *
+ * CSS 级联里正在运行的 animation 对它声明的属性（transform / opacity）
+ * 的优先级**高于一切普通声明，包括 inline style**，且动画期间这些属性的
+ * computed value 被锁死 → 同属性上的 transition 永不启动、inline 覆盖无效。
+ * 后果（修复前全部"视觉死亡"，用户看到的是瞬移 = 卡顿感的主根因）：
+ *   - SortableJS animate() 给**兄弟卡**写 inline transform（150ms 重排滑动）
+ *     —— 被心跳 keyframes 的 transform 掩蔽，松手后所有卡瞬移到位
+ *   - .dragging / .sortable-chosen 的 opacity 淡化 —— 被掩蔽
+ *   - .vanishing 的 opacity 淡出 —— 被掩蔽（只剩高度塌缩）
+ *
+ * 解法：交互态（拖拽中 #app[data-drag-active] 由 main.ts onStart/onEnd 挂、
+ * vanishing / dragging / sortable-chosen）暂停心跳。安全性：
+ *   - 暂停/恢复只是 0.001deg / 0.001 alpha 的亚像素 snap，肉眼不可见
+ *   - 拖拽 / 塌缩本身在持续改几何，layer 不会进 WKWebView ~2s 空闲节流
+ *     窗口，玻璃防丢失（L2 的目的）不受影响 */
+.todo-card.vanishing,
+.todo-card.dragging,
+.todo-card.sortable-chosen,
+#app[data-drag-active] .todo-card {
+  animation: none;
 }
 
 /* L3: level 切换后 force reflow —— 由 main.ts 在收到
@@ -121,7 +145,9 @@ html, body {
   -webkit-user-select: none;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  text-rendering: optimizeLegibility;
+  /* v0.2.8 perf：optimizeLegibility 强制全文字 kerning/ligature 精确计算，
+   * 长列表逐帧布局（vanish 塌缩 / 拖拽重排）时不必要的 CPU 开销；auto 即可 */
+  text-rendering: auto;
 }
 
 /* ── 整窗容器 ── */
@@ -290,10 +316,11 @@ body[data-active] #app {
   box-shadow: var(--tile-shadow);
   /* ⚠️ 不 transition backdrop-filter / box-shadow —— 它们都是合成层重操作，
      在 Rust hover emitter 50ms tick 抖动时会反复插值 → 光标闪烁。
-     视觉上从 idle 到 hover 是离散切；背景过渡走 ::before 的 background-color
-     （不在这条 transition 里），border-color 保留。 */
+     视觉上从 idle 到 hover 是离散切；背景过渡走 ::before 的 opacity。
+     **v0.2.8 perf**：border-color 也移出 transition —— hover 边沿 0→0.10
+     alpha 的逐帧 border 重绘 ×N 卡是 paint 风暴的一部分，而 0.10 的离散
+     切换肉眼不可辨。transform/opacity 留给拖拽态（心跳暂停时才生效）。 */
   transition:
-    border-color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
     transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
     opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1);
   cursor: grab;
@@ -465,11 +492,18 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
   border-width: 1px;
   overflow: hidden;
   pointer-events: none;
+  /* **v0.2.8 perf**：塌缩期间退出玻璃采样 —— 140ms 里后续卡逐帧上移、
+   * 每个移动中的 backdrop-filter layer 都要重采样，正在消失的这张没
+   * 必要再占一份采样预算（它本来就在消失，视觉无感）。 */
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  /* **v0.2.8 perf**：transition 收窄到 max-height + opacity —— padding /
+   * border-width 逐帧变化只会扩大每帧 invalidation 面积，离散切到 0 与
+   * 塌缩同步发生，肉眼无感。opacity 淡出依赖上面的 animation:none
+   * （心跳掩蔽修复）才真正生效。 */
   transition:
     max-height 140ms cubic-bezier(0.22, 1, 0.36, 1),
-    padding 140ms cubic-bezier(0.22, 1, 0.36, 1),
-    opacity 140ms cubic-bezier(0.22, 1, 0.36, 1),
-    border-width 140ms cubic-bezier(0.22, 1, 0.36, 1);
+    opacity 140ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 /* 第二阶段：再触发一次 .vanishing-2 把 max-height → 0、opacity → 0。
  * JS 在 140ms 后挂这个 class 形成"两阶段"语义。*/
@@ -536,9 +570,11 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
    * "偏上"。压到 1 (13px text box) 后文字视觉中心贴近 checkbox 中心，
    * 单行卡片里"checkbox + 文字"整体更居中。 */
   line-height: 1;
-  /* ease-out-quint：开头快结尾稳 —— hover 进入时颜色"马上出现然后平滑过渡" */
-  transition: color 0.22s cubic-bezier(0.22, 1, 0.36, 1),
-              text-shadow 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+  /* ease-out-quint：开头快结尾稳 —— hover 进入时颜色"马上出现然后平滑过渡"。
+   * **v0.2.8 perf**：text-shadow 移出 transition —— 带 2px blur 的文字阴影
+   * 逐帧重栅格化是 hover 边沿最贵的逐帧 paint（×N 卡 ×~13 帧）。idle 的
+   * 阴影本来极弱且背景 alpha 同时在渐变，shadow 离散消失不可感知。 */
+  transition: color 0.22s cubic-bezier(0.22, 1, 0.36, 1);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -547,10 +583,15 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
 /* v0.2：hover-expand（.title-expanded 换行展开）已退役，由 QuickLook 预览窗
  * （preview.html webview）替代 —— hover 长文不再把卡变长，dwell 后弹预览。 */
 
-/* ── 编辑态 input（替换 .todo-title，in-place 编辑） ──
+/* ── 编辑态 textarea（替换 .todo-title，in-place 编辑） ──
  *
- * 跟 .todo-title 同尺寸 / 同字体（flex 1 1 auto + min-width: 0），保证
- * input 替换 title 时卡内其他元素（checkbox / due / delete）位置 0 抖动。
+ * **v0.2.9：控件从 <input type=text> 换成 <textarea rows=1>** —— text input
+ * 的 value sanitization 会剥掉 value 里全部 \n/\r（HTML 规范行为），多行
+ * 标题一进编辑态就永久丢换行（赋值即丢 + commit 把剥过的值写回磁盘）。
+ * textarea value 保留 \n；Enter 提交 / Shift+Enter 插入换行（main.ts）。
+ *
+ * 跟 .todo-title 同尺寸 / 同字体（flex 1 1 0 + min-width: 0），保证替换
+ * title 时卡内其他元素（checkbox / due / delete）位置 0 抖动。
  *
  * 视觉策略：透明背景 + 1px 弱边框 + focus 时蓝色描边，沿用 .todo-input
  * 的 focus-within 视觉语义，让用户一眼看出"现在处于编辑态"。不写
@@ -559,11 +600,20 @@ body:not([data-hover]):not([data-low-power]) .todo-card.done .todo-check {
  * 跟 .todo-title 的 font 完全一致 —— 字体跳变会让用户体感"被切走"，编辑
  * 文字字号 / 字重 / letter-spacing 必须 1:1 对齐。
  *
+ * textarea UA 默认三项必关（否则跟旧 input 不等高 / 长出拖角手柄）：
+ * margin: 0（UA 默认 2px 会顶歪基线）、resize: none（拖角手柄）、
+ * overflow: hidden + white-space: pre（单行编辑盒：长行水平内滚，多行
+ * 内容垂直裁切 —— 全文看预览窗，卡片保持紧凑单行）。
+ *
  * 已完成态（.todo-card.done）的 input：去掉 line-through（用户正在编辑，
  * 删除线是给"完成态显示"的标记，不应该污染输入体验）。 */
 .todo-edit-input {
   flex: 1 1 0; /* 同 .todo-title：flex-basis 0，与内联图片 .todo-thumb 1:1 各占一半宽 */
   min-width: 0;
+  margin: 0; /* textarea UA 默认 margin 2px */
+  resize: none; /* textarea UA 默认可拖角 resize */
+  overflow: hidden;
+  white-space: pre; /* textarea UA 默认 pre-wrap —— 1 行高的盒里换行环绕会把后续行裁没且无横向内滚 */
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.10);
   border-radius: 6px;
@@ -700,9 +750,9 @@ body[data-active] #app .todo-due.days     { color: var(--c-data-cyan);  backgrou
   border: 1px solid var(--tile-border);
   border-radius: 14px;
   box-shadow: var(--tile-shadow);
-  /* 不 transition backdrop-filter —— 同 .todo-card，防 hover emitter 抖动闪烁 */
-  transition:
-    border-color 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+  /* 不 transition backdrop-filter —— 同 .todo-card，防 hover emitter 抖动闪烁。
+   * **v0.2.8 perf**：border-color 移出（同 .todo-card，离散切换肉眼不可辨）。 */
+  transition: none;
 }
 .todo-input::before {
   content: "";
@@ -795,9 +845,9 @@ body[data-narrow="1"] .todo-input-hint {
   box-shadow: var(--tile-shadow);
   color: var(--text-faint);
   cursor: pointer;
-  transition:
-    border-color 0.18s cubic-bezier(0.22, 1, 0.36, 1),
-    color 0.15s ease-out;
+  /* **v0.2.8 perf**：border-color 移出 transition（同 .todo-card）；
+   * color 留给 :active 的即时反馈 */
+  transition: color 0.15s ease-out;
 }
 .todo-paste-btn::before {
   content: "";
@@ -876,9 +926,17 @@ body[data-narrow="1"] .todo-input-hint {
 /* ── todo-section-done：idle → hover 的透明度过渡 ──
  * idle 下整个 done section 渐变到 opacity: 0（见下方规则），
  * hover 回到 1。复用全局 cubic-bezier(0.22, 1, 0.36, 1) iOS spring，
- * 跟 .todo-card / .section-header 的色彩过渡节奏一致。 */
+ * 跟 .todo-card / .section-header 的色彩过渡节奏一致。
+ * **v0.2.8 perf**：配对 visibility —— opacity:0 只是不画，子卡仍带
+ * backdrop-filter + will-change + 无限心跳（心跳让 layer 永远"活着"，
+ * WebKit 不按空闲回收）→ idle（99% 的状态）下 N 张不可见 done 卡持续
+ * 占用 blur 合成预算，挤压 hover 过渡的 GPU 余量。visibility:hidden
+ * 让 WebKit 跳过其绘制/合成/命中测试；布局占位不变（0 跳位设计保留，
+ * scrollHeight 语义不受影响）。时序：淡出完（0.22s）才 hidden，hover
+ * 回来立即 visible（base 规则 delay 0），肉眼与纯 opacity 方案无差别。 */
 .todo-section-done {
-  transition: opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+  transition: opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+              visibility 0s linear 0s;
 }
 
 /* ── Done section header —— idle（未 hover）下完全透明 ──
@@ -911,6 +969,10 @@ body:not([data-hover]):not([data-low-power]) .section-header-done {
 body:not([data-hover]):not([data-low-power]) .todo-section-done {
   opacity: 0;
   pointer-events: none;
+  /* v0.2.8：见上方 .todo-section-done 注释 —— visibility 延迟到淡出完成 */
+  visibility: hidden;
+  transition: opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+              visibility 0s linear 0.22s;
 }
 
 /* ── 空态 ── */

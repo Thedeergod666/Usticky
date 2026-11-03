@@ -69,6 +69,12 @@ function attachmentUrl(file: string): string | null {
   return convertFileSrc(attachmentsDir + sep + file);
 }
 let lastRenderedSnap: TodoSnapshot | null = null;
+/// **v0.2.8 扩展性**：最近一次 todos-changed 的快照。浮窗 hidden（tray 收起 /
+/// quick-add hide / 切走 app）期间 todos-changed 跳过 render（预览窗编辑等
+/// 场景每次 CRUD 都跑全量 diff 是白烧 —— 没人看得见），show 时用这份补一次。
+/// 与 lastRenderedSnap 的区别：后者只反映**已渲染进 DOM** 的状态。
+let latestSnap: TodoSnapshot | null = null;
+let renderPendingOnShow = false;
 let lastFitFingerprint: string | null = null;
 let sortableInstances: Sortable[] = [];  // 保存实例，cleanup 用
 let isDragging = false;  // 自己跟踪 SortableJS 拖拽状态（比 sortableInstances[i].dragEl 可靠，
@@ -86,12 +92,21 @@ const DUE_TICK_MS = 30_000;
 /// setInterval handle，beforeunload 清理。与上一段 refreshDueLabels 共用。
 let dueTickerId: ReturnType<typeof setInterval> | null = null;
 function refreshDueLabels() {
-  if (!lastRenderedSnap) return;
+  const snap = lastRenderedSnap;
+  if (!snap) return;
+  // v0.2.8：Map 一次建表（只收有 due 的），行内 O(1) 反查 —— 旧实现每行
+  // todos.find() 是 O(N²)，N=1k 每 30s ~1M 次比较、N=10k ~100M 次，ticker
+  // 一次就掉帧。Musage updateCountdowns 的纯 dataset 驱动是同方向的正面参照。
+  const byId = new Map<string, Todo>();
+  for (const t of snap.todos) {
+    if (t.due_at) byId.set(t.id, t);
+  }
+  if (byId.size === 0) return;
   const cards = document.querySelectorAll<HTMLElement>(".todo-card");
   for (const row of cards) {
     const id = row.dataset.todoId;
     if (!id) continue;
-    const todo = lastRenderedSnap.todos.find((t) => t.id === id);
+    const todo = byId.get(id);
     if (!todo || !todo.due_at) continue;
     const dueEl = row.querySelector<HTMLElement>(".todo-due");
     if (!dueEl) continue;
@@ -456,9 +471,17 @@ const sortableOpts: Sortable.Options = {
   fallbackOnBody: true,
   filter: NON_DRAGGABLE_SELECTORS,
   preventOnFilter: true,
-  onStart: () => { isDragging = true; },
+  onStart: () => {
+    isDragging = true;
+    // v0.2.8 卡顿修复：拖拽期间给 #app 挂 data-drag-active —— CSS 据此暂停
+    // 所有卡的心跳动画（animation 会掩蔽 inline transform，见 styles.css
+    // 心跳暂停段注释），SortableJS 的重排滑动动画（animate() 写 inline
+    // transform）和兄弟卡位移才真正"动起来"，不再瞬移。
+    app.dataset.dragActive = "1";
+  },
   onEnd: (evt) => {
     isDragging = false;
+    delete app.dataset.dragActive;
     void handleDragEnd(evt);
   },
 };
@@ -546,6 +569,10 @@ function render(snap: TodoSnapshot) {
 
   // 维持 .todo-list 子节点顺序：pendingHeader, pendingSection, doneHeader, doneSection
   orderListChildren(list);
+
+  // v0.2.8：本帧布局稳定后批量预测量 thumb 宽（rAF 单槽），hover 边沿
+  // 的 setCardHover 缓存全命中、零强制布局。
+  scheduleThumbPrefetch();
 
   // 输入中禁止 autoResize -- scrollHeight 跳变会打断输入（AGENTS.md #18）
   // 但"输入中"的判定是 input 有内容（正在打字），不是聚焦本身 --
@@ -644,18 +671,28 @@ function orderListChildren(list: HTMLElement) {
 ///   3. 摘孤儿（snap 里没有的）-- 孤儿若是当前 hover 卡就 reset
 ///   4. 顺序变了 -> 按 snap 顺序挪（快速路径：顺序一致跳过）
 function diffSection(section: HTMLElement, todos: Todo[]) {
-  const existing = new Map<string, HTMLElement>();
+  // **v0.2.8 多值 Map**（Musage 2026-09-07 同款防御）：后端 reorder/restore
+  // 均拒绝重复 id，但防御成本 ~5 行 —— 万一重复 id 逃进 DOM（异常路径），
+  // 单值 Map 会让第二个副本逃过孤儿清理永久残留；`shift()` 取用让每个
+  // 节点最多被复用一次，剩余的都是孤儿被摘掉。
+  const existing = new Map<string, HTMLElement[]>();
   section.querySelectorAll<HTMLElement>(".todo-card").forEach((el) => {
     const id = el.dataset.todoId;
-    if (id) existing.set(id, el);
+    if (!id) return;
+    const bucket = existing.get(id);
+    if (bucket) bucket.push(el);
+    else existing.set(id, [el]);
   });
 
   let anchor: HTMLElement | null = null;
   for (const todo of todos) {
-    let row = existing.get(todo.id);
-    if (row) {
-      existing.delete(todo.id);
-    } else {
+    let row: HTMLElement | undefined;
+    const bucket = existing.get(todo.id);
+    if (bucket && bucket.length > 0) {
+      row = bucket.shift();
+      if (bucket.length === 0) existing.delete(todo.id);
+    }
+    if (!row) {
       row = buildTodoRow(todo);
       if (anchor) {
         section.insertBefore(row, anchor.nextSibling);
@@ -669,10 +706,12 @@ function diffSection(section: HTMLElement, todos: Todo[]) {
 
   // 摘孤儿。若孤儿正是当前 hover 卡 -> reset hover + 取消 dwell
   // （节点没了，dwell 闭包的 card 会变 detached）。
-  for (const orphan of existing.values()) {
-    const orphanId = orphan.dataset.todoId;
-    if (orphanId) forgetHoverForId(orphanId);
-    orphan.remove();
+  for (const bucket of existing.values()) {
+    for (const orphan of bucket) {
+      const orphanId = orphan.dataset.todoId;
+      if (orphanId) forgetHoverForId(orphanId);
+      orphan.remove();
+    }
   }
 
   // 重排（快速路径：顺序一致就跳过，不触发 reflow）
@@ -806,7 +845,15 @@ function updateTodoRow(row: HTMLElement, todo: Todo) {
   }
   const check = refs.check;
   if (check) {
-    check.title = todo.status === "done" ? t("app.action.undo") : t("app.action.complete");
+    // **v0.2.8**：原 `check.title = ...` 是浮窗内最后一个残留的原生 tooltip
+    // （v0.2.1 规则的漏网之鱼，hover 1s 会弹白色小条），换 aria-label +
+    // 同值守卫（旧实现每次 render 每行无条件重写）。
+    const label = todo.status === "done"
+      ? t("app.action.undo")
+      : t("app.action.complete");
+    if (check.getAttribute("aria-label") !== label) {
+      check.setAttribute("aria-label", label);
+    }
   }
 
   const titleEl = row.querySelector<HTMLElement>(".todo-title");
@@ -840,8 +887,11 @@ function updateTodoRow(row: HTMLElement, todo: Todo) {
     thumb.remove();
   }
 
-  // title 文本
-  if (titleEl) titleEl.textContent = todo.title;
+  // title 文本（v0.2.8 同值守卫：同值 textContent 赋值仍替换文本节点、
+  // 无谓 dirty layout，10k 规模下每次 render 万次写）
+  if (titleEl && titleEl.textContent !== todo.title) {
+    titleEl.textContent = todo.title;
+  }
 
   // due 标签（title 与 actions 之间）：有则建 / 更新，无则摘
   const actions = refs.actions;
@@ -849,14 +899,15 @@ function updateTodoRow(row: HTMLElement, todo: Todo) {
   let due = row.querySelector<HTMLElement>(".todo-due");
   if (todo.due_at) {
     const { text, cls } = dueLabel(todo.due_at);
+    const newClass = `todo-due ${cls}`;
     if (!due) {
       due = document.createElement("div");
-      due.className = `todo-due ${cls}`;
+      due.className = newClass;
       due.textContent = text;
       row.insertBefore(due, actions);
     } else {
-      due.className = `todo-due ${cls}`;
-      due.textContent = text;
+      if (due.className !== newClass) due.className = newClass;
+      if (due.textContent !== text) due.textContent = text;
     }
   } else if (due) {
     due.remove();
@@ -1133,6 +1184,30 @@ function setCardHover(card: HTMLElement, on: boolean) {
   }
 }
 
+/// **v0.2.8 布局抖动修复**：render / resize 后在**一个 rAF 里批量预测量**
+/// 所有卡片的 thumb 宽，填满 thumbWidthCache —— 之后聚焦路径扫卡时
+/// setCardHover 缓存全命中，hover 边沿零 `offsetWidth` 强制布局读。
+/// 旧实现：首次扫一遍全新列表每卡边界各 flush 一次 layout（resize 后
+/// 代际 bump 全体 miss 更是逐卡读）；现在一次 layout 换 N 次 hover 零读。
+let thumbPrefetchRaf: number | null = null;
+function scheduleThumbPrefetch(): void {
+  if (thumbPrefetchRaf !== null) return;
+  thumbPrefetchRaf = requestAnimationFrame(() => {
+    thumbPrefetchRaf = null;
+    const cards = app.querySelectorAll<HTMLElement>(".todo-card");
+    for (const card of cards) {
+      if (thumbWidthGeneration.get(card) === currentThumbGeneration) continue;
+      const thumb = card.querySelector<HTMLElement>(".todo-thumb");
+      if (!thumb) continue;
+      const w = thumb.offsetWidth;
+      if (w > 0) {
+        thumbWidthCache.set(card, w);
+        thumbWidthGeneration.set(card, currentThumbGeneration);
+      }
+    }
+  });
+}
+
 /// 进入卡片 hover：挂 .card-hover（操作按钮显隐）+ 立即出/切预览。
 /// 聚焦窗口走 mouseenter，未聚焦走 Rust hover-pos（同一状态机）。
 function hoverCard(card: HTMLElement) {
@@ -1267,8 +1342,9 @@ function newTempTodo(title: string): Todo {
     updated_at: Date.now(),
     due_at: null,
     tags: [],
-    // order 推到最末：避免真实 todo（order 从后端取）覆盖后位置跳变
-    order: Number.MAX_SAFE_INTEGER,
+    // order 与后端一致推到段首（v0.2.8 置顶语义；order 实际不参与排序，
+    // 仅与后端 add 的 min-1 语义保持注释一致）。
+    order: Number.MIN_SAFE_INTEGER,
     attachment: null,
   };
 }
@@ -1283,13 +1359,21 @@ async function addTodo(title: string): Promise<boolean> {
     showMiniFlash(t("app.error.too_long", { max: 114514 }));
     return false;
   }
-  // A3：本地立即插入 temp todo，render 走 keyed diff 加到末尾。input 由调用方
+  // A3：本地立即插入 temp todo，render 走 keyed diff。input 由调用方
   // 在调 addTodo 之前已清空（Enter handler 已切到不 await 模式）。
+  // **v0.2.8 置顶对齐**：temp 插到第一个 pending 前（无 pending 则 index 0）
+  // —— 后端 add 现在也是置顶，乐观位置与回流位置一致，不会"先底后顶"跳行。
   const temp = newTempTodo(trimmed);
   if (lastRenderedSnap) {
+    const firstPending = lastRenderedSnap.todos.findIndex((td) => td.status === "pending");
+    const at = firstPending === -1 ? 0 : firstPending;
     lastRenderedSnap = {
       ...lastRenderedSnap,
-      todos: [...lastRenderedSnap.todos, temp],
+      todos: [
+        ...lastRenderedSnap.todos.slice(0, at),
+        temp,
+        ...lastRenderedSnap.todos.slice(at),
+      ],
     };
     render(lastRenderedSnap);
   }
@@ -1611,6 +1695,7 @@ function cleanupSortables() {
   // onEnd 已经处理，但跨 webview 某些边界 / 异常路径可能遗漏），重置，
   // 不让后续 render 永久被挡。
   isDragging = false;
+  delete app.dataset.dragActive;
   // P2-6：拖拽期间被吞的 render 一次补掉。
   flushPendingRender();
 }
@@ -1633,7 +1718,7 @@ function cleanupSortables() {
 // 参数，commands/mod.rs line 81-100 直接复用。
 function enterEditMode(card: HTMLElement, todo: Todo) {
   // 已有 input 在编辑（防御性 —— 多次快速点击）
-  if (card.querySelector("input.todo-edit-input")) return;
+  if (card.querySelector("textarea.todo-edit-input")) return;
 
   // **P1-4 fix（2026-09-04 全量审查）**：跨 section 编辑切换 → 前一张
   // 卡片的 input 永久残留 + Sortable 永久 disabled。旧实现只查新 card 的
@@ -1643,7 +1728,7 @@ function enterEditMode(card: HTMLElement, todo: Todo) {
   // exitEditMode 时 restoreSortableForCard 只恢复 B → A 永久卡住直到用户
   // 再进 A 编辑再退。修：进入新编辑前先扫所有 .todo-edit-input 找旧编辑态
   // 调 commitAndExit 保存内容走 update_todo 路径，失败则按 input 当前值保留。
-  const allEditingInputs = app.querySelectorAll<HTMLInputElement>("input.todo-edit-input");
+  const allEditingInputs = app.querySelectorAll<HTMLTextAreaElement>("textarea.todo-edit-input");
   if (allEditingInputs.length > 0) {
     for (const oldInput of Array.from(allEditingInputs)) {
       const oldCard = oldInput.closest<HTMLElement>(".todo-card");
@@ -1669,10 +1754,18 @@ function enterEditMode(card: HTMLElement, todo: Todo) {
     if (sortInstance) sortInstance.option("disabled", true);
   }
 
-  const input = document.createElement("input");
-  input.type = "text";
+  // **v0.2.9 换行丢失根修**：编辑控件必须是 textarea，不能是
+  // <input type=text> —— HTML 规范的 value sanitization 会剥掉 text input
+  // value 里的全部 \n/\r（赋值 / 粘贴 / 拖入都逃不掉）。多行 todo（粘贴
+  // 按钮 / 预览窗创建的）一点进浮窗编辑，input.value = todo.title 瞬间
+  // 失换行；此后 next !== todo.title 恒真，用户什么都没改，blur/Enter 提交
+  // 就把剥掉换行的版本 update_todo 写回磁盘 = 静默数据丢失。textarea 的
+  // value 保留 \n；视觉上 rows=1 + 同 font/padding/border（见 styles.css
+  // .todo-edit-input 注释），与旧 input 等高。
+  const input = document.createElement("textarea");
   input.className = "todo-edit-input";
   input.maxLength = 114514;
+  input.rows = 1;
   input.value = todo.title;
   input.spellcheck = false;
   input.autocomplete = "off";
@@ -1736,7 +1829,11 @@ function enterEditMode(card: HTMLElement, todo: Todo) {
   };
 
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
+    // IME 守卫（对齐 preview.ts v0.2.7 P1）：候选词确认的 Enter 带
+    // isComposing / keyCode 229，不能触发 commit —— 否则 zh-CN 输入中按
+    // Enter 选词会提前提交半截组合文本。
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       e.stopPropagation();
       void commit();
@@ -1745,6 +1842,8 @@ function enterEditMode(card: HTMLElement, todo: Todo) {
       e.stopPropagation();
       cancel();
     }
+    // Shift+Enter：放行默认行为 = textarea 插入换行，随 commit 落盘。
+    // 卡片仍单行高（内部滚动），多行全文看预览窗。
   });
   // blur 提交 —— 注意：commit 内部 settled 检查避免重复触发
   // （cancel 后元素被移走，blur 仍可能在异步队列里派发）
@@ -1766,7 +1865,7 @@ function reenterEditOnFailure(card: HTMLElement, todo: Todo, value: string) {
     : null;
   const target = live ?? card;
   enterEditMode(target, todo);
-  const input = target.querySelector<HTMLInputElement>("input.todo-edit-input");
+  const input = target.querySelector<HTMLTextAreaElement>("textarea.todo-edit-input");
   if (input) {
     input.value = value;
     input.focus();
@@ -1776,7 +1875,7 @@ function reenterEditOnFailure(card: HTMLElement, todo: Todo, value: string) {
 /// 退出编辑态（恢复成显示态），不调 IPC。用于 commit 成功后本地先 revert
 /// 然后等待后端 emit 的 todos-changed 走完整重建。
 function exitEditMode(card: HTMLElement, newTitle: string) {
-  const input = card.querySelector<HTMLInputElement>("input.todo-edit-input");
+  const input = card.querySelector<HTMLTextAreaElement>("textarea.todo-edit-input");
   if (!input) {
     restoreSortableForCard(card);
     // P2-6：编辑期间被吞的 render 一次补掉。
@@ -1939,6 +2038,8 @@ async function init() {
       // **P3-1 fix**：resize 时 bump 代际，让 thumbWidthCache miss 重新测
       // thumb 宽（旧窗口下的缓存值与新窗口不符）。
       bumpThumbGeneration();
+      // v0.2.8：bump 后批量重测一遍（否则 resize 后首次扫卡逐卡 forced layout）
+      scheduleThumbPrefetch();
     })
     .then((fn) => (unlistenResized = fn))
     .catch((e) => console.error("[usticky] onResized failed", e));
@@ -1984,6 +2085,10 @@ async function init() {
       setHoverAttr(false);
       // 隐藏时清 active —— 切别 app 后不该留"假激活"
       clearActive();
+    } else if (renderPendingOnShow) {
+      // v0.2.8：hidden 期间被跳过的 todos-changed 在这里补一次
+      renderPendingOnShow = false;
+      if (latestSnap) render(latestSnap);
     }
   });
   // (b) 显形**不再** debounce —— 2026-07-08 fix：
@@ -2026,6 +2131,13 @@ async function init() {
   // ── IPC: 监听 todos-changed 事件 ──
   let unlistenTodos: UnlistenFn | null = null;
   listen<TodoSnapshot>("usticky://todos-changed", (e) => {
+    latestSnap = e.payload;
+    // v0.2.8：浮窗 hidden 时不渲染（省 N 卡 diff + autoResize 排程），show
+    // 时 visibilitychange 补。isEditing/isDragging 的守卫在 render 内部照常生效。
+    if (document.visibilityState === "hidden") {
+      renderPendingOnShow = true;
+      return;
+    }
     render(e.payload);
   })
     .then((fn) => (unlistenTodos = fn))
@@ -2316,7 +2428,20 @@ async function init() {
   let unlistenBackdropRefresh: UnlistenFn | null = null;
   listen("usticky://backdrop-refresh", () => {
     if (backdropRefreshTimer !== null) clearTimeout(backdropRefreshTimer);
-    const targets = app.querySelectorAll<HTMLElement>(".todo-card, .todo-input, .todo-paste-btn");
+    // v0.2.8：只刷 **视口内可见** 的卡。force-reflow 对每个命中元素是 2 次
+    // backdrop 重采样（+1px / 归位），长列表滚出视口的卡刷了也看不见 ——
+    // 一次 rect 批量读（单次 layout flush，边沿触发非高频路径）过滤，
+    // N 卡列表的重采样开销压到可见集（~屏内 25-50 张）。
+    const appRect = app.getBoundingClientRect();
+    const targets = [...app.querySelectorAll<HTMLElement>(
+      ".todo-card, .todo-input, .todo-paste-btn",
+    )].filter((el) => {
+      if (el.classList.contains("todo-card")) {
+        const r = el.getBoundingClientRect();
+        return r.bottom >= appRect.top && r.top <= appRect.bottom;
+      }
+      return true; // 输入瓦片 / 粘贴键常驻顶部，恒刷
+    });
     targets.forEach((el) => el.classList.add("force-reflow"));
     backdropRefreshTimer = setTimeout(() => {
       backdropRefreshTimer = null;
@@ -2972,8 +3097,16 @@ function ensureInputBar() {
   // 并把已键入的文字当图片 todo 的标题传进去；纯文本则放行默认插入 input。
   // 仅在 input 聚焦时触发（窗口此时是 key window，paste 事件可靠） -- 未聚焦
   // 浮窗的粘贴仍由粘贴按钮兜底（后端读剪贴板无焦点要求）。
+  //
+  // **v0.2.9 换行丢失修复（创建路径）**：多行文本也不能放行 —— WebKit 往
+  // text input 默认粘贴插入会把 \n 剥成空格，用户粘多行文本落盘的 todo 就
+  // 没了换行。检测到 \n：preventDefault，已键入文字作第一行 + 粘贴文本拼接
+  // 走 addTodo（后端 validate_title 只 trim 首尾，内部换行原样保留）。单行
+  // 放行默认插入。失败回填只回填已键入文字（input 存不了 \n），粘贴部分
+  // 仍在剪贴板可重试。
   input.addEventListener("paste", (e) => {
-    const items = e.clipboardData?.items;
+    const dt = e.clipboardData;
+    const items = dt?.items;
     if (!items) return;
     let hasImage = false;
     for (let i = 0; i < items.length; i++) {
@@ -2982,7 +3115,21 @@ function ensureInputBar() {
         break;
       }
     }
-    if (!hasImage) return; // 纯文本 -> 走默认插入 input
+    if (!hasImage) {
+      const text = (dt.getData("text/plain") ?? "").replace(/\r\n?/g, "\n");
+      if (!text.includes("\n") || !text.trim()) return; // 单行/纯空白 -> 默认插入
+      e.preventDefault();
+      const typed = input.value.trim();
+      const combined = (typed ? typed + "\n" : "") + text.trim();
+      const prevValue = input.value;
+      input.value = "";
+      pastePending = true; // 期间 Enter handler 跳过（同图片分支防双建）
+      void addTodo(combined).then((ok) => {
+        pastePending = false;
+        if (!ok && !input.value) input.value = prevValue;
+      });
+      return;
+    }
     e.preventDefault();
     const typed = input.value.trim();
     pastePending = true; // P3-22：期间 Enter handler 跳过

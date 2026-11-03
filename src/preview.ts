@@ -231,6 +231,54 @@ function ensureSkeleton() {
     setTimeout(() => scheduleFit(), 0);
   });
   textarea.addEventListener("change", () => scheduleFit());
+  // **v0.2.8 预览窗粘图**：textarea 聚焦时 Cmd+V 且剪贴板含图片 → 把图片
+  // **附加到当前 todo**（替换旧附件），而不是新建一个 todo —— 用户在详情框
+  // 编辑时贴截图，期望"贴到这个任务上"。纯文本粘贴走默认插入，行为不变。
+  // 与 main.ts 输入框 paste 监听同款模式（items 扫 image/* → preventDefault
+  // → 走后端读 OS 剪贴板）。paste 只在窗口为 key window 时可靠派发 ——
+  // textarea 聚焦即满足。
+  textarea.addEventListener("paste", (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    let hasImage = false;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.startsWith("image/")) {
+        hasImage = true;
+        break;
+      }
+    }
+    if (!hasImage) return; // 纯文本 → 默认插入
+    e.preventDefault();
+    const id = currentTodoId;
+    if (!id) return;
+    void (async () => {
+      try {
+        const todo = await invoke<Todo>("paste_image_to_todo", { todoId: id });
+        // todos-changed listener 只回填 textarea 不重渲染图片（init 内注释），
+        // 这里拿 invoke 返回的完整 Todo 直接 render —— img load 监听自动
+        // scheduleFit 按新图宽高比调窗高。render 对聚焦中的 textarea 不回填
+        // value，未保存的编辑不受影响。
+        render(todo);
+        flashHint(hintEl, t("app.paste.flash_image"));
+      } catch (err) {
+        const s = String(err);
+        const hint = hintEl ?? appEl.querySelector<HTMLElement>(".preview-hint");
+        if (hint) {
+          hint.textContent = s.includes("no_image") || s.includes("empty")
+            ? t("app.paste.no_image")
+            : t("app.paste.failed");
+          if (!(s.includes("no_image") || s.includes("empty"))) {
+            hint.classList.add("error");
+            console.error("[preview] paste_image_to_todo failed", err);
+          }
+          setTimeout(() => {
+            hint.classList.remove("error");
+            hint.textContent = hintRestingText();
+          }, 2000);
+        }
+      }
+    })();
+  });
   textarea.addEventListener("focus", () => {
     if (!isPinned && currentTodoId) {
       emit("usticky://preview-editing", { id: currentTodoId }).catch(() => {});

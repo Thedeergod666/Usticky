@@ -102,6 +102,109 @@ fn notify_geom_changed() {
     geom_notify().notify_one();
 }
 
+/// 显示器几何快照（物理 px）：全屏 bounds + work_area（扣菜单栏/Dock）。
+/// 从 `tauri::Monitor` 抽成纯数据，让 [`clamp_restore_pos`] 可脱离
+/// AppHandle 单测。
+#[derive(Clone, Copy, Debug)]
+struct MonitorRect {
+    /// 全屏矩形（x, y, w, h，含菜单栏/Dock 区域）—— 点命中 / 最近屏判定用
+    bounds: (i32, i32, i32, i32),
+    /// 可视区矩形（同序）—— 最终 clamp 用（P0-5 同款语义，防菜单栏/Dock 遮）
+    work: (i32, i32, i32, i32),
+}
+
+/// **v0.2.9 fix（双屏重启后浮窗骑在两屏交界处）**：多屏感知的启动位置恢复。
+///
+/// 旧实现把保存的 (x, y) clamp 到**主显示器**边界 —— 本意是"副屏拔了别把
+/// 窗口扔屏外"，但它不认识副屏：窗口上次合法地在副屏（坐标超出主屏范围），
+/// 重启后 `x.clamp(主屏区间)` 强行把它拉到主屏边缘，恰好落在双屏并排的
+/// **交界处**。正确语义：
+///   1. 保存坐标仍落在某块显示器**全屏矩形**内 → 恢复到那块屏
+///   2. 所有屏都不包含该点（上次用的屏被拔 / 排列变了）→ 选**最近**的屏
+///      （点 clamp 进各屏矩形算距离平方取最小）
+///   3. monitors 为空（极端：API 失败）→ 返 None，调用方放弃 clamp 用原坐标
+///   4. 无论哪条路径命中，最终都按**整窗收纳** clamp：窗口 (win_w × win_h)
+///      放得下时保证**整窗**在该屏 work_area 内（左上角右界 = work 右界 -
+///      win_w）；放不下（窗口比屏宽/高）才退化为"至少
+///      [`RESTORE_MIN_VISIBLE_PX`] 可见"。
+///      —— 第 4 条是首版修复的回归补丁：首版只保证左上角 60px 可见，
+///      窗口实际 240-300px 宽，被钉在"屏右缘-60"后其余 240px 悬在屏外
+///      没有显示器的空间里，用户看到的就是一条 ~35px 的"竖条"贴屏幕边。
+///      整窗收纳同时治好"重启后骑在双屏缝上"的原始场景（左上角在 A 屏
+///      但窗口伸进 B 屏 → 恢复时整窗拉回 A 屏）。
+const RESTORE_MIN_VISIBLE_PX: i32 = 60;
+fn clamp_restore_pos(
+    monitors: &[MonitorRect],
+    x: i32,
+    y: i32,
+    win_w: i32,
+    win_h: i32,
+) -> Option<(i32, i32)> {
+    if monitors.is_empty() {
+        return None;
+    }
+    // 1. 点命中判定（半开区间，右/下缘不属本屏 —— 并排屏共享边缘坐标）
+    let hit = monitors.iter().position(|m| {
+        let (rx, ry, rw, rh) = m.bounds;
+        x >= rx && x < rx.saturating_add(rw) && y >= ry && y < ry.saturating_add(rh)
+    });
+    // 2. 都不命中 → 最近屏
+    let idx = hit.or_else(|| {
+        monitors
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, m)| {
+                let (rx, ry, rw, rh) = m.bounds;
+                let dx = x.clamp(rx, rx.saturating_add(rw).saturating_sub(1)) - x;
+                let dy = y.clamp(ry, ry.saturating_add(rh).saturating_sub(1)) - y;
+                dx * dx + dy * dy
+            })
+            .map(|(i, _)| i)
+    })?;
+    // 3. 整窗收纳 clamp（见 doc comment 第 4 条）。win_w/h 非正（调用方
+    //    拿不到尺寸）时按 0 处理 —— 区间退化为 [wx, wx+ww]，效果等于
+    //    只约束左上角在屏内，不会 panic。
+    let (wx, wy, ww, wh) = monitors[idx].work;
+    let max_dx = if win_w > 0 && win_w <= ww {
+        ww - win_w
+    } else {
+        (ww - RESTORE_MIN_VISIBLE_PX).max(0)
+    };
+    let max_dy = if win_h > 0 && win_h <= wh {
+        wh - win_h
+    } else {
+        (wh - RESTORE_MIN_VISIBLE_PX).max(0)
+    };
+    Some((
+        x.clamp(wx, wx.saturating_add(max_dx)),
+        y.clamp(wy, wy.saturating_add(max_dy)),
+    ))
+}
+
+/// 从 AppHandle 抽全部显示器的几何快照（setup 恢复用）。
+fn collect_monitor_rects(app: &tauri::AppHandle) -> Vec<MonitorRect> {
+    app.available_monitors()
+        .map(|ms| {
+            ms.iter()
+                .map(|m| {
+                    let p = m.position();
+                    let s = m.size();
+                    let wa = m.work_area();
+                    MonitorRect {
+                        bounds: (p.x, p.y, s.width as i32, s.height as i32),
+                        work: (
+                            wa.position.x,
+                            wa.position.y,
+                            wa.size.width as i32,
+                            wa.size.height as i32,
+                        ),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// **P2-8 fix**：浮窗几何 trailing-edge debounce 持久化后台循环。
 ///
 /// 用 `Notify` + `tokio::time::sleep` 的 trailing-edge debounce：
@@ -515,19 +618,32 @@ pub fn run() {
                     let s = store.blocking_read();
                     s.last_window_geom().clone()
                 };
-                // clamp 到主显示器范围内 —— 上次插着副屏、副屏拔了的话，
-                // 直接 set_position 会把窗口扔到屏幕外。
-                let mon = app.primary_monitor().ok().flatten();
-                let (mx, my, mw, mh) = mon
-                    .map(|m| {
-                        let s = m.size();
-                        let p = m.position();
-                        (p.x, p.y, s.width as i32, s.height as i32)
-                    })
-                    .unwrap_or((0, 0, 1920, 1080));
+                // **v0.2.9 fix（双屏重启后浮窗骑在两屏交界处）**：多屏感知恢复。
+                // 旧实现 clamp 到主显示器边界 —— 窗口上次在副屏（坐标超出
+                // 主屏范围）时，重启后被强行拉到主屏边缘 = 双屏交界处。
+                // 现在按"命中屏恢复 / 屏没了选最近屏 + **整窗收纳**进该屏
+                // work_area"的语义走 [`clamp_restore_pos`]（详见其 doc comment，
+                // 含首版"只保左上角 60px 可见 → 240px 宽窗口悬屏外露 35px
+                // 竖条"的回归补丁说明）。
+                let monitors = collect_monitor_rects(app.handle());
+                // 整窗收纳需要窗口尺寸：优先用持久化值（跟位置同一生命周期），
+                // 缺省退到当前 outer_size（窗口已按 config 默认尺寸建好）。
+                let (win_w, win_h) = match (geom.width, geom.height) {
+                    (Some(w), Some(h)) if w > 0 && h > 0 => (w as i32, h as i32),
+                    _ => window
+                        .outer_size()
+                        .map(|s| (s.width as i32, s.height as i32))
+                        .unwrap_or((300, 200)),
+                };
                 if let (Some(x), Some(y)) = (geom.x, geom.y) {
-                    let cx = x.clamp(mx.saturating_sub(50), mx + mw - 50);
-                    let cy = y.clamp(my.saturating_sub(10), my + mh - 10);
+                    let (cx, cy) =
+                        clamp_restore_pos(&monitors, x, y, win_w, win_h).unwrap_or((x, y));
+                    if (cx, cy) != (x, y) {
+                        tracing::debug!(
+                            "启动恢复浮窗位置：saved=({x},{y}) → clamp=({cx},{cy})（{} 块屏, 窗口 {win_w}×{win_h}）",
+                            monitors.len()
+                        );
+                    }
                     let _ = window.set_position(tauri::PhysicalPosition::new(cx, cy));
                 }
                 if let (Some(w), Some(h)) = (geom.width, geom.height) {
@@ -743,6 +859,7 @@ pub fn run() {
             commands::set_quick_add_shortcut,
             commands::get_attachments_dir,
             commands::paste_from_clipboard,
+            commands::paste_image_to_todo,
             commands::open_preview_window,
             commands::close_preview_window,
             commands::prewarm_preview_window,
@@ -793,4 +910,172 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod geom_restore_tests {
+    use super::*;
+
+    /// 典型双屏布局：主屏（含菜单栏 work_area）+ 右侧副屏（Retina 物理坐标）。
+    fn dual_monitors() -> Vec<MonitorRect> {
+        vec![
+            MonitorRect {
+                bounds: (0, 0, 2560, 1600),
+                work: (0, 50, 2560, 1490),
+            },
+            MonitorRect {
+                bounds: (2560, 0, 1440, 2560),
+                work: (2560, 50, 1440, 2460),
+            },
+        ]
+    }
+
+    /// 典型浮窗尺寸（物理 px）：窄卡片 300 宽、内容高 ~800（31 条卡全屏高）。
+    const WIN: (i32, i32) = (300, 800);
+
+    /// **v0.2.9 核心回归**：窗口上次在**副屏**，重启后必须原样恢复 ——
+    /// 旧实现 clamp 到主屏右缘（2560-50），恰好落在两屏交界处。
+    #[test]
+    fn restore_pos_on_secondary_monitor_kept() {
+        let mons = dual_monitors();
+        // 副屏内的合法坐标
+        assert_eq!(
+            clamp_restore_pos(&mons, 3000, 400, WIN.0, WIN.1),
+            Some((3000, 400))
+        );
+        // 贴副屏左缘（就是交界线右侧）也原样保留
+        assert_eq!(
+            clamp_restore_pos(&mons, 2560, 400, WIN.0, WIN.1),
+            Some((2560, 400))
+        );
+    }
+
+    /// 主屏内坐标同样原样恢复（不能被新逻辑误伤）。
+    #[test]
+    fn restore_pos_on_primary_monitor_kept() {
+        let mons = dual_monitors();
+        assert_eq!(
+            clamp_restore_pos(&mons, 200, 300, WIN.0, WIN.1),
+            Some((200, 300))
+        );
+        assert_eq!(
+            clamp_restore_pos(&mons, 0, 100, WIN.0, WIN.1),
+            Some((0, 100))
+        );
+    }
+
+    /// 保存坐标在菜单栏区域内（y < work_area 顶）→ clamp 到可视区顶。
+    #[test]
+    fn restore_pos_clamps_into_work_area() {
+        let mons = dual_monitors();
+        // y=10 在菜单栏里 → 顶到 work_area 顶 50
+        assert_eq!(
+            clamp_restore_pos(&mons, 200, 10, WIN.0, WIN.1),
+            Some((200, 50))
+        );
+    }
+
+    /// **竖条回归（v0.2.9 二修）**：副屏被拔后，保存坐标经"最近屏"分支
+    /// 恢复 —— 必须按**整窗宽度**收纳（x = 主屏右界 - 300），不能只保证
+    /// 左上角 60px 可见（首版 clamp 到 2560-60 → 300px 宽窗口有 240px
+    /// 悬在屏外，用户只看到 35px 竖条）。
+    #[test]
+    fn restore_pos_from_unplugged_monitor_contains_whole_window() {
+        let mons = vec![MonitorRect {
+            bounds: (0, 0, 2560, 1600),
+            work: (0, 50, 2560, 1490),
+        }];
+        // 上次在 (3000, 400)（副屏没了）→ 整窗收纳：x = 2560 - 300
+        assert_eq!(
+            clamp_restore_pos(&mons, 3000, 400, WIN.0, WIN.1),
+            Some((2560 - 300, 400))
+        );
+        // 比 work_area 还靠下也一样被收纳（y 上界 = 50 + (1490-800) = 740）
+        assert_eq!(
+            clamp_restore_pos(&mons, 3000, 1400, WIN.0, WIN.1),
+            Some((2560 - 300, 740))
+        );
+    }
+
+    /// **骑缝回归（v0.2.9 二修）**：保存坐标命中 A 屏但窗口伸进 B 屏
+    /// （骑双屏缝）→ 恢复时整窗拉回 A 屏内。只看左上角命中的首版会
+    /// 原样保留骑缝位置。
+    #[test]
+    fn restore_seam_straddle_pulls_window_fully_onscreen() {
+        let mons = dual_monitors();
+        // 左上角 2510 在主屏（< 2560）但 300px 宽窗口跨进副屏 → 拉回整窗
+        assert_eq!(
+            clamp_restore_pos(&mons, 2510, 300, WIN.0, WIN.1),
+            Some((2560 - 300, 300))
+        );
+    }
+
+    /// 窗口比屏**高**（长列表全屏高 2000 > work 1490）：y 退化为"至少
+    /// 顶部可见一条"（clamp 上界 = work 底 - 60），不会反转/panic。
+    #[test]
+    fn restore_taller_than_monitor_keeps_top_visible() {
+        let mons = dual_monitors();
+        assert_eq!(
+            clamp_restore_pos(&mons, 200, 100, 300, 2000),
+            Some((200, 100))
+        );
+        // y=1400 ≤ 上界 50+(1490-60)=1480 → 原样保留（顶部可见）
+        assert_eq!(
+            clamp_restore_pos(&mons, 200, 1400, 300, 2000),
+            Some((200, 1400))
+        );
+        // y 更靠下才被压回 1480
+        assert_eq!(
+            clamp_restore_pos(&mons, 200, 1600, 300, 2000),
+            Some((200, 1480))
+        );
+    }
+
+    /// 副屏在主屏**左侧**（负坐标）：命中副屏原样恢复；副屏没了 clamp
+    /// 到主屏左缘 0（不是负坐标扔屏外）。
+    #[test]
+    fn restore_pos_with_left_secondary_monitor() {
+        let mons = vec![
+            MonitorRect {
+                bounds: (-1440, 0, 1440, 2560),
+                work: (-1440, 50, 1440, 2460),
+            },
+            MonitorRect {
+                bounds: (0, 0, 2560, 1600),
+                work: (0, 50, 2560, 1490),
+            },
+        ];
+        assert_eq!(
+            clamp_restore_pos(&mons, -1000, 300, WIN.0, WIN.1),
+            Some((-1000, 300))
+        );
+        // 副屏拔掉后（只剩主屏），旧坐标 (-1000, 300) → clamp 到主屏内
+        let only_primary = vec![mons[1]];
+        assert_eq!(
+            clamp_restore_pos(&only_primary, -1000, 300, WIN.0, WIN.1),
+            Some((0, 300))
+        );
+    }
+
+    /// 显示器列表拿不到（API 失败）→ None，调用方用原坐标（不瞎 clamp）。
+    #[test]
+    fn restore_pos_with_no_monitors_returns_none() {
+        assert_eq!(clamp_restore_pos(&[], 3000, 400, WIN.0, WIN.1), None);
+    }
+
+    /// 极端小屏（work_area 比 RESTORE_MIN_VISIBLE_PX 还窄）：clamp 区间
+    /// 退化而非反转（lo > hi 时 i32::clamp 会 panic）。退化语义 = 贴
+    /// work_area 右/下界（x 界 100-60=40、y 界退化到顶 10）。
+    #[test]
+    fn restore_pos_tiny_monitor_does_not_panic() {
+        let mons = vec![MonitorRect {
+            bounds: (0, 0, 100, 80),
+            work: (0, 10, 100, 60),
+        }];
+        // 窗口 300 宽 > 屏宽 100 → 退化到 min-visible 语义
+        assert_eq!(
+            clamp_restore_pos(&mons, 50, 40, WIN.0, WIN.1),
+            Some((40, 10))
+        );
+    }
 }

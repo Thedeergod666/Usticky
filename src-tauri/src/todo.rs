@@ -254,22 +254,38 @@ impl Store {
         self.add_with_attachment(title, None)
     }
 
-    /// v0.2 剪贴板图片粘贴：带附件的 add。order 逻辑跟纯文本 add 完全一致
-    /// （append 到 pending 段末尾，max_order + 1）。
+    /// v0.2 剪贴板图片粘贴：带附件的 add。落位逻辑跟纯文本 add 完全一致。
+    ///
+    /// **v0.2.8 起置顶**：新建 todo 插到 **pending 段第一行**（原实现 push
+    /// 到 Vec 末尾 = pending 段最后一行）。显示顺序 = Vec 顺序按 status
+    /// 过滤（前端 render / 本文件均不按 order 排序），所以插入位置即显示
+    /// 位置。order 取 `min - 1` 保持「section 内 order 沿显示方向递增」的
+    /// 不变量（与 reorder 归一化后的 0..N-1 一致）；连续置顶会让 order 走
+    /// 负数 —— 无害（i32，无溢出风险；任何一次拖拽都归一化回 0..N-1）。
+    ///
+    /// `position()` 找**第一个 pending** 所在位置插入：对 pending/done 在
+    /// Vec 里交错的布局稳健（restore 是 push 到末尾的，交错是真实会出现的
+    /// 状态），不假设两段各自连续 —— 与 reorder 的 base_idx 锚定同款防御。
     pub fn add_with_attachment(
         &mut self,
         title: String,
         attachment: Option<TodoAttachment>,
     ) -> Todo {
         let now = chrono::Utc::now().timestamp_millis();
-        let max_order = self
+        let min_order = self
             .data
             .todos
             .iter()
             .filter(|t| t.status == TodoStatus::Pending)
             .map(|t| t.order)
-            .max()
-            .unwrap_or(-1);
+            .min()
+            .unwrap_or(1); // pending 段为空 → 新条 order 从 0 起
+        let insert_idx = self
+            .data
+            .todos
+            .iter()
+            .position(|t| t.status == TodoStatus::Pending)
+            .unwrap_or(0); // 无 pending → 插 Vec 头部（显示上仍是 pending 第一行）
         let todo = Todo {
             id: uuid::Uuid::new_v4().to_string(),
             title,
@@ -279,28 +295,29 @@ impl Store {
             updated_at: now,
             due_at: None,
             tags: vec![],
-            order: max_order + 1,
+            order: min_order - 1,
             attachment,
         };
-        self.data.todos.push(todo.clone());
+        self.data.todos.insert(insert_idx, todo.clone());
         todo
     }
 
-    /// 修改 todo 字段。**status 变化时**还会把 todo 从 Vec 中当前位置
-    /// 摘出并 append 到目标 status section 末尾，重置 `order` 为该 section
-    /// 的 `max_order + 1`。
+    /// 修改 todo 字段。**status 变化时**还会把 todo 从 Vec 中当前位置摘出，
+    /// 插入到目标 status section 的**第一行**（v0.2.8 起置顶；v0.2.7 及之前
+    /// 是 append 到目标 section 末尾），order 重置为该 section 的 `min - 1`。
     ///
     /// **为什么改 status 要移动 Vec 物理位置**：v0.1 之前 update() 只改 status
     /// 字段不动 Vec，导致 pending/done 在数组里穿插。`reorder()` 的 `base_idx`
     /// 锚定逻辑遇到穿插状态会出错，跨重启后用户看到的排序与预期不符。
-    /// 把 todo 移到目标 section 末尾 = 简单可预测：每次 toggleDone 把 todo
-    /// 放到该 section "最近完成 / 最近撤销" 的位置，跟用户心智模型一致。
+    /// 移到目标 section 头部 = 简单可预测：刚完成的任务出现在 done 区最上面、
+    /// 刚恢复的任务出现在 pending 区最上面，跟"最近操作在最前"的心智模型一致。
     ///
     /// 边界：
     ///   - 仅 title 改（status=None）：不动 Vec（编辑 title 不影响位置）
     ///   - status 与旧值相同（toggle 取消）：当 no-op，不动 Vec
-    ///   - status 改变：摘出 + push 到目标 section 末尾 + 重置 order
-    /// 修改 todo 字段。
+    ///   - status 改变：摘出 + 插到目标 section 第一个同 status 元素前 +
+    ///     重置 order（min/position 都在 remove **之后**算 —— remove 让 idx
+    ///     之后的元素前移，先算会插错位）
     ///
     /// 返回 `Ok(Some(todo))` 表示实际改了什么；`Ok(None)` 表示 **no-op**
     /// （title 和 status 都是 None）—— 调用方应该跳过 persist + emit。
@@ -333,27 +350,33 @@ impl Store {
         let now = chrono::Utc::now().timestamp_millis();
         let current_status = self.data.todos[idx].status.clone();
 
-        // status 改变 → 摘出 + push 到目标 section 末尾 + 重置 order
+        // status 改变 → 摘出 + 插到目标 section 第一行 + 重置 order（v0.2.8 置顶）
         if let Some(new_status) = status.as_ref() {
             if *new_status != current_status {
-                // 目标 section 的 max_order（排除被摘出的 todo 自己）
-                let max_order = self
+                let mut todo = self.data.todos.remove(idx);
+                todo.status = new_status.clone();
+                // min/position 都在 remove 之后算：目标段已不含自己，且 idx
+                // 之后的元素已前移（先算后 remove 会插错位）。
+                let min_order = self
                     .data
                     .todos
                     .iter()
-                    .enumerate()
-                    .filter(|(i, t)| *i != idx && t.status == *new_status)
-                    .map(|(_, t)| t.order)
-                    .max()
-                    .unwrap_or(-1);
-                let mut todo = self.data.todos.remove(idx);
-                todo.status = new_status.clone();
-                todo.order = max_order + 1;
+                    .filter(|t| t.status == *new_status)
+                    .map(|t| t.order)
+                    .min()
+                    .unwrap_or(1); // 目标段为空 → order 从 0 起
+                todo.order = min_order - 1;
                 todo.updated_at = now;
                 if let Some(title) = title {
                     todo.title = title;
                 }
-                self.data.todos.push(todo.clone());
+                let insert_idx = self
+                    .data
+                    .todos
+                    .iter()
+                    .position(|t| t.status == *new_status)
+                    .unwrap_or(0); // 目标段为空 → 插 Vec 头部
+                self.data.todos.insert(insert_idx, todo.clone());
                 return Ok(Some(todo));
             }
         }
@@ -381,6 +404,32 @@ impl Store {
         Ok(Some(todo.clone()))
     }
 
+    /// v0.2.8 预览窗 Cmd+V 粘图：给**已有** todo 设置/替换附件。
+    ///
+    /// 返回 `(更新后的 Todo, 被替换掉的旧附件文件名)`。旧文件**不在这里删**：
+    /// 立即删需要跨 persist 的引用检查 + 写锁临界区（P0-7 的 purge_attachment
+    /// 同款复杂度），替换附件是低频操作，留孤儿给启动扫描
+    /// （`purge_orphan_attachments`）清更划算。
+    ///
+    /// 走独立方法而不复用 [`update`](Self::update)：update 的 no-op 检测只看
+    /// title/status，attachment-only 变更会被误判成 no-op 跳过 persist。
+    pub fn set_attachment(
+        &mut self,
+        id: &str,
+        attachment: TodoAttachment,
+    ) -> Result<(Todo, Option<String>), String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let todo = self
+            .data
+            .todos
+            .iter_mut()
+            .find(|t| t.id == id)
+            .ok_or_else(|| rust_i18n::t!("commands.error.not_found").to_string())?;
+        let old = todo.attachment.replace(attachment);
+        todo.updated_at = now;
+        Ok((todo.clone(), old.map(|a| a.file)))
+    }
+
     pub fn delete(&mut self, id: &str) -> Option<Todo> {
         let idx = self.data.todos.iter().position(|t| t.id == id)?;
         Some(self.data.todos.remove(idx))
@@ -388,12 +437,11 @@ impl Store {
 
     /// 撤销删除 -- 把前端 undo 栈暂存的完整 Todo 原样塞回 Vec。
     ///
-    /// 保留原 id/order/status，尽量回到删除前的位置。边缘情况：删除后
-    /// 用户若 reorder 过同 section，reorder 会把该 section 的 order 重排成
-    /// 0,1,2...，此时原 order 可能跟某条 todo 撞号 -> `todos_sorted` 的
-    /// stable sort 会把这条排到同号之后（它在 Vec 末尾）。这是可接受的
-    /// 退化：reorder 之后精确原位本就不可能保证，恢复到 section 末尾已
-    /// 足够。
+    /// 保留原 id/order/status。注意：塞回的位置是 Vec **末尾**（其 section
+    /// 显示上的最后一行），并非删除前的原位 —— 显示顺序 = Vec 顺序按
+    /// status 过滤，没有任何代码按 order 排序（order 只在 add/update 算
+    /// 下一个值时被读）。这与 v0.2.8 起「新建/翻转置顶」不对称，属 undo
+    /// 的既有取舍：恢复的条目按"最旧"落位，新操作的条目按"最新"置顶。
     ///
     /// 防御：id 已存在（前端重复 restore / 并发）-> **不重复插入**，返 `None`。
     /// 调用方（`restore_todo` command）据此跳过 persist，直接返已存在那条，
@@ -497,9 +545,9 @@ pub fn purge_orphan_attachments(&self) {
         }
 
         // 1. 找被拖 section 在 Vec 里的最早位置 —— 作为新顺序的锚点。
-        //    不依赖"section 在 Vec 里连续"的假设：防御 add/update 之后
-        //    pending/done 在数组里穿插（虽然 add() 总 append，但 v0.2
-        //    之后可能改）。
+        //    不依赖"section 在 Vec 里连续"的假设：防御 add/update/restore
+        //    之后 pending/done 在数组里穿插（restore 是 push 到末尾的，
+        //    交错布局是真实会出现的状态）。
         let id_set: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
         let base_idx = match self
             .data
@@ -1123,48 +1171,54 @@ mod reorder_tests {
         assert_eq!(done, vec!["9", "10", "2", "3", "4"]);
     }
 
-    /// **P1-2 fix** 回归测试：update() 改 status 必须把 todo 从 Vec 中当前位置
-    /// 摘出并 append 到目标 status section 末尾 + 重置 order。
+    /// **v0.2.8 置顶语义**回归测试：update() 改 status 把 todo 摘出并插到
+    /// 目标 status section **第一行**（v0.2.7 前是 append 到末尾）。
     /// 旧实现只改 status 字段不动 Vec，导致 pending/done 穿插 → reorder 出错。
     #[test]
-    fn update_status_moves_todo_to_target_section_end() {
+    fn update_status_moves_todo_to_front_of_target_section() {
         let mut s = fresh_store(vec![
             mk("a", TodoStatus::Pending, 0),
             mk("b", TodoStatus::Done, 0),
             mk("c", TodoStatus::Done, 1),
         ]);
-        // a: pending → done。预期：a 从 index 0 摘出，append 到 done 末尾，
-        // order = max(done.order) + 1 = 2。
+        // a: pending → done。预期：a 插到 done 段第一行（b 之前），
+        // order = min(done.order) - 1 = -1。
         let updated = s
             .update("a", None, Some(TodoStatus::Done))
             .unwrap()
             .unwrap();
         assert_eq!(updated.status, TodoStatus::Done);
-        assert_eq!(updated.order, 2);
-        assert_eq!(ids(&s), vec!["b", "c", "a"]);
-        // 物理顺序：原 done 段保留原位置，新完成项追加到末尾
-        assert_eq!(s.data.todos[2].id, "a");
-        assert_eq!(s.data.todos[2].order, 2);
+        assert_eq!(updated.order, -1);
+        assert_eq!(ids(&s), vec!["a", "b", "c"]);
+        // done 段显示顺序：a 是第一行
+        let done: Vec<&str> = s
+            .data
+            .todos
+            .iter()
+            .filter(|t| t.status == TodoStatus::Done)
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(done, vec!["a", "b", "c"]);
     }
 
-    /// **P1-2 fix** 回归测试：撤销完成 (done → pending) 也走同样的移动逻辑。
+    /// **v0.2.8 置顶语义**回归测试：撤销完成 (done → pending) 插到 pending 第一行。
     #[test]
-    fn update_status_done_to_pending_moves() {
+    fn update_status_done_to_pending_moves_to_front() {
         let mut s = fresh_store(vec![
             mk("a", TodoStatus::Pending, 0),
             mk("b", TodoStatus::Pending, 1),
             mk("c", TodoStatus::Done, 0),
             mk("d", TodoStatus::Done, 1),
         ]);
-        // c: done → pending → append 到 pending 末尾
+        // c: done → pending → 插到 pending 段第一行（a 之前）
         let updated = s
             .update("c", None, Some(TodoStatus::Pending))
             .unwrap()
             .unwrap();
         assert_eq!(updated.status, TodoStatus::Pending);
-        assert_eq!(updated.order, 2); // max(0,1) + 1
-        assert_eq!(ids(&s), vec!["a", "b", "d", "c"]);
-        // c 现在是 pending 段最后一条
+        assert_eq!(updated.order, -1); // min(0,1) - 1
+        assert_eq!(ids(&s), vec!["c", "a", "b", "d"]);
+        // c 现在是 pending 段第一行
         let pending: Vec<&str> = s
             .data
             .todos
@@ -1172,7 +1226,7 @@ mod reorder_tests {
             .filter(|t| t.status == TodoStatus::Pending)
             .map(|t| t.id.as_str())
             .collect();
-        assert_eq!(pending, vec!["a", "b", "c"]);
+        assert_eq!(pending, vec!["c", "a", "b"]);
     }
 
     /// **P1-2 fix**：仅改 title（status=None）→ in-place update，不动 Vec。
@@ -1228,7 +1282,8 @@ mod reorder_tests {
         assert_eq!(s.data.todos[0].updated_at, pinned_updated_at);
     }
 
-    /// **P1-2 fix**：同时改 title + status → status 路径生效（title 也更新）。
+    /// **P1-2 fix + v0.2.8 置顶**：同时改 title + status → status 路径生效
+    /// （title 也更新，落位在目标段第一行）。
     #[test]
     fn update_title_and_status_together() {
         let mut s = fresh_store(vec![
@@ -1241,35 +1296,36 @@ mod reorder_tests {
             .unwrap();
         assert_eq!(updated.status, TodoStatus::Done);
         assert_eq!(updated.title, "done item");
-        // a 已 append 到 done 末尾
-        assert_eq!(ids(&s), vec!["b", "a"]);
+        // a 插到 done 段第一行（v0.2.8 置顶）
+        assert_eq!(ids(&s), vec!["a", "b"]);
     }
 
-    /// **P1-2 fix**：连续 toggle 不应让 order 出现重复或乱序。
+    /// **v0.2.8 置顶语义**：连续 toggle 后 order 沿显示方向单调递减（每次
+    /// 置顶 min-1），无重复；置顶位次与显示顺序一致。
     #[test]
-    fn update_chained_toggles_give_monotonic_order() {
+    fn update_chained_toggles_prepend_keeps_orders_unique() {
         let mut s = fresh_store(vec![
             mk("a", TodoStatus::Pending, 0),
             mk("b", TodoStatus::Pending, 1),
             mk("c", TodoStatus::Pending, 2),
         ]);
-        // a → done (append 到 done 段，order=0)
+        // a → done（done 段为空 → order 0，插头部）
         s.update("a", None, Some(TodoStatus::Done))
             .unwrap()
             .unwrap();
-        // a → pending (append 到 pending 段，order=3 = max(1,2,?))
+        // a → pending（插回 pending 第一行，order = min(1,2)-1 = 0）
         s.update("a", None, Some(TodoStatus::Pending))
             .unwrap()
             .unwrap();
-        // pending 段：b(1), c(2), a(3) —— 单调递增
-        let pending: Vec<i32> = s
+        // pending 段显示顺序：a(0), b(1), c(2) —— 置顶 + 无重复
+        let pending: Vec<(&str, i32)> = s
             .data
             .todos
             .iter()
             .filter(|t| t.status == TodoStatus::Pending)
-            .map(|t| t.order)
+            .map(|t| (t.id.as_str(), t.order))
             .collect();
-        assert_eq!(pending, vec![1, 2, 3]);
+        assert_eq!(pending, vec![("a", 0), ("b", 1), ("c", 2)]);
     }
 
     /// **P2-4 fix**：update(title=None, status=None) → Ok(None) no-op，
@@ -1361,5 +1417,176 @@ mod reorder_tests {
         assert_eq!(s.data.todos[0].order, 0);
         assert_eq!(s.data.todos[1].order, 1);
         assert_eq!(s.data.todos[2].order, 2);
+    }
+
+    // ── v0.2.8 置顶语义回归测试 ──
+
+    /// 新建 todo 插到 pending 段第一行（v0.2.7 前是追加到末尾），
+    /// done 段位置不动。这是 add() 落位的第一个测试（此前零覆盖）。
+    #[test]
+    fn add_inserts_at_front_of_pending_section() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+            mk("c", TodoStatus::Done, 0),
+        ]);
+        let added = s.add("new".into());
+        // pending 显示顺序：new, a, b；done 的 c 不动（id 是 uuid，按 title 断言）
+        let titles: Vec<&str> = s.data.todos.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["new", "a", "b", "c"]);
+        assert_eq!(added.order, -1); // min(0,1) - 1
+        assert_eq!(s.data.todos[0].title, "new");
+    }
+
+    /// 带附件路径（paste_from_clipboard 图片分支）同样置顶。
+    #[test]
+    fn add_with_attachment_inserts_at_front() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Done, 0),
+        ]);
+        let attachment = TodoAttachment {
+            file: "x.png".into(),
+            mime: "image/png".into(),
+            width: Some(10),
+            height: Some(10),
+        };
+        let added = s.add_with_attachment(String::new(), Some(attachment));
+        // 新条插在第一个 pending（a）之前 → Vec 首位；b（done）在末尾不动
+        assert_eq!(s.data.todos.len(), 3);
+        assert_eq!(s.data.todos[0].id, added.id);
+        assert_eq!(s.data.todos[1].id, "a");
+        assert_eq!(s.data.todos[2].id, "b");
+        // 纯图 todo：空标题 + 附件在
+        assert_eq!(s.data.todos[0].title, "");
+        assert!(s.data.todos[0].attachment.is_some());
+    }
+
+    /// 交错 Vec（done 在前、pending 穿插）下 add 仍插到**第一个 pending** 前
+    /// —— 这是置顶实现对交错布局稳健性的核心防御点。
+    #[test]
+    fn add_in_interleaved_vec_targets_first_pending() {
+        let mut s = fresh_store(vec![
+            mk("d0", TodoStatus::Done, 0),
+            mk("p1", TodoStatus::Pending, 1),
+            mk("d1", TodoStatus::Done, 2),
+            mk("p2", TodoStatus::Pending, 3),
+        ]);
+        s.add("new".into());
+        // 插在 p1（第一个 pending）之前，其余原位（id 是 uuid，按 title 断言）
+        let titles: Vec<&str> = s.data.todos.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["d0", "new", "p1", "d1", "p2"]);
+        // pending 显示顺序：new 是第一行（id 是 uuid，按 title 断言）
+        let pending: Vec<&str> = s
+            .data
+            .todos
+            .iter()
+            .filter(|t| t.status == TodoStatus::Pending)
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(pending, vec!["new", "p1", "p2"]);
+    }
+
+    /// 全 done（无 pending）的 store 里 add → 插 Vec 头部，order 从 0 起。
+    #[test]
+    fn add_to_store_with_no_pending() {
+        let mut s = fresh_store(vec![
+            mk("d0", TodoStatus::Done, 0),
+            mk("d1", TodoStatus::Done, 1),
+        ]);
+        let added = s.add("new".into());
+        assert_eq!(added.order, 0); // unwrap_or(1) - 1
+        assert_eq!(ids(&s).len(), 3);
+        assert_eq!(s.data.todos[0].title, "new");
+    }
+
+    /// 交错 Vec 下翻转 status，插入点 = 目标 status 的首个元素前。
+    #[test]
+    fn update_status_move_in_interleaved_vec() {
+        let mut s = fresh_store(vec![
+            mk("d0", TodoStatus::Done, 0),
+            mk("p1", TodoStatus::Pending, 1),
+            mk("d1", TodoStatus::Done, 2),
+        ]);
+        // p1 → done：插到第一个 done（d0）之前
+        let updated = s
+            .update("p1", None, Some(TodoStatus::Done))
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, TodoStatus::Done);
+        assert_eq!(ids(&s), vec!["p1", "d0", "d1"]);
+        let done: Vec<&str> = s
+            .data
+            .todos
+            .iter()
+            .filter(|t| t.status == TodoStatus::Done)
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(done, vec!["p1", "d0", "d1"]);
+    }
+
+    /// 连续置顶会让 order 走负数（min-1 链）；一次拖拽把 section 归一化回
+    /// 0..N-1 且无重复 —— 显式断言 order 漂移有界、可被 reorder 收敛。
+    #[test]
+    fn prepend_then_reorder_normalizes_order() {
+        let mut s = fresh_store(vec![
+            mk("a", TodoStatus::Pending, 0),
+            mk("b", TodoStatus::Pending, 1),
+        ]);
+        s.add("n1".into()); // order -1
+        s.add("n2".into()); // order -2
+        let orders_before: Vec<i32> = s
+            .data
+            .todos
+            .iter()
+            .map(|t| t.order)
+            .collect();
+        assert!(orders_before.iter().any(|o| *o < 0), "prepend 应产生负 order");
+        // 拖一次（完整 pending permutation，顺序原样）→ order 归一化
+        let pending_ids: Vec<String> = s
+            .data
+            .todos
+            .iter()
+            .filter(|t| t.status == TodoStatus::Pending)
+            .map(|t| t.id.clone())
+            .collect();
+        s.reorder(&pending_ids).unwrap();
+        let orders_after: Vec<i32> = s
+            .data
+            .todos
+            .iter()
+            .filter(|t| t.status == TodoStatus::Pending)
+            .map(|t| t.order)
+            .collect();
+        assert_eq!(orders_after, (0..orders_after.len() as i32).collect::<Vec<_>>());
+    }
+
+    /// v0.2.8 set_attachment：替换已有 todo 的附件 + 返回旧文件名；
+    /// id 不存在 → Err；替换后 updated_at 被 bump。
+    #[test]
+    fn set_attachment_replaces_and_returns_old_file() {
+        let mut s = fresh_store(vec![mk("a", TodoStatus::Pending, 0)]);
+        let first = TodoAttachment {
+            file: "old.png".into(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+        };
+        let (_, old1) = s.set_attachment("a", first).unwrap();
+        assert_eq!(old1, None);
+        let pinned = 1_700_000_000_000i64;
+        s.data.todos[0].updated_at = pinned;
+        let second = TodoAttachment {
+            file: "new.gif".into(),
+            mime: "image/gif".into(),
+            width: Some(100),
+            height: Some(50),
+        };
+        let (todo, old2) = s.set_attachment("a", second.clone()).unwrap();
+        assert_eq!(old2.as_deref(), Some("old.png"));
+        assert_eq!(todo.attachment.as_ref().unwrap().file, "new.gif");
+        assert!(todo.updated_at > pinned, "set_attachment 必须 bump updated_at");
+        // 不存在的 id → Err
+        assert!(s.set_attachment("ghost", second).is_err());
     }
 }

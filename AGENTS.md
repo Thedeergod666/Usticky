@@ -1,6 +1,6 @@
 # Usticky 项目说明
 
-> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.2.5 发布准备（剪贴板粘贴 + QuickLook 预览窗 + 删除撤销 + 玻璃 perf + 托盘归位）/ 2026-08-19**。
+> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.2.9（换行丢失根修：编辑态 textarea 化 + 多行粘贴走全文路径）/ 2026-10-27**。
 
 ## 这是什么
 
@@ -93,9 +93,9 @@ frame-ancestors 'none'
 - `connect-src ipc:` 必加：Tauri IPC 走 `ipc://` scheme
 - 配套 Vite `assetsInlineLimit: 0`（<4KB 资源被内联 → CSP block → 裂图）
 
-### 3. 渲染：当前为全量重建（v0.1.5 仍如此），未来迁移到增量 diff
+### 3. 渲染：已是 keyed diff 增量渲染（v0.2.7 起；v0.2.8 补多值 Map 防御）
 
-`innerHTML = ...` 会让整窗空白 1 帧 → "闪一下"。每张卡 / 每行用 `data-*` key 做增量 update。顺序变化：先按期望顺序插入 + reorder 循环搬已有卡，**快速路径：先比 expected/actual 字符串，相等就跳过整个循环**。
+**stale claim 修正（v0.2.8）**：本节旧版写"当前为全量重建，未来迁移增量 diff" —— 实际 commit `b628d1f`（2026-08-11）已完成迁移，此后 PERF_AUDIT.md 的 S1/S2/S3/A1/A2/A3/B2/B3/B4 系列持续打磨。现状：`render()` 按 section 走 `diffSection` keyed diff（`data-todo-id` 复用行节点、`buildTodoRow` 零监听器骨架 + `updateTodoRow` 原地更新、事件全部委托到 `#app` 3 个 listener、expected/actual 字符串快速路径跳过 reorder 循环、Sortable 实例随 section 跨 render 复用）。v0.2.8 再补：diffSection 多值 Map（Musage 同款重复 key 防御）、updateTodoRow 同值守卫、hidden 窗口渲染门。
 
 ### 4. 内容高度自适应（防"浮窗越长越高"）
 
@@ -416,6 +416,8 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 ✅ **附带：预览窗 hover 穿缝行为改进**（[main.ts](file:///Users/wyh/Project/Usticky/src/main.ts)）：预览开着时鼠标穿 card↔preview 之间的缝隙（短暂"两窗都不在"），原实现会立即摘 `.card-hover` + 落 idle 玻璃 -> 卡片像失焦闪一下。改：预览开着（`previewTodoId !== null && previewPinnedId === null`，即非 pinned 的 hover 面板）时，`floating-hover(false)` / hover-pos 不摘卡片强调、不落 idle；`over_preview` 命中时把 `rustHoveredCardId` 对齐到 `previewTodoId` 保持 `.card-hover`。释放时机统一收到 `preview-closed`：预览真关 + 鼠标仍不在浮窗（`lastHoverPayload === false`）才落 idle + 摘 `.card-hover`；鼠标在浮窗上则不动（让 hover-pos 正常驱动，避免摘了又挂抖动）。顺带删了 `previewWasOver` / `justLeftPreview` 边沿机制（被 preview-closed 释放路径取代，不再需要）。 `close_preview_window` 兜底直接 emit `usticky://preview-closed`：w.close() 在 Tauri 2 / WKWebView 下可能不触发 webview beforeunload -> preview.ts 的 beforeunload 监听不来 -> 浮窗收不到 preview-closed -> 穿缝期间保留的强调 / 玻璃卡死释放不了（只有切走 app 触发 onFocusChanged 才摘）。preview.ts beforeunload 仍会再 emit 一次，listener 幂等无副作用。
 ✅ 构建验证：`cargo check --all-targets` 零警告 ✓、`cargo test --lib` 20/20 ✓、`pnpm build`（tsc + vite）✓。
 
+> **stale claim 修正（v0.2.8）**：本段 ① 描述的 `.todo-banner` 整宽 banner 方案与实际代码不符 —— 当前 [styles.css](file:///Users/wyh/Project/Usticky/src/styles.css) / [main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) 是 `.todo-thumb` **内联单行 1:1** 方案（v0.2.1 形态：thumb 与 title 各 `flex:1 1 0` 占一半宽，纯图卡 `:empty` 折叠独占整宽；v0.2.1 段的描述才是现状）。历史留档不改原文，以 v0.2.1 段为准。
+
 ### v0.2.7（2026-09-04，8 域全量代码审查修复）
 
 8 个并行审查 agent 对 8 个模块域做深度 bug 扫描（前端渲染/交互/预览/设置、后端存储/命令/平台/配置），共发现 ~95 条（按分级 P0=8/P1=22/P2=30/P3=26 报告）。本次修复 **P0（7）+ P1（8）+ P3（18）= 33 条 commit**，P2（30 条边界条件）列入 v0.3 候选。
@@ -450,6 +452,57 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 - thumbWidthCache 实现与注释矛盾 / 滚动 / 拖拽残留边沿 / `:empty` 在空白字符 title 下失效 / pulse 动画无 reduced-motion / 浅色背景对比度 / due 标签 DST 边界 / 多次删附件 / 预览窗 confirm 跨 todo 残留 / input Cmd+V 粘图片残留空白 / perfDump 版本硬编码等
 
 **构建验证**：`cargo check --all-targets` 零警告 ✓、`cargo test --lib` 21/21 ✓（多一个 reorder_rejects_mixed_status_subset 回归测试）、`pnpm build`（tsc + vite）✓。
+
+### v0.2.8（2026-10-26，置顶语义 + 预览窗粘图 + 动画卡顿根修 + 1k 卡扩展性 + 双屏位置修复）
+
+用户反馈四项，4 个并行排查 agent 定位根因后统一修复：
+
+✅ **① 新建/翻转置顶**（原实现全部追加到目标 section **末尾**）：
+- 后端 [todo.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/todo.rs)：`add_with_attachment` push 改 `insert(第一个 pending 前)` + `order = min-1`；`update` status 翻转分支同款（插到目标 section 第一行）。`position()` 找首个同 status 元素，对 pending/done 交错的 Vec 布局稳健（restore 仍 push 末尾，交错是真实状态）。order 走负数无害（无人按 order 排序，reorder 归一化回 0..N-1）。
+- 前端 [main.ts](file:///Users/wyh/Project/Usticky/src/main.ts) `addTodo` 乐观 temp 同步插到第一个 pending 前（防"先底后顶"跳行）。
+- 测试 21→28：改 4 个 append 断言 + 新增 7 个（add 置顶 / 附件路径置顶 / 交错 Vec / 空 pending 段 / 翻转交错 / 置顶后 reorder 归一化 / set_attachment）。
+✅ **② 预览窗 Cmd+V 粘图 → 附加到当前 todo**（替换旧附件，不是新建 todo）：
+- 后端新命令 `paste_image_to_todo`（spawn_blocking 读剪贴板 → 0600 落盘 → `Store::set_attachment` + persist_and_emit）；文本剪贴板 → `Err("no_image")`，空 → `Err("empty")`。旧附件文件不立即删（留启动孤儿扫描，省跨 persist 引用检查临界区）。
+- 前端 [preview.ts](file:///Users/wyh/Project/Usticky/src/preview.ts) textarea paste 监听（对齐 main.ts 输入框模式），成功后拿返回 Todo 直接 `render()`（todos-changed listener 不重渲染图片）+ flashHint；img load → scheduleFit 自动按新图调窗高。新 i18n key `app.paste.no_image`；删后端死 key `commands.paste.image_title`。
+✅ **③ 动画卡顿根修**（根因：**心跳动画掩蔽 transform/opacity** —— CSS animation 优先级高于 inline style，SortableJS 的 150ms 重排滑动 / 拖拽半透明 / vanish 淡出全部视觉死亡，用户看到的是"瞬移"）：
+- styles.css：`.vanishing / .dragging / .sortable-chosen / #app[data-drag-active] .todo-card { animation: none }`（main.ts Sortable onStart/onEnd 挂摘 data-drag-active，兄弟卡的 inline transform 因此复活）；拖拽/塌缩本身在改几何，layer 不进 ~2s 节流窗口，玻璃防丢失不受影响。
+- paint 风暴收窄：`.todo-title` transition 去掉 text-shadow（2px blur 文字阴影逐帧重栅格化 ×N 卡是 hover 边沿最贵逐帧 paint）；.todo-card/.todo-input/.todo-paste-btn transition 去掉 border-color（0→0.10 离散切换肉眼不可辨）；`.vanishing` 塌缩期间 `backdrop-filter: none` + transition 收窄到 max-height+opacity。
+- **done section idle 配对 `visibility: hidden`**（0.22s 延迟到淡出完成，hover 立即恢复）：opacity:0 的不可见 done 卡此前仍带心跳 + backdrop 常驻 GPU 底噪，idle 是 99% 的状态。
+- backdrop-refresh（L3）只刷视口内可见卡（rect 批量读过滤）；`text-rendering: auto`；.todo-paste-btn 补 will-change。
+- JS 布局抖动：render/resize 后**一个 rAF 批量预测量**全部 thumb 宽填 cache（聚焦路径扫卡 hover 边沿零 offsetWidth 强制布局）。
+✅ **④ 1k 卡扩展性**（渲染已是 keyed diff，本轮补超线性/浪费点）：
+- `refreshDueLabels` O(N²)→O(N)（Map 建表；N=10k 每 30s 从 ~100M 次比较降到 ~10k）。
+- `updateTodoRow` title/due/aria 同值守卫（同值 textContent 赋值仍替换文本节点）。
+- **hidden 渲染门**：浮窗 hidden 期间 todos-changed 跳过 render（latestSnap 暂存），visibilitychange→visible 补一次。
+- `diffSection` 单值→多值 Map（Musage 2026-09-07 同款重复 key 防御）。
+- `check.title` 原生 tooltip（浮窗内最后残留）→ aria-label。
+
+✅ **⑤ 双屏重启后浮窗骑在两屏交界处**（用户实测：macOS 双屏并排，重启后窗口落在两块屏幕中间）：
+- 根因：[lib.rs](file:///Users/wyh/Project/Usticky/src-tauri/src/lib.rs) setup 恢复位置时把保存的 (x, y) **clamp 到主显示器边界** —— 本意是"副屏拔了别把窗口扔屏外"，但它不认识副屏：窗口上次合法地在副屏（坐标超出主屏范围），重启后被强行拉到主屏右缘，恰好 = 双屏交界处；且用的是 `monitor.size()` 而非 work_area。
+- 修（一版）：新增 `clamp_restore_pos` 多屏感知纯函数（`MonitorRect` 快照脱离 AppHandle 可单测）—— 坐标仍落在某块屏**全屏矩形**内 → 恢复到那块屏；所有屏都不含该点（屏被拔/排列变了）→ 选**最近屏**（点 clamp 进各屏矩形算距离平方取最小）；拿不到显示器列表 → 原坐标不动。setup 恢复接入 `collect_monitor_rects(app.handle())`。
+- **修（二版，竖条回归）**：一版只保证**左上角** 60px 可见 —— 保存坐标走"最近屏"分支时，300px 宽的窗口被钉在"目标屏右缘 - 60"，其余 240px 悬在屏外无显示器的空间，用户看到贴屏幕右缘的 ~35px 竖条（那列圆圈是各卡勾选圈、竖排文字是压到一字宽的 section 标题；`resize_floating_window` 只改高，窗口宽度从未塌，纯粹是位置问题）。二版升级为**整窗收纳**：clamp 带 win_w/win_h（setup 从持久化 geom 取，缺省 outer_size），窗口放得下时 x ∈ [work 左, work 右 - win_w]（整窗在屏内）；放不下（窗口比屏宽/高）才退化为 min-visible。整窗收纳同时治好"命中 A 屏但窗口伸进 B 屏（骑缝）"的恢复场景。
+- 测试 28→37：副屏原样恢复（核心回归）/ 主屏不误伤 / work_area 顶 clamp / **副屏拔掉整窗收纳**（竖条回归）/ **骑缝拉回整窗** / 高于屏的窗口顶部可见 / 左侧负坐标副屏 / 空列表返 None / 小屏 clamp 区间退化不 panic。
+
+**100/1k/10k 扩展性结论**（详见排查报告，本轮已实装 1k 档）：
+- ≤500：现有架构（keyed diff + 3 委托监听 + rAF 合并）完全够。
+- ~1k：本轮四项后每次 CRUD 成本毫秒级；payload ~250KB 可接受。
+- ~10k 需要（v0.3 候选）：`.todo-card { content-visibility: auto; contain-intrinsic-size: auto 44px }`（屏外卡跳过 layout/paint，~3 行 CSS，需实测与 backdrop/SortableJS 交互）；todos-changed 改增量事件（`{rev, upserted, removed, order}`，同时解决 emit MB 级 payload 和 snapshot 双深拷贝）；reorder 锚点增量协议；**不建议虚拟化**（scrollHeight 自适应 + SortableJS drop index + reorder 完整排列校验三重依赖全量 DOM，c-v:auto 已等价"渲染虚拟化"）；**存储继续 JSON 不换 SQLite**（单文件原子写 + epoch + 5 份 bak 的防线优于引入 rusqlite 的复杂度，换库也不解决 IPC payload）。
+
+**构建验证**：`cargo check --all-targets` 零警告 ✓（clippy 警告 28→27，未引入新警告）、`cargo test --lib` 28/28 ✓、`pnpm build`（tsc + vite）✓。
+
+**经验沉淀**：⑦ CSS animation 对其声明属性的优先级高于 inline style 且锁死 computed value —— 任何"用 inline transform 做动画"的库（SortableJS animate / FLIP）与常驻 keyframes 动画（心跳保活）在同一元素上互斥，交互态必须暂停后者；⑧ `visibility: hidden` 是 opacity:0 的免费配套（跳过绘制/合成/命中测试），配对延迟 transition 可保 0 跳位；⑨ 列表项常驻保活动画（心跳）+ backdrop-filter 是按 N 线性增长的 GPU 底噪，不可见子树要显式退出合成。
+
+### v0.2.9（2026-10-27，多行内容换行丢失修复）
+
+用户反馈 todo 内容有时丢换行。根因：HTML `<input type=text>` 的 **value sanitization 是规范行为 —— 会剥掉 value 里全部 `\n`/`\r`**（赋值 / 粘贴 / 拖入都逃不掉），而项目有两条路径用 text input 承载可能含换行的标题（后端 `validate_title` 注释明确"换行 trim 后保留"，换行本是被支持的设计）：
+
+✅ **① 浮窗编辑态 `<input>` → `<textarea rows=1>`**（静默数据丢失主因）：多行 todo（粘贴按钮 / 预览窗创建）一点进浮窗编辑，`input.value = todo.title` 瞬间剥掉换行；此后 commit 里 `next !== todo.title` 恒真 —— **用户什么都没改，blur/Enter 提交也把剥掉换行的版本 update_todo 写回磁盘**。修：编辑控件改 `textarea.todo-edit-input`（value 保留 `\n`；rows=1 + 同 font/padding/border + `margin:0; resize:none; overflow:hidden; white-space:pre` 与旧 input 等高 0 抖动）；**Enter 提交 / Shift+Enter 插入换行**（textarea 内部滚动，卡片保持单行紧凑，全文看预览窗）/ Esc 取消；顺手补 IME 守卫（`isComposing || keyCode 229` 不触发 commit，防 zh-CN 选词 Enter 提前提交半截组合文本，对齐 preview.ts v0.2.7 P1）。配套改 4 处 `input.todo-edit-input` 选择器 → `textarea.todo-edit-input`（**exitEditMode 那处漏改 = cleanup 永远找不到元素**，isEditing 守卫永不释放）。
+✅ **② quick-add 输入框粘贴多行文本**（创建路径丢失）：WebKit 往 text input 默认粘贴插入剥 `\n` 成空格。paste listener 补文本分支：`getData("text/plain")` 含 `\n` → preventDefault + 已键入文字作第一行 + 粘贴文本（`\r\n` 归一 `\n`）拼接走 `addTodo`（后端 validate_title 只 trim 首尾，内部换行原样落盘）；单行放行默认插入。失败回填只回填已键入文字（input 存不了 `\n`），粘贴部分仍在剪贴板可重试；`pastePending` 防与 Enter 双建（同图片分支）。
+✅ **显示层维持 `white-space: nowrap`**：卡片单行紧凑是设计 —— `textContent` 渲染数据无损（`\n` 视觉折叠为空格 + 省略号），多行全文看预览窗（`.preview-text` textarea + pre-wrap）。未改。
+
+**经验沉淀**：⑩ `<input type=text>` 的 value 带"无换行不变量"（HTML 规范 value sanitization）—— 任何可能含多行文本的字段，录入和编辑都必须走 `<textarea>` 或后端路径，且"改了控件类型"必须全量 grep 标签选择器（`input.xxx` → `textarea.xxx`，漏一处该路径静默找不到元素）。
+
+**构建验证**：`pnpm build`（tsc + vite）✓（本轮无 Rust 改动）。
 
 ### 仍未做
 

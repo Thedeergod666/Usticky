@@ -1060,6 +1060,88 @@ pub async fn paste_from_clipboard(
     }
 }
 
+/// v0.2.8 预览窗 Cmd+V 粘图：把剪贴板图片**附加到已有 todo**（替换旧附件）。
+/// 与 [`paste_from_clipboard`]（新建 todo）相对 —— 用户在详情框编辑时粘贴
+/// 截图，期望"贴到这个任务上"而不是冒出一个新任务。
+///
+/// 错误分支：剪贴板是文本 → `Err("no_image")`（前端 flash 区分"没图"与
+/// "失败"）；剪贴板空 → `Err("empty")`；todo 不存在 → not_found。
+/// 旧附件文件**不在这里删**（`Store::set_attachment` 返回旧文件名但本命令
+/// 丢弃）—— 留给启动孤儿扫描清，省掉跨 persist 的引用检查临界区。
+#[tauri::command]
+pub async fn paste_image_to_todo(
+    app: AppHandle,
+    store: State<'_, SharedStore>,
+    todo_id: String,
+) -> Result<Todo, String> {
+    // 同 paste_from_clipboard 的 P5 perf fix：剪贴板读取是同步重活，挪
+    // spawn_blocking，不阻塞共享 IPC 池。
+    let content = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        move || crate::clipboard::read(&app)
+    })
+    .await
+    .map_err(|e| format!("clipboard read: {e}"))?;
+    let img = match content {
+        crate::clipboard::ClipboardContent::Image(img) => img,
+        crate::clipboard::ClipboardContent::Text(_) => return Err("no_image".into()),
+        crate::clipboard::ClipboardContent::Empty => return Err("empty".into()),
+    };
+    // todo 必须先存在（先校验再落盘，错误路径不碰磁盘 —— 同 P3-5 姿态）
+    {
+        let s = store.read().await;
+        if !s.todos().iter().any(|t| t.id == todo_id) {
+            return Err(rust_i18n::t!("commands.error.not_found").to_string());
+        }
+    }
+    // —— 附件落盘：与 paste_from_clipboard 图片分支同源（mode 0600 + 失败清残文件）——
+    let dir = store
+        .read()
+        .await
+        .attachments_dir()
+        .ok_or_else(|| rust_i18n::t!("commands.error.no_attachments_dir").to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create attachments dir: {e}"))?;
+    let file = format!("{}.{}", uuid::Uuid::new_v4(), img.ext);
+    let path = dir.join(&file);
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| f.write_all(&img.data))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&path);
+                format!("write attachment: {e}")
+            })?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&path, &img.data).map_err(|e| {
+        let _ = std::fs::remove_file(&path);
+        format!("write attachment: {e}")
+    })?;
+
+    let attachment = crate::todo::TodoAttachment {
+        file,
+        mime: img.mime.to_string(),
+        width: img.width,
+        height: img.height,
+    };
+    let todo = {
+        let mut s = store.write().await;
+        let (todo, _old_file) = s.set_attachment(&todo_id, attachment)?;
+        // persist 失败时内存已指向新附件、磁盘还是旧的 —— 与 paste_from_clipboard
+        // 同款容错姿态（persist_and_emit 内部 emit persist-failed，不回滚）。
+        todo
+    };
+    persist_and_emit(&app, &store).await;
+    Ok(todo)
+}
+
 // ── QuickLook 式预览窗口（v0.2）──
 
 /// v0.2.1 prewarm 竞态防线：预览窗已建但 webview 还没加载完时，
