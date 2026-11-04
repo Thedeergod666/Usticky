@@ -535,18 +535,34 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 **改动文件**：`index.html`（+9 哨兵节点）、`src/styles.css`（心跳搬家 + 删"交互态暂停心跳"整段 + 3 处 stale 注释）、`src/main.ts`（删 `data-drag-active` ×3）。
 
 **验收清单（下一个 agent / 用户跑）**：
+
+> 📄 **可复制的 console 诊断套件**：[docs/diag/glass-ab-test.md](file:///Users/wyh/Project/Usticky/docs/diag/glass-ab-test.md)（898 行，含 17 段可直接粘贴的 console 片段、WebKit 坑清单、结果记录表）。下面第 3 条的核心 A/B 实验在该文档 §4 有完整脚本 + 阳性对照 `E3` + 失败分支排查。
+> ⚠️ **实验前必须做的三件事**（否则结论无效）：
+> ① **切到 PinTop**（设置面板）—— 默认档是 `PinBottom`（`PinMode::default()`），其 hover-raise 会切 NSWindow level → emit `usticky://backdrop-refresh` → L3 给可见卡加 `.force-reflow` **强制重采样** → 会把"玻璃掉了"洗成假阴性。
+> ② **devtools Undock 成独立窗口**并摆在浮窗旁边 —— Tauri devtools 默认停靠应用内，鼠标移进 console 浮窗就失焦 → `body[data-hover]` 被清 → 玻璃强弱随鼠标进出跳变，读不出结论。
+> ③ 浮窗别被别的窗口完全遮住 —— WKWebView 会暂停合成/节流 rAF，探针采不到样本。
+
 1. `pnpm tauri dev` → 未 hover：卡片是**独立胶囊**，**卡间是透明缝**（能看清桌面），**底部 done 保留区不铺玻璃**（不该有大片模糊）。
 2. hover：done 段显形，每张卡各自带玻璃，**卡间仍留缝**，滚动到底**每张卡都还有玻璃**（不该有未玻璃的底边带）。
-3. **静置 10s 玻璃不消失**（L2 哨兵是否真能保住其它卡片的采样 —— 这是本方案唯一未经验证的关键假设：节流是**窗口级**判定，若实际是元素级，玻璃仍会在 ~2s 后掉，需回退方案见下）。
+3. **静置 10s 玻璃不消失**（L2 哨兵是否真能保住其它卡片的采样 —— 这是本方案唯一未经验证的关键假设：节流是**窗口级**判定，若实际是元素级，玻璃仍会在 ~2s 后掉）。
+   - **计时协议**：移除哨兵这个 DOM 变更本身会触发一次 invalidation → 玻璃在移除瞬间必被重采样一次。**计时起点是"鼠标移回浮窗之后"**，等 ≥6s 再判读。
+   - **阳性对照 `E3`**：给所有瓦片加 `.force-reflow`（CSS 里 blur 10px→11px，强制 WebKit 重采样）。**玻璃掉了 + E3 按下立刻回来** → 掉的确实是 backdrop 采样 → 假设成立；**掉了 + E3 按下不回来** → 不是采样被丢弃（瓦片丢了滤镜/被盖住/低电量）→ 另找原因。
 4. 拖拽排序：松手后卡片是**滑动**归位，不是瞬移（验证原因 2 已修）。
 5. 标记完成：卡片淡出 + 塌缩，**有淡出**不是直接消失（v0.2.8 被掩蔽的老问题）。
 6. 低电量模式：玻璃整体关闭（`body[data-low-power] *` 的 `animation:none` + `backdrop-filter:none` 覆盖哨兵，此时无玻璃可保，无副作用）。
+   - ⚠️ **注**：`body[data-low-power]` 属性**当前前端并未接线**（`src/*.ts` 零命中）→ 这条规则今天不会触发，哨兵的 blanket-kill 是理论隐患而非现存 bug。
 
-**若第 3 条失败（玻璃 2s 后掉）**：说明节流是元素级而非窗口级。备选（按代价排序）—— ①把哨兵从 1px 放大成**覆盖整个窗口的隐形 backdrop-filter 面板**（`opacity:0.001`，仍 O(1) 层但 blur 面积大）；②恢复逐卡心跳，但**只动画 `opacity` 不动画 `transform`**（避开经验 ⑦ 的掩蔽，代价是 opacity 过渡也被锁 → 需另想办法）；③回到 `perf/single-glass-panel` 并接受视觉回归。
+**若第 3 条失败（玻璃 2s 后掉）**：说明节流是元素级而非窗口级。**先跑 `E3` 阳性对照确认掉的确实是 backdrop 采样**（见验收清单第 3 条），再按代价排序选备选：
+
+- ①**把哨兵放大成覆盖整个视口的隐形 backdrop 面板**（`position:fixed; inset:0; opacity:0.001`）—— 仍是 O(1) 个合成层，但每帧重采样面积从 1px² 变整个视口。这也是"窗口级假设"的最强形式：连它都保不住采样，说明方向全错。
+- ②**恢复逐卡心跳，但只动画 `opacity` 不动画 `transform`** —— transform 不再被锁 → SortableJS 归位滑动正常；opacity 被锁 → `.dragging`/`.vanishing` 淡出失效，**补救办法是把淡入淡出搬到 `.todo-card::before`**（伪元素从不挂 animation，且 `styles.css` 早就把玻璃背景搬到 `::before`、它已带 `transition: opacity 0.22s`）。代价：退回 O(N) 动画层，GPU 风暴回来。
+- ③`perf/single-glass-panel`（commit b334114）—— **已被用户否决**，选它之前必须先跟用户确认（3 个视觉回归：底部大片模糊留白 / 底边 95px 无玻璃 + 面板不跟随滚动 / 卡间透明缝消失）。
+
+**⚠️ 反向分支（更常见，优先考虑）**：如果 A/B 实验里**移除哨兵后玻璃压根就不掉**（不是"掉了又回来"）—— 那说明当前配置下根本没触发 WKWebView 的空闲节流（可能是 macOS 版本 / 窗口层级 / 是否 key 的差异），**这时最优解不是上备选 ①，而是把 L2 心跳整层删掉**（连哨兵一起删）—— **零 GPU 成本**，且卡片上零 animation 的核心收益（经验 ⑦ 的治本）完整保留。排查用的 console 片段见 [docs/diag/glass-ab-test.md](file:///Users/wyh/Project/Usticky/docs/diag/glass-ab-test.md) §4.5（B-1a/b：停掉心跳但保留元素 → 区分"是动画在起作用"还是"元素存在就够了"；L1 `will-change` 是否已足够；是否其实是被遮挡导致的另一个 bug）。
 
 **后续候选**（未做）：原生 `windowEffects`（macOS `NSVisualEffectView` / Win11 Acrylic）可把整套 CSS 玻璃 workaround 删掉，但**同样是整窗矩形模糊 → 同样切不出卡间缝**，与"逐卡玻璃"目标冲突，需先决定是否放弃缝隙观感；`prefers-reduced-motion` 支持（v0.2.7 P2 遗留）。
 
-**经验沉淀**：⑪ **"降采样成本"和"降动画数量"是两件事，别用前者换后者** —— 单面板方案省下了采样层数，代价是丢了逐瓦片才有的视觉特性；而卡顿感的另一半（animation 掩蔽 inline style）跟采样层数毫无关系。⑫ **CSS animation 掩蔽 inline style 的连带效应**：任何"保活"用的常驻动画，如果声明了 transform/opacity，就会连带禁掉该元素上一切依赖 inline style 的第三方动画（SortableJS 的 animate() 就是典型）。保活动画应该挂在一个**专用的、不参与任何交互**的哨兵元素上。⑬ **backdrop-filter 的节流是窗口级还是元素级，决定了保活方案能不能"只做一个"** —— 本项目的判断是窗口级（依据：玻璃是**整窗同时**丢失的、backing store 是窗口级资源），但**尚未实测验证**。
+**经验沉淀**：⑪ **"降采样成本"和"降动画数量"是两件事，别用前者换后者** —— 单面板方案省下了采样层数，代价是丢了逐瓦片才有的视觉特性；而卡顿感的另一半（animation 掩蔽 inline style）跟采样层数毫无关系。⑫ **CSS animation 掩蔽 inline style 的连带效应**：任何"保活"用的常驻动画，如果声明了 transform/opacity，就会连带禁掉该元素上一切依赖 inline style 的第三方动画（SortableJS 的 animate() 就是典型）。保活动画应该挂在一个**专用的、不参与任何交互**的哨兵元素上。⑬ **backdrop-filter 的节流是窗口级还是元素级，决定了保活方案能不能"只做一个"** —— 本项目的判断是窗口级（依据：玻璃是**整窗同时**丢失的、backing store 是窗口级资源），但**尚未实测验证**。⑭ **验证"玻璃会不会掉"之前，先排除掉所有会主动重采样的路径** —— 否则 L3（`backdrop-refresh` → `.force-reflow`）会把失败洗成假阴性（PinBottom 默认档的 hover-raise 就走这条路）；同理 devtools 停靠会偷走焦点打断 hover 状态、被遮挡窗口会被节流合成。**做 A/B 实验必须：切 PinTop + devtools Undock + 窗口不被遮挡 + 计时从"鼠标移回"开始 + 带阳性对照**。
 
 **构建验证**：`pnpm build`（tsc + vite）✓（本轮无 Rust 改动）。
 
