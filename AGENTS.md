@@ -593,7 +593,32 @@ v0.2.10 初版把"心跳从卡片上摘掉"当成了终点，审查发现**症�
 
 **回归审查的其余结论**（全部核过，无问题）：卡片及其 4 层祖先（body → #app → .todo-list → .todo-section → .todo-card）**零 animation**；L1（`will-change: backdrop-filter`）与 L3（`backdrop-refresh` → `.force-reflow`）未被波及且 L3 的选择器恰好覆盖全部 3 个常驻玻璃瓦片；哨兵不会被任何代码路径移除（`main.ts` 全程不重写 body 子节点）、不挡点击（`pointer-events:none`）、不进 `#app` 的 flex 布局与 `scrollHeight`、不会被 `z-index:-1` 挤出合成层（负 z-index 只影响绘制顺序，不影响合成与动画）；`src/perf.ts` 是通用 mark/measure 工具、不采集动画指标，**不需要改**。
 
+**验证结果（2026-11-04，4 个并行 agent）**：
+
+| 项 | 结果 |
+|---|---|
+| `pnpm build`（tsc + vite） | ✅ 通过 |
+| `cargo check --all-targets` | ✅ 0 warning / 0 error |
+| `cargo test --lib` | ✅ **37 passed / 0 failed** |
+| 应用启动 | ✅ 浮窗在屏上（layer=-1 = PinBottom），数据 39 条（8 pending / 31 done / 1 附件） |
+| 探针 B（哨兵静态） | ✅ `cssAnimationNames=['usticky-backdrop-heartbeat']`（全局唯一）/ `playState=running` / `computedBackdropFilter='blur(10px) saturate(1.8)'` / `zIndex=-1` / `pointerEvents=none` / rect 1×1 @(0,0) |
+| 探针 C（哨兵活性） | ✅ `currentTime` 推进、transform matrix 变化、opacity 变化 → "ALIVE" |
+| 探针 D（卡片零 animation） | ✅ `tilesChecked=41` / `tilesWithAnimation=[]` / `sampleCardTransition='opacity 0.22s …'`（**不含 transform** → v0.2.10b 不变量成立）|
+| 探针 G（逐卡玻璃 + 卡缝） | ✅ 每卡 `bf='blur(10px) saturate(1.8)'` + `willChange='backdrop-filter'` / `gapPx=6` / 缝隙处 `elementsWithBackdropFilterAtGap=[]` → **卡缝是真透明缝** |
+| 探针 H（done 保留区） | ✅ `doneSection{opacity:'0',visibility:'hidden',pointerEvents:'none'}` / 5 个探针点 `withBackdropFilter` 全为 `[]` → **保留区上方无任何 backdrop-filter 元素** |
+| 视觉（idle / hover / 滚到底） | ✅ 每卡独立玻璃胶囊、卡间 6px 真透明缝、done 保留区是**锐利背景**（不是大片模糊）、玻璃贴内容无未玻璃底边带 |
+| 静置 10s | ✅ 像素级不变（两张 PNG 的 sha256 完全相同） |
+| **§E 核心 A/B（移除哨兵 → 玻璃是否掉）** | ❌ **本机无法验证** —— 测的是 WKWebView 原生节流，见下 |
+
+**❌ 唯一没验到的一条**：§E 核心 A/B（移除哨兵后 ~2s 玻璃是否消失）。它测的是 **WKWebView / WindowServer 的原生节流行为**，**任何 Web 渲染环境都复现不了**（Chrome 没有拍平机制）→ 必须真人肉眼，或给终端授「屏幕录制」权限后跑 `docs/diag/glass-ab-test.md` §E。
+
+**⛔ 抓屏被 TCC 挡住（本机事实）**：`screencapture` / `CGWindowListCreateImage`（macOS 15 已 obsolete）/ **ScreenCaptureKit（`SCStreamErrorDomain Code=-3801`「用户拒绝了…捕捉的TCC」）** / `osascript` / `sudo` 全部失败。**不是休眠、不是锁屏、不是无头**（console 会话活跃、WindowServer 持 `UserIsActive`、CGWindowList 有 83 个真实 on-screen 窗）。解锁办法：给 **VS Code**（Claude Code CLI 的父进程）授「屏幕录制」权限。**人类用户自己完全能看能验** —— 被挡的只是"程序化抓像素"。
+
+**💡 绕过办法（本次实际用到的，值得复用）**：**Chrome headless + CDP 加载正在运行的 vite dev server**（`http://127.0.0.1:1421/` = 当前分支代码），mock 掉 `window.__TAURI_INTERNALS__`，并在其后注入模拟"桌面纹理"背景（斜条纹）→ 拿到真实渲染的 PNG + 可跑的 DOM 探针。产物在 `~/usticky-verification-20261104/`（9 张 PNG + `render.mjs` / `probes.mjs` / `grab.swift` / `sck.swift` 等 harness 脚本）。**能验证"逐卡玻璃 / 卡缝 / 保留区 / 零 animation / 静置 10s 像素不变"这些结构性与视觉性质；验证不了 WKWebView 原生节流。**
+
 **验收清单（下一个 agent / 用户跑）**：
+
+
 
 > 📄 **可复制的 console 诊断套件**：[docs/diag/glass-ab-test.md](file:///Users/wyh/Project/Usticky/docs/diag/glass-ab-test.md)（898 行，含 17 段可直接粘贴的 console 片段、WebKit 坑清单、结果记录表）。下面第 3 条的核心 A/B 实验在该文档 §4 有完整脚本 + 阳性对照 `E3` + 失败分支排查。
 > ⚠️ **实验前必须做的三件事**（否则结论无效）：
