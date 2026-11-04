@@ -63,6 +63,14 @@ html, body {
  * 属性不触发 layout/paint，但 WebKit 任何时刻都判定 layer "活着" →
  * backdrop sample 不进 ~2s 节流失效窗口。linear 4s 与浮窗同参数。
  *
+ * **v0.2.10 补记（两套机制并存，不是重复）**：浮窗已把心跳从"每卡一个"
+ * 改成"**窗口一个**"哨兵（.glass-keepalive，见 index.html + styles.css）；
+ * 预览窗**保留元素级心跳** —— 预览窗只有 .preview-panel 一个 backdrop-filter
+ * 元素，元素级与窗口级在这里等价，成本都是 O(1)，没必要跟着改。
+ * 另：预览窗**不监听** usticky://backdrop-refresh → 没有 L3 兜底，
+ * 只靠这一份心跳撑着（pre-existing，浮窗开/关预览窗时会 emit 救浮窗，
+ * 预览窗自己收不到）。
+ *
  * 别用 JS 定时器周期性 toggle filter 类（v0.2.1 的 heartbeat）—— 每次
  * toggle 都强制 backdrop 重采样，视觉上就是 ~1Hz 的整窗闪烁（用户实测
  * 抓包"每秒闪一次"，cadence 与定时器完全吻合）。连续动画没有 toggle

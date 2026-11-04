@@ -1,6 +1,6 @@
 # Usticky 项目说明
 
-> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.2.10（玻璃心跳从「每卡一个」降为「窗口一个」哨兵）/ 2026-11-03 —— ⚠️ 在分支 `perf/window-keepalive-glass`，未合入 main，待用户视觉验收**。合入前请读 v0.2.10 段的验收清单。上一版已合入 main 的快照：**v0.2.9（换行丢失根修：编辑态 textarea 化 + 多行粘贴走全文路径）/ 2026-10-27**。
+> 任何新打开此项目的 AI 会话应先读这个文件。当前快照：**v0.2.10b（玻璃心跳从「每卡一个」降为「窗口一个」哨兵 + 回归审查补修）/ 2026-11-04 —— ⚠️ 在分支 `perf/window-keepalive-glass`，未合入 main，待用户视觉验收**。合入前请读 v0.2.10 段的验收清单 + v0.2.10b 段的 3 处补修。上一版已合入 main 的快照：**v0.2.9（换行丢失根修：编辑态 textarea 化 + 多行粘贴走全文路径）/ 2026-10-27**。
 
 ## 这是什么
 
@@ -466,6 +466,7 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 - 前端 [preview.ts](file:///Users/wyh/Project/Usticky/src/preview.ts) textarea paste 监听（对齐 main.ts 输入框模式），成功后拿返回 Todo 直接 `render()`（todos-changed listener 不重渲染图片）+ flashHint；img load → scheduleFit 自动按新图调窗高。新 i18n key `app.paste.no_image`；删后端死 key `commands.paste.image_title`。
 ✅ **③ 动画卡顿根修**（根因：**心跳动画掩蔽 transform/opacity** —— CSS animation 优先级高于 inline style，SortableJS 的 150ms 重排滑动 / 拖拽半透明 / vanish 淡出全部视觉死亡，用户看到的是"瞬移"）：
 - styles.css：`.vanishing / .dragging / .sortable-chosen / #app[data-drag-active] .todo-card { animation: none }`（main.ts Sortable onStart/onEnd 挂摘 data-drag-active，兄弟卡的 inline transform 因此复活）；拖拽/塌缩本身在改几何，layer 不进 ~2s 节流窗口，玻璃防丢失不受影响。
+  > ⚠️ **v0.2.10 已退役**：心跳从"每卡一个"改成"窗口一个哨兵"后，卡片上不再挂任何 animation，这条 `animation: none` 补丁**整段删除**（连同它要解决的 masking 问题一起消失）。**但补丁退役 ≠ 问题解决** —— 归位滑动被"样式表的 transform 过渡吃掉 FLIP"重新打脸，见 v0.2.10b 第 1 条。`data-drag-active` 属性本身保留，语义改成"拖拽进行中"。
 - paint 风暴收窄：`.todo-title` transition 去掉 text-shadow（2px blur 文字阴影逐帧重栅格化 ×N 卡是 hover 边沿最贵逐帧 paint）；.todo-card/.todo-input/.todo-paste-btn transition 去掉 border-color（0→0.10 离散切换肉眼不可辨）；`.vanishing` 塌缩期间 `backdrop-filter: none` + transition 收窄到 max-height+opacity。
 - **done section idle 配对 `visibility: hidden`**（0.22s 延迟到淡出完成，hover 立即恢复）：opacity:0 的不可见 done 卡此前仍带心跳 + backdrop 常驻 GPU 底噪，idle 是 99% 的状态。
 - backdrop-refresh（L3）只刷视口内可见卡（rect 批量读过滤）；`text-rendering: auto`；.todo-paste-btn 补 will-change。
@@ -526,13 +527,39 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 | L2 | `styles.css` `.glass-keepalive` + `index.html` | **窗口级** 1px 哨兵，持续微动 → 合成器永不空闲 → 全部瓦片的 backdrop 采样一起被保住 | **改**：从"每卡一个"降为"窗口一个" |
 | L3 | `macos.rs` `set_window_level` → `usticky://backdrop-refresh` | level 切换后 force reflow 立即重采 | **不变**（仍只刷视口内可见卡）|
 
-- **心跳不再挂在卡片上** → 卡片上**零 `animation`** → 没有任何属性被锁死 → SortableJS 的 inline transform 归位滑动、`.dragging`/`.sortable-chosen` 的 opacity 淡化、`.vanishing` 的淡出**全部原生生效**。v0.2.8 那套"交互态暂停心跳"补丁连同 `main.ts` 的 `data-drag-active`（3 处）**整套退役**。
+- **心跳不再挂在卡片上** → 卡片上**零 `animation`** → 没有任何属性被锁死 → SortableJS 的 inline transform 归位滑动、`.dragging` 的 opacity 淡化、`.vanishing` 的淡出**全部原生生效**。v0.2.8 那套"交互态暂停心跳"整段 CSS 删除（`main.ts` 的 `data-drag-active` 属性**保留但语义变了**，见下方 v0.2.10b）。
 - **成本 O(N) → O(1)**：每帧只重采样 1 个 1px² 层，而不是 N 个卡片层。
-- **哨兵节点**：`<body>` 下 `<div class="glass-keepalive">`（`index.html`），`position: fixed` → 相对浮窗视口，不受 `#app` 滚动 / `render()` 的 DOM 增删影响。**刻意不用 `var(--tile-blur)`** —— 瓦片变量定义在 `#app` 规则上，哨兵是 `#app` 的兄弟节点继承不到，`var()` 无效会让 `backdrop-filter` 计算成 `none`（等于没加）。哨兵自己带 `backdrop-filter: blur(10px) saturate(180%)`，让它是**真正的 backdrop-filter 元素且持续被 invalidation** —— 走的正是旧版"每卡心跳"完全相同的机制，只是数量 1 个。
+- **哨兵节点**：`<body>` 下 `<div class="glass-keepalive">`（`index.html`），`position: fixed` → 相对浮窗视口，不受 `#app` 滚动 / `render()` 的 DOM 增删影响。哨兵自己带 `backdrop-filter`（用 `var(--tile-blur)`/`var(--tile-saturate)` —— 这两个变量 **v0.2.10b 已从 `#app` 上提到 `body`**，因为哨兵是 `#app` 的**兄弟**节点，CSS 变量只沿祖先链继承、不做兄弟共享，定义在 `#app` 上它继承不到 → `var()` 无效会让整个 `backdrop-filter` 声明算成 `none` = 哨兵静默失效），让它是**真正的 backdrop-filter 元素且持续被 invalidation** —— 走的正是旧版"每卡心跳"完全相同的机制，只是数量 1 个。
 
 **为什么保留逐卡玻璃（否决整窗单面板）**：单块连续玻璃在物理上**切不出卡间的透明缝隙** —— 模糊必须逐瓦片才能挖出缝，这是"圆角胶囊 + 透明间隙"观感的唯一来源。同理，单面板会盖住 done 段的保留区（`visibility:hidden` 但仍占布局高度）→ 就是用户看到的"大面积模糊留白"。
 
-**改动文件**：`index.html`（+9 哨兵节点）、`src/styles.css`（心跳搬家 + 删"交互态暂停心跳"整段 + 3 处 stale 注释）、`src/main.ts`（删 `data-drag-active` ×3）。
+**改动文件**：`index.html`（+9 哨兵节点）、`src/styles.css`（心跳搬家 + 删"交互态暂停心跳"整段 + 变量上提 body）、`src/main.ts`（`data-drag-active` 语义变更）、`src/preview.css`（注释互指）、`docs/diag/glass-ab-test.md`（诊断套件）。
+
+#### v0.2.10b —— 回归审查后补的 3 处（**审查 agent 挖出，都是真回归**）
+
+v0.2.10 初版把"心跳从卡片上摘掉"当成了终点，审查发现**症状没治好，只是换了成因**：
+
+1. **`.todo-card` 的 `transition: transform 0.18s` 必须删掉**（P1-1，**最关键**）。
+   SortableJS 的归位动画是经典 FLIP（`sortable.esm.js:643-666`，逐行核对过）：
+   ```js
+   css(target, 'transition', '');              // ① 清 inline transition
+   css(target, 'transform', '');               // ② 清 inline transform
+   css(target, 'transform', 'translate3d(dx,dy,0)');  // ③ **瞬时**摆回旧视觉位置
+   repaint(target);                            //    强制重排
+   css(target, 'transition', 'transform 150ms');// ④ 开 inline 过渡
+   css(target, 'transform', 'translate3d(0,0,0)');     // ⑤ 目标位置 → 触发过渡
+   ```
+   第 ③ 步**必须瞬时生效**才有东西可滑。①**只清 inline transition，清不掉样式表的** —— 样式表这条若在，③ 就从"瞬时摆位"变成一段 180ms 过渡，FLIP 偏移从未落地 → **归位仍然是瞬移**。
+   ⚠️ 两个版本的症状完全一样、成因**相反**：v0.2.8 是"心跳 animation 锁死 transform"，v0.2.10 初版是"样式表 transition 吃掉 FLIP"。**两个都要避开。**
+   → 修法：`.todo-card` 的 transition **只剩 `opacity 0.22s`**，transform 过渡交回 SortableJS 的 inline transition 独占。代价：`.todo-card.dragging` 的 `scale(0.98)` 变瞬切（该 class 落在被 `visibility:hidden` 遮住的 ghost 占位卡上，视觉无影响）。
+2. **`.sortable-chosen` 的淡化只在"真在拖"时生效**（P1-3）。SortableJS 在 **mousedown 那一刻**就挂 `chosenClass`（`:1302`）、mouseup 才摘（`:1952`）→ **普通单击标题（= 进编辑态的高频路径）也完整走一遍**。v0.2.8 时代 opacity 被心跳锁死 → 这条规则一直是死规则；心跳一撤它就复活 → 点一下标题会看到卡片先淡到 0.7 再淡回 1（各 220ms）= 一次可见闪烁。
+   → 修法：`#app[data-drag-active] .todo-card.sortable-chosen { opacity: 0.7 }`，闸门是 Sortable 的 `onStart`（**只在真正发生拖动时才派发**，`:1423`，单击不触发）。
+   → **`data-drag-active` 这个属性回来了，但语义完全变了**：v0.2.8 是"暂停卡片心跳"，v0.2.10b 是"**拖拽进行中**"的状态标记。原 v0.2.8 的 CSS 消费者（`animation: none`）依然不存在。
+3. **`--tile-blur` / `--tile-saturate` 从 `#app` 上提到 `body`**（P2-2）。哨兵是 `#app` 的兄弟节点，继承不到 `#app` 的变量 → 之前只能写死数值（"刻意写死"这种注释维护法迟早被人改回去导致哨兵静默失效）。上提到 `body` 后两边共用一份定义；低电量覆盖 `body[data-low-power] #app { --tile-blur: 0 }` 设在 `#app` 自身、依然压过继承值。
+
+另修：`perfDump` 的版本号硬编码 `"0.2.0"` → `"0.2.10"`（v0.2.7 遗留）；`.todo-card` / `.todo-section-done` / `.sortable-fallback` 三处 stale 注释（仍写着"心跳挂在卡片上"的旧因果）；L3 `.force-reflow` 覆盖范围注释（哨兵与 `.mini-flash` 有意不在内）；`preview.css` 加一句"两套机制并存不重复"的互指注释。
+
+**回归审查的其余结论**（全部核过，无问题）：卡片及其 4 层祖先（body → #app → .todo-list → .todo-section → .todo-card）**零 animation**；L1（`will-change: backdrop-filter`）与 L3（`backdrop-refresh` → `.force-reflow`）未被波及且 L3 的选择器恰好覆盖全部 3 个常驻玻璃瓦片；哨兵不会被任何代码路径移除（`main.ts` 全程不重写 body 子节点）、不挡点击（`pointer-events:none`）、不进 `#app` 的 flex 布局与 `scrollHeight`、不会被 `z-index:-1` 挤出合成层（负 z-index 只影响绘制顺序，不影响合成与动画）；`src/perf.ts` 是通用 mark/measure 工具、不采集动画指标，**不需要改**。
 
 **验收清单（下一个 agent / 用户跑）**：
 
@@ -548,6 +575,7 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
    - **计时协议**：移除哨兵这个 DOM 变更本身会触发一次 invalidation → 玻璃在移除瞬间必被重采样一次。**计时起点是"鼠标移回浮窗之后"**，等 ≥6s 再判读。
    - **阳性对照 `E3`**：给所有瓦片加 `.force-reflow`（CSS 里 blur 10px→11px，强制 WebKit 重采样）。**玻璃掉了 + E3 按下立刻回来** → 掉的确实是 backdrop 采样 → 假设成立；**掉了 + E3 按下不回来** → 不是采样被丢弃（瓦片丢了滤镜/被盖住/低电量）→ 另找原因。
 4. 拖拽排序：松手后卡片是**滑动**归位，不是瞬移（验证原因 2 已修）。
+   - ⚠️ **光看"有没有滑动"不够**：FLIP 偏移被截断时，仍会采到多个不同的非零位移值、只是幅值很小 → 肉眼和"只看非零值"的探针都会误判成滑动。必须看**幅值**：`docs/diag/glass-ab-test.md` §5.3 的 `maxAbsTranslation` 应 ≈ 一个行距（`rowPitch`），`amplitudeOK === true` 才算通过。
 5. 标记完成：卡片淡出 + 塌缩，**有淡出**不是直接消失（v0.2.8 被掩蔽的老问题）。
 6. 低电量模式：玻璃整体关闭（`body[data-low-power] *` 的 `animation:none` + `backdrop-filter:none` 覆盖哨兵，此时无玻璃可保，无副作用）。
    - ⚠️ **注**：`body[data-low-power]` 属性**当前前端并未接线**（`src/*.ts` 零命中）→ 这条规则今天不会触发，哨兵的 blanket-kill 是理论隐患而非现存 bug。
@@ -562,7 +590,7 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 
 **后续候选**（未做）：原生 `windowEffects`（macOS `NSVisualEffectView` / Win11 Acrylic）可把整套 CSS 玻璃 workaround 删掉，但**同样是整窗矩形模糊 → 同样切不出卡间缝**，与"逐卡玻璃"目标冲突，需先决定是否放弃缝隙观感；`prefers-reduced-motion` 支持（v0.2.7 P2 遗留）。
 
-**经验沉淀**：⑪ **"降采样成本"和"降动画数量"是两件事，别用前者换后者** —— 单面板方案省下了采样层数，代价是丢了逐瓦片才有的视觉特性；而卡顿感的另一半（animation 掩蔽 inline style）跟采样层数毫无关系。⑫ **CSS animation 掩蔽 inline style 的连带效应**：任何"保活"用的常驻动画，如果声明了 transform/opacity，就会连带禁掉该元素上一切依赖 inline style 的第三方动画（SortableJS 的 animate() 就是典型）。保活动画应该挂在一个**专用的、不参与任何交互**的哨兵元素上。⑬ **backdrop-filter 的节流是窗口级还是元素级，决定了保活方案能不能"只做一个"** —— 本项目的判断是窗口级（依据：玻璃是**整窗同时**丢失的、backing store 是窗口级资源），但**尚未实测验证**。⑭ **验证"玻璃会不会掉"之前，先排除掉所有会主动重采样的路径** —— 否则 L3（`backdrop-refresh` → `.force-reflow`）会把失败洗成假阴性（PinBottom 默认档的 hover-raise 就走这条路）；同理 devtools 停靠会偷走焦点打断 hover 状态、被遮挡窗口会被节流合成。**做 A/B 实验必须：切 PinTop + devtools Undock + 窗口不被遮挡 + 计时从"鼠标移回"开始 + 带阳性对照**。
+**经验沉淀**：⑪ **"降采样成本"和"降动画数量"是两件事，别用前者换后者** —— 单面板方案省下了采样层数，代价是丢了逐瓦片才有的视觉特性；而卡顿感的另一半（animation 掩蔽 inline style）跟采样层数毫无关系。⑫ **CSS animation 掩蔽 inline style 的连带效应**：任何"保活"用的常驻动画，如果声明了 transform/opacity，就会连带禁掉该元素上一切依赖 inline style 的第三方动画（SortableJS 的 animate() 就是典型）。保活动画应该挂在一个**专用的、不参与任何交互**的哨兵元素上。⑬ **backdrop-filter 的节流是窗口级还是元素级，决定了保活方案能不能"只做一个"** —— 本项目的判断是窗口级（依据：玻璃是**整窗同时**丢失的、backing store 是窗口级资源），但**尚未实测验证**。⑭ **验证"玻璃会不会掉"之前，先排除掉所有会主动重采样的路径** —— 否则 L3（`backdrop-refresh` → `.force-reflow`）会把失败洗成假阴性（PinBottom 默认档的 hover-raise 就走这条路）；同理 devtools 停靠会偷走焦点打断 hover 状态、被遮挡窗口会被节流合成。**做 A/B 实验必须：切 PinTop + devtools Undock + 窗口不被遮挡 + 计时从"鼠标移回"开始 + 带阳性对照**。⑮ **移除"锁死 transform 的 animation"之后，还要检查有没有别的东西在吃 transform 过渡** —— SortableJS 的 FLIP 归位要求元素上的 transform 过渡**由它自己的 inline transition 独占**：它的 `animate()` 第 1 步 `css(target,'transition','')` **只清 inline**，清不掉样式表的 → 样式表里残留的 `transition: transform` 会把"瞬时摆回旧视觉位置"变成一段过渡 → FLIP 偏移从未落地 → **症状与被 animation 锁死时一模一样**。**排掉一个成因不等于问题解决，要重新验证。**⑯ **"死规则"复活 = 新引入的视觉回归** —— v0.2.8 时代被心跳 animation 锁死 computed value 而"从未生效"的 CSS 规则（如 `.sortable-chosen { opacity: 0.7 }`），心跳一撤就全部复活 → 暴露出之前从没被看见过的闪烁（普通单击标题也会触发）。**移除压制机制时，要把它压住过的东西逐条重新审视。**
 
 **构建验证**：`pnpm build`（tsc + vite）✓（本轮无 Rust 改动）。
 

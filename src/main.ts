@@ -473,14 +473,22 @@ const sortableOpts: Sortable.Options = {
   preventOnFilter: true,
   onStart: () => {
     isDragging = true;
-    // v0.2.10：**不再需要** data-drag-active 暂停心跳 —— 心跳已从"每卡一个"
-    // 改为"窗口一个"哨兵（.glass-keepalive），卡片上不再挂任何 animation，
-    // 也就不会锁死 transform 的 computed value → SortableJS 的 inline
-    // transform 归位滑动（animate() 写 inline transform）天然生效，
-    // 不再有"松手后所有卡瞬移"的瞬移感。
+    // v0.2.10b：data-drag-active 的语义**变了** —— 不再是"暂停卡片心跳"
+    // （心跳已搬到窗口级哨兵 .glass-keepalive，卡片上已无 animation），
+    // 现在它是"**拖拽进行中**"的状态标记：只有真正拖起来时才让选中的卡
+    // 淡下去当占位提示。
+    //
+    // 为什么需要它：SortableJS 在 **mousedown 那一刻**就挂 chosenClass
+    // （sortable.esm.js:1302），mouseup 才摘（:1952）—— 普通单击标题
+    // （= 进编辑态的高频路径）也会完整走一遍。若卡片在 chosen 态就淡到
+    // 0.7，点一下标题会看到卡片先淡后亮（各 220ms）= 一次可见闪烁。
+    // onStart 只在真正发生拖动时才派发（sortable.esm.js:1423），单击不会
+    // 触发 → 用它做闸门正好。
+    app.dataset.dragActive = "1";
   },
   onEnd: (evt) => {
     isDragging = false;
+    delete app.dataset.dragActive;
     void handleDragEnd(evt);
   },
 };
@@ -1694,6 +1702,8 @@ function cleanupSortables() {
   // onEnd 已经处理，但跨 webview 某些边界 / 异常路径可能遗漏），重置，
   // 不让后续 render 永久被挡。
   isDragging = false;
+  // v0.2.10b：拖拽态标记（CSS 侧用来只给"真在拖"的卡加淡化，见 sortableOpts.onStart）
+  delete app.dataset.dragActive;
   // P2-6：拖拽期间被吞的 render 一次补掉。
   flushPendingRender();
 }
@@ -2954,7 +2964,7 @@ async function init() {
     try {
       const perfOut = await invoke<string | null>("get_perf_path");
       if (perfOut) {
-        await perfDump(perfOut, { ready: Date.now(), version: "0.2.0" });
+        await perfDump(perfOut, { ready: Date.now(), version: "0.2.10" });
       }
     } catch (e) {
       console.debug("[usticky] perf dump skipped:", e);

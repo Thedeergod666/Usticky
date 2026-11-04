@@ -19,7 +19,7 @@
 | 1 | 哨兵活着 | `B` + `C` | `cssAnimationNames: ['usticky-backdrop-heartbeat']`、`verdict: 'ALIVE'` |
 | 2 | 卡片零 animation | `D` | `elementsWithAnimation: []`、`allCssAnimationNames: ['usticky-backdrop-heartbeat']` |
 | 3 | **核心 A/B** | `E1`（移除）→ `E2`（恢复） | 移除后 ~2s 玻璃掉 = **假设成立**；不掉 = **假设不成立** |
-| 4 | 归位滑动 | `F1`（布防）→ 拖拽 → `F2`（读数） | `distinctTranslations >= 3` = 滑动（通过） |
+| 4 | 归位滑动 | `F1`（布防）→ 拖拽 → `F2`（读数） | `distinctTranslations >= 3` **且** `amplitudeOK === true`（位移幅值 ≈ 一个行距）= 滑动（通过）。只看"有几个非零值"会漏判被截断的情形（见 §5.3 失败签名 B） |
 | 5 | 逐卡玻璃 + 卡缝 | `G` | `elementsWithBackdropFilterAtGap: []` = 卡缝是真空隙 |
 | 6 | done 保留区 | `H` | `verdict: 'PASS: done reserved area has NO backdrop-filter…'` |
 
@@ -280,7 +280,7 @@
     allCssAnimationNames: [...new Set(ga.filter(a => a.animationName).map(a => a.animationName))],
     sampleCardTransition: card ? getComputedStyle(card).transition : '(no card)',
     sampleCardWillChange: card ? getComputedStyle(card).willChange : '(no card)',
-    retiredDragActiveFlag: appEl?.dataset.dragActive ?? '(absent — good, v0.2.10 已退役)',
+    dragActiveFlag: appEl?.dataset.dragActive ?? '(absent — 未在拖拽，正常)',
   };
 })()
 ```
@@ -293,18 +293,25 @@
   tilesWithAnimation: [],          // ← 断言
   animationsTargetingTiles: [],    // ← 断言
   allCssAnimationNames: ['usticky-backdrop-heartbeat'],   // ← 断言：全局只有哨兵一个 CSS 动画
-  sampleCardTransition: 'transform 0.18s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1)',
+  sampleCardTransition: 'opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1)',
   sampleCardWillChange: 'backdrop-filter',
-  retiredDragActiveFlag: '(absent — good, v0.2.10 已退役)'
+  dragActiveFlag: '(absent — 未在拖拽，正常)'
 }
 ```
 
 **断言清单**
 - `tilesWithAnimation` 为 `[]` → 卡片 / 输入瓦片 / 粘贴键上**零** animation。
 - `allCssAnimationNames` 只有 `usticky-backdrop-heartbeat` → 全局唯一动画源是哨兵。
-- `sampleCardTransition` **仍然包含 `transform`** → 过渡还在（过渡是"滑动归位"生效的前提；
-  没有 transition 的话 SortableJS 内联的 `transform` 会瞬间跳到位，同样表现为瞬移）。
-- `retiredDragActiveFlag` 是 `(absent …)` → v0.2.8 那套 `data-drag-active` 补丁确实退役了。
+- `sampleCardTransition` **不含 `transform`** → 这是 **v0.2.10b 的硬性不变量**。
+  样式表里只要留着 transform 过渡，SortableJS 的 FLIP 就失效：`animate()` 第 1 步
+  `css(target,'transition','')` **只清 inline**，清不掉样式表的 → 第 3 步"瞬时摆回
+  旧视觉位置"变成一段过渡 → 偏移从未落地 → 归位仍是瞬移。transform 过渡必须由
+  SortableJS 自己的 inline `transition: transform 150ms` 独占。
+  （旧版本这条断言写的是"仍然包含 transform → 过渡还在 → 是滑动的前提"，**推理
+  是反的**：SortableJS 自带 inline transition，样式表那条不是前提，是干扰源。）
+- `dragActiveFlag` 是 `(absent …)` → 空闲时没有拖拽标记。（v0.2.10b 起这个属性的
+  语义从"暂停卡片心跳"变成"**真在拖**"——只有真拖起来才给选中的卡加淡化，避免
+  普通单击标题时出现"淡一下又淡回来"的闪烁。它空闲时本就该是 absent。）
 
 > `animationsTargetingTiles` 出现 `'(transition)'` 是**正常且无害**的：SortableJS 归位时会临时给卡片
 > 加 inline `transition: transform 150ms`，这是一次**过渡**，不是 animation，不锁死 computed value。
@@ -434,28 +441,39 @@ WebKit 判定 backdrop-filter 变了 → **强制重新采样** → 玻璃立刻
 
 ### 5.1 判据
 
-SortableJS 1.15.7 的 `animate()`（`node_modules/sortablejs/modular/sortable.esm.js:641`）在归位时做三件事：
+SortableJS 1.15.7 的 `animate()`（`node_modules/sortablejs/modular/sortable.esm.js:643-666`，**逐行核对过源码**）在归位时做五步 —— 这是经典 FLIP：
 
 ```js
-css(target, 'transform', '');                                  // 1. 清 inline transform
-css(target, 'transform', 'translate3d(dx,dy,0)');               // 2. 摆到旧位置
-repaint(target);                                               //    强制重排
-css(target, 'transition', 'transform 150ms');                   // 3. 开过渡
-css(target, 'transform', 'translate3d(0,0,0)');                // 4. 目标位置 → 触发过渡
+css(target, 'transition', '');                                    // 1. 清 inline transition
+css(target, 'transform', '');                                     // 2. 清 inline transform
+css(target, 'transform', 'translate3d(dx,dy,0)');                  // 3. 瞬时摆回旧视觉位置
+this.forRepaintDummy = repaint(target);                            //    强制重排
+css(target, 'transition', 'transform 150ms');                      // 4. 开 inline 过渡
+css(target, 'transform', 'translate3d(0,0,0)');                   // 5. 目标位置 → 触发过渡
 ```
 
-**关键**：第 4 步能否产生"滑动"，取决于该元素的 `transform` computed value 是否被锁死。
+**第 3 步必须"瞬时"生效**，第 5 步的过渡才有东西可滑。三个坑：
 
-- **v0.2.8（旧，逐卡心跳）**：卡片上有 `animation: usticky-backdrop-heartbeat`，而 keyframes **声明了 `transform`**
-  → running animation 覆盖 inline style → computed transform 被锁在 `matrix(1,0,0,1,0,0)`（rotate 0deg）
-  → **兄弟卡瞬移到位**（用户感受的"卡顿感"）。
-- **v0.2.10（新）**：卡片上**零 animation** → inline `transform` 生效 → 150ms 过渡 → **滑动归位**。
+- **v0.2.8（逐卡心跳）**：卡片上 `animation: usticky-backdrop-heartbeat`，keyframes **声明了 `transform`**
+  → running animation 覆盖 inline style、锁死 computed transform
+  → 第 3 步被完全忽略 → 卡片直接落回新布局位置 → **瞬移**（用户感受的"卡顿感"）。
+- **v0.2.10（只删心跳）**：卡片零 animation → 第 3 步生效了，但**样式表**的
+  `transition: transform 0.18s` 接管了第 1 步清掉的 inline transition → 第 3 步
+  从"瞬时摆位"变成一段 180ms 过渡 → FLIP 偏移从未真正落地 → **仍然是瞬移**。
+  ⚠️ 第 1 步只清 **inline** transition，**清不掉样式表的** —— 这是最容易漏的一环。
+- **v0.2.10b（当前）**：`.todo-card` 的 transition **只剩 opacity**，transform 过渡
+  由 SortableJS 的 inline `transition: transform 150ms` 独占 → 第 3 步瞬时、
+  第 5 步过渡 → **滑动归位**。
 
 **所以判据是：归位过程中，被观察卡的 `getComputedStyle(el).transform` 必须出现"非零平移"的中间值。**
 
 > ⚠️ **必须读 computed value，不能读 `el.style.transform`**。
 > `el.style.transform` 是 inline 的**目标值**（瞬间从 `translate3d(dx,dy,0)` 跳到 `translate3d(0,0,0)`），
 > 在新旧两种实现下**看起来一样**。中间过程只存在于 computed value 里。
+
+> ⚠️ **只看"有没有非零平移"不够**（v0.2.10b 补）：若 FLIP 偏移被截断，采样仍会
+> 出现多个不同的非零值、只是幅值很小 → 会被误判成"滑动"。必须同时看**幅值**——
+> 见 §5.4 的 `maxAbsTranslation` 判据。
 
 ### 5.2 布防 —— `F1`（**先跑这段，再去拖**）
 
@@ -494,17 +512,42 @@ css(target, 'transform', 'translate3d(0,0,0)');                // 4. 目标位�
   p.stop = true;
   const moved = p.samples.filter(x => x.tf && (Math.abs(x.tf.tx) > 0.5 || Math.abs(x.tf.ty) > 0.5));
   const uniq = [...new Set(moved.map(x => x.tf.tx.toFixed(2) + ',' + x.tf.ty.toFixed(2)))];
+  // 行距参照：相邻两张 pending 卡的顶边间距（= 卡片高 + section gap）
+  const cards = [...document.querySelectorAll('.todo-section-pending .todo-card')];
+  let rowPitch = 0;
+  for (let i = 1; i < cards.length; i++) {
+    const d = cards[i].getBoundingClientRect().top - cards[i-1].getBoundingClientRect().top;
+    if (d > 0) { rowPitch = d; break; }
+  }
+  // 位移幅值 —— 只看"有几个不同的非零值"不够：FLIP 偏移被截断时照样有多个
+  // 不同的非零值，只是幅值很小 → 会被误判成滑动。必须同时看幅值。
+  const maxAbs = moved.length
+    ? Math.max(...moved.map(x => Math.max(Math.abs(x.tf.tx), Math.abs(x.tf.ty))))
+    : 0;
+  const amplitudeOK = rowPitch > 0 ? maxAbs >= rowPitch * 0.7 : null;
+  let verdict;
+  if (!moved.length) {
+    verdict = 'FAIL: SNAP — 瞬移，transform 被锁死或 FLIP 失效';
+  } else if (uniq.length < 3) {
+    verdict = 'WEAK: 只有 ' + uniq.length + ' 个不同位移值';
+  } else if (amplitudeOK === false) {
+    verdict = 'WEAK: 位移被截断 — maxAbs=' + maxAbs.toFixed(2) + 'px < 行距的 70%（'
+             + (rowPitch * 0.7).toFixed(2) + 'px）';
+  } else {
+    verdict = 'PASS: SLIDING — 归位是滑动，且位移幅度完整';
+  }
   return {
     cardId: p.id,
     framesSampled: p.samples.length,
     framesWithTranslation: moved.length,          // ← 断言：> 0
     distinctTranslations: uniq.length,            // ← 断言：>= 3
+    maxAbsTranslation: Number(maxAbs.toFixed(2)), // ← 断言：≈ rowPitch
+    rowPitch: Number(rowPitch.toFixed(2)),
+    amplitudeOK,                                  // ← 断言：true
     sampleValues: uniq.slice(0, 12),
     firstMoved: moved.slice(0, 4).map(x => x.tf),
     lastMoved: moved.slice(-4).map(x => x.tf),
-    verdict: uniq.length >= 3
-      ? 'PASS: SLIDING — 归位是滑动（animation 没有锁死 transform）'
-      : (moved.length ? 'WEAK: 只有 ' + uniq.length + ' 个不同位移值' : 'FAIL: SNAP — 瞬移，transform 被 animation 掩蔽'),
+    verdict,
   };
 })()
 ```
@@ -517,25 +560,49 @@ css(target, 'transform', 'translate3d(0,0,0)');                // 4. 目标位�
   framesSampled: 180,
   framesWithTranslation: 47,
   distinctTranslations: 9,
+  maxAbsTranslation: 18.4,        // ≈ 一个行距
+  rowPitch: 44.5,
+  amplitudeOK: true,
   sampleValues: ['0.00,-18.40', '0.00,-12.27', '0.00,-6.13', '0.00,-0.00', '0.00,6.13', '0.00,12.27', '0.00,18.40', ...],
   firstMoved: [{tx: 0, ty: -18.4}, {tx: 0, ty: -12.27}, {tx: 0, ty: -6.13}, {tx: 0, ty: -0.01}],
   lastMoved:  [{tx: 0, ty: 6.13}, {tx: 0, ty: 12.27}, {tx: 0, ty: 18.4}, {tx: 0, ty: 18.4}],
-  verdict: 'PASS: SLIDING — 归位是滑动（animation 没有锁死 transform）'
+  verdict: 'PASS: SLIDING — 归位是滑动，且位移幅度完整'
 }
 ```
 
-**失败签名（旧实现 / 若 v0.2.10 回归）**
+**失败签名 A（旧实现：心跳 animation 锁死 transform）**
 
 ```text
 {
   framesWithTranslation: 0,          // ← 一次都没有
   distinctTranslations: 0,
-  verdict: 'FAIL: SNAP — 瞬移，transform 被 animation 掩蔽'
+  verdict: 'FAIL: SNAP — 瞬移，transform 被锁死或 FLIP 失效'
 }
 ```
 
 > 旧实现下 computed transform 会被心跳 keyframes 钉在 `matrix(1, 0, 0, 1, 0, 0)`
 > （`rotate(0deg)` 不产生平移分量）→ `tx/ty` 恒为 0 → `framesWithTranslation` 恒为 0。判据非常干净。
+
+**失败签名 B（样式表 transform 过渡吃掉 FLIP：v0.2.10 的中间状态）**
+
+```text
+{
+  framesWithTranslation: 14,        // ← 有非零值！但不是 0
+  distinctTranslations: 6,          // ← >= 3，看起来像"滑动"
+  maxAbsTranslation: 1.7,          // ← 但幅值只有行距的 ~4%
+  rowPitch: 44.5,
+  amplitudeOK: false,              // ← 关键判据
+  verdict: 'WEAK: 位移被截断 — maxAbs=1.70px < 行距的 70%（31.15px）'
+}
+```
+
+> 这个签名**只看"有几个不同的非零位移值"会漏判**（6 ≥ 3、1.7px > 0.5px 阈值），
+> 但用户看到的仍是瞬移。`maxAbsTranslation` / `amplitudeOK` 才是判据。
+> 根因：`.todo-card` 的 transition 里留着 `transform` → SortableJS 第 1 步
+> `css(target,'transition','')` 只清 inline，清不掉样式表的 → 第 3 步"瞬时摆回
+> 旧视觉位置"变成一段被中途改向的过渡 → FLIP 偏移从未完整落地。
+> **v0.2.10b 的修法**：把 `transform` 从 `.todo-card` 的 transition 列表里去掉
+> （只剩 `opacity`），transform 过渡交回 SortableJS 的 inline transition 独占。
 
 ### 5.4 纯肉眼判据（不用 console 也能看）
 

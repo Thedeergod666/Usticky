@@ -136,9 +136,9 @@
  * 数量从 N 降到 1。1px² 的 blur + saturate 成本可忽略，采样结果被
  * opacity 0.001 压到肉眼不可见。
  *
- * ⚠️ 这里**刻意不写 var(--tile-blur)**：瓦片变量定义在 #app 规则上，哨兵
- * 是 #app 的兄弟节点 → 继承不到 → var() 无效会让 backdrop-filter 计算成
- * none（等于没加）。数值本身无所谓（1px² + 0.001 alpha），写死即可。 */
+ * blur/saturate 用 var(--tile-blur/--tile-saturate) —— 这两个变量定义在
+ * **body** 上（v0.2.10b 上提），因为哨兵是 #app 的兄弟节点、继承不到
+ * #app 的变量；写死数值早晚会和瓦片漂移。 */
 .glass-keepalive {
   position: fixed;
   top: 0;
@@ -149,8 +149,8 @@
   pointer-events: none;
   z-index: -1;
   will-change: transform;
-  backdrop-filter: blur(10px) saturate(180%);
-  -webkit-backdrop-filter: blur(10px) saturate(180%);
+  backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
+  -webkit-backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
   animation: usticky-backdrop-heartbeat 4s linear infinite;
 }
 
@@ -171,6 +171,14 @@
  *     不动元素自身背景 → 过渡照常走。
  *   - +1px blur 差肉眼不可见（10px→11px），但足以让 WebKit 判定
  *     backdrop-filter 变了 → 重采样。
+ *
+ * **覆盖范围**（v0.2.10b 补记）：选择器只含 3 个常驻玻璃瓦片
+ * （.todo-card / .todo-input / .todo-paste-btn）—— 恰好等于浮窗里常驻
+ * backdrop-filter 元素的**全集**。两个例外是有意为之：
+ *   - `.mini-flash`（瞬时 toast，自带 backdrop-filter）—— 出现即用、
+ *     消失即走，不需要保活；
+ *   - `.glass-keepalive`（窗口级哨兵）—— 它的**存在本身**就是为了让窗口
+ *     保持活跃；它自己那份 1px² 采样陈旧与否毫无视觉影响（opacity 0.001）。
  */
 .todo-card.force-reflow,
 .todo-input.force-reflow,
@@ -195,6 +203,22 @@ html, body {
   /* v0.2.8 perf：optimizeLegibility 强制全文字 kerning/ligature 精确计算，
    * 长列表逐帧布局（vanish 塌缩 / 拖拽重排）时不必要的 CPU 开销；auto 即可 */
   text-rendering: auto;
+}
+
+/* 玻璃瓦片的模糊/饱和变量定义在 **body**（不是 #app）。
+ *
+ * v0.2.10b：窗口级哨兵 .glass-keepalive 挂在 <body> 下，是 #app 的**兄弟**
+ * 节点 —— CSS 自定义属性只沿祖先链继承、不做兄弟共享，定义在 #app 上它继承
+ * 不到，var(--tile-blur) 会 invalid-at-computed-value-time 让整个
+ * backdrop-filter 声明算成 none（= 哨兵静默失效，"刻意写死"这种注释维护法
+ * 迟早被人改回去）。上提到 body 后两边共用同一份定义。
+ *
+ * 低电量覆盖 `body[data-low-power] #app { --tile-blur: 0 }` 设在 #app 自身，
+ * 压过继承来的 body 值 → 瓦片侧照常生效；哨兵侧则由 blanket 的
+ * `backdrop-filter: none !important` 直接关掉，不受影响。 */
+body {
+  --tile-blur: 10px;
+  --tile-saturate: 180%;
 }
 
 /* ── 整窗容器 ── */
@@ -245,8 +269,8 @@ html, body {
    * rgb(28,30,38) × opacity 0.30 ≡ rgba(28,30,38,0.30)。 */
   --tile-bg-rgb: 28, 30, 38;
   --tile-bg-alpha: 0.30;
-  --tile-blur: 10px;
-  --tile-saturate: 180%;
+  /* --tile-blur / --tile-saturate 定义在 body 上（v0.2.10b）——
+   * 窗口级哨兵 .glass-keepalive 是 #app 的兄弟节点，继承不到 #app 的变量。 */
   --tile-border: rgba(255, 255, 255, 0);
   --tile-shadow: 0 0 0 rgba(0, 0, 0, 0);
 
@@ -346,14 +370,17 @@ body[data-active] #app {
   align-items: center;
   gap: 10px;
   padding: 9px 13px 9px;
-  /* 背景搬到 ::before 伪元素（见下方）。原因：父元素上同时有
-   * backdrop-filter + will-change: backdrop-filter + 心跳动画时，
-   * background-color 的 CSS 过渡会被合成层重置/快照为瞬时（无渐变），
-   * 而 .todo-title/.todo-check/.todo-due 上的 color 过渡正常（它们
-   * 不在 backdrop-filter 合成层上）。把背景移到 ::before，伪元素
-   * 不带 backdrop-filter / will-change / 心跳，background-color 过渡
-   * 走 paint 通道、不被合成层重置。overflow:hidden 把 ::before 裁到
-   * 卡片圆角内（避免 ::before 圆角与卡片圆角错位的 1px 露出）。 */
+  /* 背景搬到 ::before 伪元素（见下方）。原因：**带 backdrop-filter +
+   * will-change: backdrop-filter 的元素上，background-color 的 CSS 过渡会
+   * 被合成层重置/快照为瞬时（无渐变）**，而 .todo-title/.todo-check/.todo-due
+   * 上的 color 过渡正常（它们不在 backdrop-filter 合成层上）。把背景移到
+   * ::before，伪元素不带 backdrop-filter / will-change，background-color
+   * 过渡走 paint 通道、不被合成层重置。overflow:hidden 把 ::before 裁到
+   * 卡片圆角内（避免 ::before 圆角与卡片圆角错位的 1px 露出）。
+   *
+   * v0.2.10b 补注：当年的原始理由里还列了"心跳动画"（那时心跳挂在卡片上）。
+   * 心跳已搬到窗口级哨兵，**但结论不变** —— 触发重置的是 backdrop-filter
+   * 合成层本身，不是心跳。 */
   position: relative;
   overflow: hidden;
   backdrop-filter: blur(var(--tile-blur)) saturate(var(--tile-saturate));
@@ -367,12 +394,22 @@ body[data-active] #app {
      **v0.2.8 perf**：border-color 也移出 transition —— hover 边沿 0→0.10
      alpha 的逐帧 border 重绘 ×N 卡是 paint 风暴的一部分，而 0.10 的离散
      切换肉眼不可辨。
-     **v0.2.10**：transform/opacity 过渡现在**常态生效** —— 卡片上已不再挂
-     任何 animation（心跳搬到窗口级哨兵），不存在"运行中的 animation 锁死
-     computed value"的问题：SortableJS 的 inline transform 归位滑动、拖拽
-     半透明、vanish 淡出都能正常走过渡。 */
+     **v0.2.10**：opacity 过渡现在**常态生效** —— 卡片上已不再挂任何
+     animation（心跳搬到窗口级哨兵），不存在"运行中的 animation 锁死
+     computed value"的问题，vanish 淡出 / 拖拽半透明都能正常走过渡。
+     **v0.2.10b：transform 绝不能出现在这条 transition 里** ——
+     SortableJS 的归位动画是经典 FLIP：`animate()` 先
+     `css(target,'transition','')` + `css(target,'transform','translate3d(dx,dy,0)')`
+     **瞬时**把元素摆回旧视觉位置，再开 inline `transition: transform 150ms`
+     过渡到 0（= 新布局位置）。第 ① 步只清 **inline** transition，清不掉
+     **样式表**的 —— 样式表这条若在，第 ③ 步的"瞬时摆位"就变成一段过渡，
+     FLIP 的偏移从未真正生效 → **归位仍然表现为瞬移**。
+     （老症状是"心跳 animation 锁死 transform"，新症状是"transition 吃掉
+     FLIP"，症状相同、成因相反 —— 两个都要避开。）
+     → transform 过渡交回 SortableJS 的 inline transition 独占。
+     代价：.todo-card.dragging 的 scale(0.98) 变瞬切 —— 该 class 落在
+     被 visibility:hidden 遮住的 ghost 占位卡上，视觉无影响。 */
   transition:
-    transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
     opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1);
   cursor: grab;
 }
@@ -396,11 +433,18 @@ body[data-active] #app {
 }
 .todo-card:active { cursor: grabbing; }
 .todo-card.dragging { opacity: 0.5; transform: scale(0.98); }
-.todo-card.sortable-chosen {
-  /* chosen 是被选中但还没开始动的卡片（mousedown 后、mousemove 前），
-   * 视觉上轻微淡化提示"在动"但不抢戏。drag 真正开始后 ghost 占主导。 */
-  opacity: 0.7;
-}
+/* chosen 是被选中但**还没开始动**的卡片 —— SortableJS 在 **mousedown 那一刻**
+ * 就挂上 chosenClass（sortable.esm.js:1302），mouseup 时摘掉（:1952），
+ * 所以**普通单击标题也会完整走一遍**（单击标题 = 进编辑态的高频路径）。
+ *
+ * v0.2.10b：淡化只挂在**真正拖起来**的时候 —— #app[data-drag-active] 由
+ * main.ts 的 Sortable `onStart` 挂（onStart 只在真正发生拖动时才派发，
+ * 普通单击不触发），onEnd 摘掉。否则点一下标题会看到卡片先淡到 0.7 再淡回
+ * 1（各 220ms）—— 高频路径上多出来的一次闪烁。
+ *
+ * 为什么以前没这个问题：那时卡片上挂着心跳 animation，锁死了 opacity 的
+ * computed value → 这条规则一直是**死规则**（v0.2.10 移除心跳后才复活）。 */
+#app[data-drag-active] .todo-card.sortable-chosen { opacity: 0.7; }
 .todo-card.dragging,
 .todo-card.sortable-chosen,
 .todo-card.sortable-drag,
@@ -453,8 +497,11 @@ body[data-active] #app {
  * 最顶层"的 bug 也源于此）。用 visibility:hidden 而不是
  * display:none / opacity：克隆保留盒模型，SortableJS 内部对它的
  * transform 更新、drop 时移除都不受影响；opacity 也压不住——
- * SortableJS 内联 opacity:0.8 + 心跳动画会盖掉普通声明，得靠
- * !important，而 visibility 没有内联冲突，一行到位。 */
+ * SortableJS 会内联写 opacity（0.8），普通声明盖不住，得靠
+ * !important，而 visibility 没有内联冲突，一行到位。
+ *
+ * v0.2.10b 补注：原注释说"心跳动画会盖掉普通声明" —— 心跳已不在卡片上，
+ * 但 SortableJS 的**内联 opacity** 依然盖得住普通声明，结论不变。 */
 .todo-card.sortable-drag,
 .todo-card.sortable-fallback {
   visibility: hidden;
@@ -981,12 +1028,14 @@ body[data-narrow="1"] .todo-input-hint {
  * hover 回到 1。复用全局 cubic-bezier(0.22, 1, 0.36, 1) iOS spring，
  * 跟 .todo-card / .section-header 的色彩过渡节奏一致。
  * **v0.2.8 perf**：配对 visibility —— opacity:0 只是不画，子卡仍带
- * backdrop-filter + will-change + 无限心跳（心跳让 layer 永远"活着"，
- * WebKit 不按空闲回收）→ idle（99% 的状态）下 N 张不可见 done 卡持续
- * 占用 blur 合成预算，挤压 hover 过渡的 GPU 余量。visibility:hidden
+ * backdrop-filter + will-change → idle（99% 的状态）下 N 张不可见 done 卡
+ * 持续占用 blur 合成预算，挤压 hover 过渡的 GPU 余量。visibility:hidden
  * 让 WebKit 跳过其绘制/合成/命中测试；布局占位不变（0 跳位设计保留，
  * scrollHeight 语义不受影响）。时序：淡出完（0.22s）才 hidden，hover
- * 回来立即 visible（base 规则 delay 0），肉眼与纯 opacity 方案无差别。 */
+ * 回来立即 visible（base 规则 delay 0），肉眼与纯 opacity 方案无差别。
+ * **v0.2.10b 补注**：原注释里"无限心跳让 layer 永远活着"这一条论据已随
+ * 心跳迁移到窗口级哨兵而消失 —— 现在 done 卡**没有动画**，纯靠
+ * visibility:hidden 退出合成。结论不变（该优化仍值得做），理由要改。 */
 .todo-section-done {
   transition: opacity 0.22s cubic-bezier(0.22, 1, 0.36, 1),
               visibility 0s linear 0s;
