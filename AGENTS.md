@@ -531,7 +531,39 @@ idle 白色数据 + 半透深底（`rgba(22,24,30,0.30)`）+ `backdrop-filter: b
 - **成本 O(N) → O(1)**：每帧只重采样 1 个 1px² 层，而不是 N 个卡片层。
 - **哨兵节点**：`<body>` 下 `<div class="glass-keepalive">`（`index.html`），`position: fixed` → 相对浮窗视口，不受 `#app` 滚动 / `render()` 的 DOM 增删影响。哨兵自己带 `backdrop-filter`（用 `var(--tile-blur)`/`var(--tile-saturate)` —— 这两个变量 **v0.2.10b 已从 `#app` 上提到 `body`**，因为哨兵是 `#app` 的**兄弟**节点，CSS 变量只沿祖先链继承、不做兄弟共享，定义在 `#app` 上它继承不到 → `var()` 无效会让整个 `backdrop-filter` 声明算成 `none` = 哨兵静默失效），让它是**真正的 backdrop-filter 元素且持续被 invalidation** —— 走的正是旧版"每卡心跳"完全相同的机制，只是数量 1 个。
 
-**为什么保留逐卡玻璃（否决整窗单面板）**：单块连续玻璃在物理上**切不出卡间的透明缝隙** —— 模糊必须逐瓦片才能挖出缝，这是"圆角胶囊 + 透明间隙"观感的唯一来源。同理，单面板会盖住 done 段的保留区（`visibility:hidden` 但仍占布局高度）→ 就是用户看到的"大面积模糊留白"。
+#### 机制已定位（2026-11-04，外部求证 + 本机 layer tree 实测）
+
+**结论：L2 的"窗口级哨兵"在机制上是正确的，且找到了比"采样缓存被节流"更底层的真实原因。**
+
+> **真实机制**：macOS **WindowServer** 在窗口"空闲约 1.05 秒"后，自动把该窗口的整棵 layer tree **拍平（flatten）成一张位图**。拍平的直接后果 —— 原文："Flattening means compositing the entire layer hierarchy into a single bitmap, **which eliminates the `CABackdropLayer`'s ability to sample live content**"。
+> 而 CSS `backdrop-filter` 在 macOS WKWebView 上**就是** `CABackdropLayer` + `CAFilter` 高斯模糊 —— 拍平 → 采样能力被消灭 → **窗口内所有 backdrop-filter 同时失效** → 整窗玻璃一起消失。
+
+**证据链**（四路独立印证）：
+- **WebKit 源码**：`GraphicsLayerCA.cpp` / `PlatformCAFiltersCocoa.mm` —— 每个带 backdrop-filter 的元素建一个名为 "backdrop" 的 layer（`LayerTypeBackdropLayer`）挂 `CAFilter`；且**没有软件降级路径**（源码原话：`FIXME: This would clear the backdrop filters if we had a software implementation`）。
+- **官方 bug**：`bugs.webkit.org/show_bug.cgi?id=275919`（"Backdrop-filter: blur with a transparent web view renders incorrectly"）→ 修复 PR 只动 `PlatformCAFiltersCocoa.mm` → 证明 macOS 路径确实落在 `CABackdropLayer`。
+- **Apple 官方 WWDC 2014 Session 220**："the blur effect actually happens **out of process**… in the Window Server… on the GPU"；且 "non-key or inactive state, so it **automatically removes the blurring** and just goes to being a solid color fill" —— 印证"要不要模糊"是**窗口状态级**的决定。
+- **本机 layer tree dump**（Swift 探针实测，macOS 26）：`WKCompositingLayer name="backdrop hosting: …" → CABackdropLayer name=backdrop`，两个 backdrop 元素 → 两个 backdrop hosting。
+
+⇒ **节流的触发条件是窗口级**（窗口是否空闲），**后果也是窗口级**（一次拍平杀死窗口内全部采样）→ "每卡一个心跳 → 窗口一个哨兵"的降级**在机制上成立**，O(N)→O(1) 成立。时间常数也对得上：拍平延迟 1.05s ≈ 观察到的"静止 ~2s 后玻璃掉"（差一个 WebKit 提交节拍）。
+
+⚠️ **证据修正（推翻本项目之前写下的论据）**：AGENTS.md / 记忆里一直用"玻璃是**整窗同时**丢失的"来论证窗口级 —— **这条论据是错的**：所有瓦片采样的是**同一个窗口级 backdrop 源**，即使节流判定是元素级，表现也会是"整窗一起掉"。真正定性的证据是上面那条拍平机制，不是症状。
+
+**置信度边界**（别当既成事实用）：拍平机制 = **高**（两个独立社区逆向来源原文一致 + 官方 WWDC + WebKit 源码 + 本机实测）；"窗口里**任意一个**持续动画即可保住全部采样" = **中高（推断）** —— 没找到逐字出处，但与"逐卡心跳确实有效"的既有实测一致；WKWebView 是否完全受 NSWindow 拍平开关管辖 = **未验证**。
+
+**根治路径（未做，值得下一轮）**：`NSWindow.setValue(false, forKey: "shouldAutoFlattenLayerTree")`（objc2，浮窗建后、**首次 display 之前**）→ 直接关掉拍平 → **所有 CSS 心跳可以整个删掉**（GPU 成本归零，两个历史痛点一起消）。四个实施要点：
+1. **必须在首次 display 之前设** —— NSWindow 只在首次 `-[NSWindow displayIfNeeded]` 的 surface 创建时把该选项下发给 `NSViewLayerSurface`（设晚了无效）。
+2. **WKWebView 是 hosted layer（CALayerHost）**，NSWindow 这个 KVC **不一定**覆盖到 WebKit 托管的子树 → **未验证点**。退路：`canHostLayersInWindowServer` off→on toggle（"recreates the layer tree immediately"），或 `kCGSSetWindowTags` + `kCGSNeverFlattenSurfacesDuringSwipesTagBit`（避免 Spaces 切换时被强制拍平）。
+3. 私有 API 有 OS 升级失效风险 → **特性探测**：先 `value(forKey:)` 读得到再设，读不到就退回 CSS 哨兵（两条路并存互为兜底）。
+4. 预览窗（`preview.html`）是**独立的另一个 NSWindow**，要单独设一次。
+
+**"不要做"清单**（来自求证，避免重蹈覆辙）：
+- ❌ 不要把心跳改成**周期性 toggle / 改 class** —— 每次 toggle 都解除拍平→重采样→再拍平，就是 v0.2.3 踩过的 **1Hz 整窗闪烁**。
+- ❌ **不要指望 `will-change: backdrop-filter` 单独能保住采样** —— 规范（Filter Effects L2 §3 + MDN）里它只做两件事：①提升为独立合成层 ②**使该元素成为 backdrop root**。**没有任何"节流豁免"语义**。副作用要记账：每张卡因此各持一份 `CABackdropLayer`（采样缓存 N 份）→ 正是"每帧 N 次 backdrop 重采样"的成本来源。
+- ❌ 不要在 `.todo-card` **内部**再加嵌套 `backdrop-filter` —— 会被卡片自己的 backdrop root 截断。
+- ⚠️ 哨兵上的 `backdrop-filter` **不是承重结构**（保活只需要动画让窗口持续出帧）。当前保留（1px²，成本可忽略，且保留了"与旧版每卡心跳完全同机制"的最大兼容性），但要知道它可以随时去掉。
+
+**为什么保留逐卡玻璃（否决整窗单面板）**
+：单块连续玻璃在物理上**切不出卡间的透明缝隙** —— 模糊必须逐瓦片才能挖出缝，这是"圆角胶囊 + 透明间隙"观感的唯一来源。同理，单面板会盖住 done 段的保留区（`visibility:hidden` 但仍占布局高度）→ 就是用户看到的"大面积模糊留白"。
 
 **改动文件**：`index.html`（+9 哨兵节点）、`src/styles.css`（心跳搬家 + 删"交互态暂停心跳"整段 + 变量上提 body）、`src/main.ts`（`data-drag-active` 语义变更）、`src/preview.css`（注释互指）、`docs/diag/glass-ab-test.md`（诊断套件）。
 
@@ -590,7 +622,7 @@ v0.2.10 初版把"心跳从卡片上摘掉"当成了终点，审查发现**症�
 
 **后续候选**（未做）：原生 `windowEffects`（macOS `NSVisualEffectView` / Win11 Acrylic）可把整套 CSS 玻璃 workaround 删掉，但**同样是整窗矩形模糊 → 同样切不出卡间缝**，与"逐卡玻璃"目标冲突，需先决定是否放弃缝隙观感；`prefers-reduced-motion` 支持（v0.2.7 P2 遗留）。
 
-**经验沉淀**：⑪ **"降采样成本"和"降动画数量"是两件事，别用前者换后者** —— 单面板方案省下了采样层数，代价是丢了逐瓦片才有的视觉特性；而卡顿感的另一半（animation 掩蔽 inline style）跟采样层数毫无关系。⑫ **CSS animation 掩蔽 inline style 的连带效应**：任何"保活"用的常驻动画，如果声明了 transform/opacity，就会连带禁掉该元素上一切依赖 inline style 的第三方动画（SortableJS 的 animate() 就是典型）。保活动画应该挂在一个**专用的、不参与任何交互**的哨兵元素上。⑬ **backdrop-filter 的节流是窗口级还是元素级，决定了保活方案能不能"只做一个"** —— 本项目的判断是窗口级（依据：玻璃是**整窗同时**丢失的、backing store 是窗口级资源），但**尚未实测验证**。⑭ **验证"玻璃会不会掉"之前，先排除掉所有会主动重采样的路径** —— 否则 L3（`backdrop-refresh` → `.force-reflow`）会把失败洗成假阴性（PinBottom 默认档的 hover-raise 就走这条路）；同理 devtools 停靠会偷走焦点打断 hover 状态、被遮挡窗口会被节流合成。**做 A/B 实验必须：切 PinTop + devtools Undock + 窗口不被遮挡 + 计时从"鼠标移回"开始 + 带阳性对照**。⑮ **移除"锁死 transform 的 animation"之后，还要检查有没有别的东西在吃 transform 过渡** —— SortableJS 的 FLIP 归位要求元素上的 transform 过渡**由它自己的 inline transition 独占**：它的 `animate()` 第 1 步 `css(target,'transition','')` **只清 inline**，清不掉样式表的 → 样式表里残留的 `transition: transform` 会把"瞬时摆回旧视觉位置"变成一段过渡 → FLIP 偏移从未落地 → **症状与被 animation 锁死时一模一样**。**排掉一个成因不等于问题解决，要重新验证。**⑯ **"死规则"复活 = 新引入的视觉回归** —— v0.2.8 时代被心跳 animation 锁死 computed value 而"从未生效"的 CSS 规则（如 `.sortable-chosen { opacity: 0.7 }`），心跳一撤就全部复活 → 暴露出之前从没被看见过的闪烁（普通单击标题也会触发）。**移除压制机制时，要把它压住过的东西逐条重新审视。**
+**经验沉淀**：⑪ **"降采样成本"和"降动画数量"是两件事，别用前者换后者** —— 单面板方案省下了采样层数，代价是丢了逐瓦片才有的视觉特性；而卡顿感的另一半（animation 掩蔽 inline style）跟采样层数毫无关系。⑫ **CSS animation 掩蔽 inline style 的连带效应**：任何"保活"用的常驻动画，如果声明了 transform/opacity，就会连带禁掉该元素上一切依赖 inline style 的第三方动画（SortableJS 的 animate() 就是典型）。保活动画应该挂在一个**专用的、不参与任何交互**的哨兵元素上。⑬ **backdrop-filter 的节流是窗口级还是元素级，决定了保活方案能不能"只做一个"** —— **2026-11-04 已定位：窗口级**。真实机制是 macOS WindowServer 空闲时把窗口 layer tree **拍平**成位图 → `CABackdropLayer` 失去实时采样能力 → 整窗玻璃一起消失。⚠️ 但当时的论据（"玻璃是整窗同时丢的"）**是错的** —— 共享采样源也会导致整窗一起掉，不能拿来证明窗口级；定性的证据必须是机制本身。**症状可以同时由两种机制产生，别用症状反推机制。**⑭ **验证"玻璃会不会掉"之前，先排除掉所有会主动重采样的路径** —— 否则 L3（`backdrop-refresh` → `.force-reflow`）会把失败洗成假阴性（PinBottom 默认档的 hover-raise 就走这条路）；同理 devtools 停靠会偷走焦点打断 hover 状态、被遮挡窗口会被节流合成。**做 A/B 实验必须：切 PinTop + devtools Undock + 窗口不被遮挡 + 计时从"鼠标移回"开始 + 带阳性对照**。⑮ **移除"锁死 transform 的 animation"之后，还要检查有没有别的东西在吃 transform 过渡** —— SortableJS 的 FLIP 归位要求元素上的 transform 过渡**由它自己的 inline transition 独占**：它的 `animate()` 第 1 步 `css(target,'transition','')` **只清 inline**，清不掉样式表的 → 样式表里残留的 `transition: transform` 会把"瞬时摆回旧视觉位置"变成一段过渡 → FLIP 偏移从未落地 → **症状与被 animation 锁死时一模一样**。**排掉一个成因不等于问题解决，要重新验证。**⑯ **"死规则"复活 = 新引入的视觉回归** —— v0.2.8 时代被心跳 animation 锁死 computed value 而"从未生效"的 CSS 规则（如 `.sortable-chosen { opacity: 0.7 }`），心跳一撤就全部复活 → 暴露出之前从没被看见过的闪烁（普通单击标题也会触发）。**移除压制机制时，要把它压住过的东西逐条重新审视。**
 
 **构建验证**：`pnpm build`（tsc + vite）✓（本轮无 Rust 改动）。
 
